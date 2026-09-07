@@ -12678,7 +12678,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0,
           missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0
         },
-        organization: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
+        organization: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
         website: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
         product: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
       };
@@ -12780,6 +12780,21 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             offers.forEach((offer) => { if (!offer || typeof offer !== 'object') return; quality.offerObservedCount += 1; if (!nonEmptyValue(offer.price)) quality.offerMissingPriceCount += 1; if (!nonEmptyValue(offer.priceCurrency)) quality.offerMissingCurrencyCount += 1; });
           } else if (family === 'organization') {
             ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) quality[`${key}ObservedCount`] += 1; });
+            // sameAs quality intentionally records only structural facts.  It
+            // does not judge URL syntax, officialness, reachability, or whether
+            // an external profile represents this organization.
+            const rawSameAs = node.sameAs;
+            const sameAsValues = Array.isArray(rawSameAs) ? rawSameAs : (rawSameAs == null ? [] : [rawSameAs]);
+            let nonEmptySameAsValues = 0;
+            if (Array.isArray(rawSameAs) && rawSameAs.length === 0) quality.emptySameAsValueCount += 1;
+            sameAsValues.forEach((value) => {
+              if ((typeof value === 'string' || typeof value === 'number') && clean(value)) nonEmptySameAsValues += 1;
+              else quality.emptySameAsValueCount += 1;
+            });
+            if (nonEmptySameAsValues > 0) {
+              quality.organizationNodesWithSameAsCount += 1;
+              quality.organizationSameAsValueCount += nonEmptySameAsValues;
+            }
           } else {
             if (nonEmptyValue(node.publisher)) quality.publisherObservedCount += 1;
             if (nonEmptyValue(node.potentialAction)) quality.potentialActionObservedCount += 1;
@@ -17864,7 +17879,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           structuredDataQualityV1: {
             breadcrumb: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
             faq: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 },
-            organization: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
+            organization: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
             website: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
             product: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
           },
@@ -17929,7 +17944,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           const structuredDataQualityV1 = {
             breadcrumb: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
             faq: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 },
-            organization: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
+            organization: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
             website: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
             product: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
           };
@@ -18005,7 +18020,23 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               if (!nonEmptyValue(node.name)) summary.missingNameCount += 1;
               if (!nonEmptyValue(node.url)) summary.missingUrlCount += 1;
               if (family === 'product') { if (!nonEmptyValue(node.description)) summary.missingDescriptionCount += 1; if (nonEmptyValue(node.image)) summary.imageObservedCount += 1; if (nonEmptyValue(node.brand)) summary.brandObservedCount += 1; const offers=Array.isArray(node.offers)?node.offers:(node.offers==null?[]:[node.offers]); offers.forEach((offer)=>{if(!offer||typeof offer!=='object')return;summary.offerObservedCount+=1;if(!nonEmptyValue(offer.price))summary.offerMissingPriceCount+=1;if(!nonEmptyValue(offer.priceCurrency))summary.offerMissingCurrencyCount+=1;}); }
-              else if (family === 'organization') ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) summary[`${key}ObservedCount`] += 1; });
+              else if (family === 'organization') {
+                ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) summary[`${key}ObservedCount`] += 1; });
+                // Structural only: preserve raw value cardinality without
+                // judging profile officialness or URL validity.
+                const rawSameAs = node.sameAs;
+                const sameAsValues = Array.isArray(rawSameAs) ? rawSameAs : (rawSameAs == null ? [] : [rawSameAs]);
+                let nonEmptySameAsValues = 0;
+                if (Array.isArray(rawSameAs) && rawSameAs.length === 0) summary.emptySameAsValueCount += 1;
+                sameAsValues.forEach((value) => {
+                  if ((typeof value === 'string' || typeof value === 'number') && clean(value)) nonEmptySameAsValues += 1;
+                  else summary.emptySameAsValueCount += 1;
+                });
+                if (nonEmptySameAsValues > 0) {
+                  summary.organizationNodesWithSameAsCount += 1;
+                  summary.organizationSameAsValueCount += nonEmptySameAsValues;
+                }
+              }
               else { if (nonEmptyValue(node.publisher)) summary.publisherObservedCount += 1; if (nonEmptyValue(node.potentialAction)) summary.potentialActionObservedCount += 1; }
             }
             if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => observeQuality(item, depth + 1));

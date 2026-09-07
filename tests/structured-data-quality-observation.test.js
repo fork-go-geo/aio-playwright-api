@@ -140,6 +140,7 @@ function quality(signals, family) {
     assert.deepStrictEqual(Object.keys(quality(orgComplete, 'organization')).sort(), [
       'addressObservedCount', 'contactPointObservedCount', 'logoObservedCount', 'missingIdCount',
       'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus', 'sameAsObservedCount',
+      'organizationNodesWithSameAsCount', 'organizationSameAsValueCount', 'emptySameAsValueCount',
       'sourceFormat', 'telephoneObservedCount'
     ].sort());
     assert.strictEqual(quality(orgComplete, 'organization').nodeCount, 1);
@@ -153,8 +154,29 @@ function quality(signals, family) {
     assert.deepStrictEqual([quality(orgMissing, 'organization').missingIdCount, quality(orgMissing, 'organization').missingNameCount, quality(orgMissing, 'organization').missingUrlCount], [1, 1, 1]);
     const orgOptional = await observe(jsonLd(org({ logo: '', sameAs: [], address: '', telephone: '', contactPoint: '' })), 'org-optional');
     assert.deepStrictEqual([quality(orgOptional, 'organization').missingIdCount, quality(orgOptional, 'organization').missingNameCount, quality(orgOptional, 'organization').missingUrlCount], [0, 0, 0]);
+    assert.deepStrictEqual([quality(orgOptional, 'organization').organizationNodesWithSameAsCount, quality(orgOptional, 'organization').organizationSameAsValueCount, quality(orgOptional, 'organization').emptySameAsValueCount], [0, 0, 1]);
+    const orgSameAsOne = await observe(jsonLd(org({ sameAs: 'https://social.example.test/example' })), 'org-sameas-one');
+    assert.deepStrictEqual([quality(orgSameAsOne, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsOne, 'organization').organizationSameAsValueCount, quality(orgSameAsOne, 'organization').emptySameAsValueCount], [1, 1, 0]);
+    const orgSameAsArrayOne = await observe(jsonLd(org({ sameAs: ['https://social.example.test/example'] })), 'org-sameas-array-one');
+    assert.deepStrictEqual([quality(orgSameAsArrayOne, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsArrayOne, 'organization').organizationSameAsValueCount], [1, 1]);
+    const orgSameAsMultiple = await observe(jsonLd(org({ sameAs: ['https://social.example.test/example', 'https://profiles.example.test/example'] })), 'org-sameas-multiple');
+    assert.deepStrictEqual([quality(orgSameAsMultiple, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsMultiple, 'organization').organizationSameAsValueCount], [1, 2]);
+    const orgSameAsEmpty = await observe(jsonLd(org({ sameAs: '' })), 'org-sameas-empty');
+    assert.deepStrictEqual([quality(orgSameAsEmpty, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsEmpty, 'organization').organizationSameAsValueCount, quality(orgSameAsEmpty, 'organization').emptySameAsValueCount], [0, 0, 1]);
+    const orgSameAsNull = await observe(jsonLd(org({ sameAs: null })), 'org-sameas-null');
+    assert.deepStrictEqual([quality(orgSameAsNull, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsNull, 'organization').organizationSameAsValueCount, quality(orgSameAsNull, 'organization').emptySameAsValueCount], [0, 0, 0]);
+    // Object form is not a sameAs scalar in the existing normalizer; it must
+    // not become a quality pass merely because it has object keys.
+    const orgSameAsObject = await observe(jsonLd(org({ sameAs: { url: 'https://social.example.test/example' } })), 'org-sameas-object');
+    assert.deepStrictEqual([quality(orgSameAsObject, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsObject, 'organization').organizationSameAsValueCount, quality(orgSameAsObject, 'organization').emptySameAsValueCount], [0, 0, 1]);
+    // URL semantics are deliberately outside this observation: a non-empty
+    // relative value is observable without being treated as a URL verdict.
+    const orgSameAsRelative = await observe(jsonLd(org({ sameAs: '/official-profile' })), 'org-sameas-relative');
+    assert.deepStrictEqual([quality(orgSameAsRelative, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsRelative, 'organization').organizationSameAsValueCount], [1, 1]);
     const orgFamily = await observe(jsonLd([{ '@type': 'Corporation', '@id': '#c', name: 'C', url: '/' }, { '@type': 'LocalBusiness', '@id': '#l', name: 'L', url: '/' }]), 'org-family');
     assert.strictEqual(quality(orgFamily, 'organization').nodeCount, 2);
+    const orgFamilySameAs = await observe(jsonLd([{ '@type': 'Corporation', '@id': '#c', name: 'C', url: '/', sameAs: 'https://profiles.example.test/c' }, { '@type': 'LocalBusiness', '@id': '#l', name: 'L', url: '/', sameAs: ['https://profiles.example.test/l', 'https://profiles.example.test/l2'] }]), 'org-family-sameas');
+    assert.deepStrictEqual([quality(orgFamilySameAs, 'organization').nodeCount, quality(orgFamilySameAs, 'organization').organizationNodesWithSameAsCount, quality(orgFamilySameAs, 'organization').organizationSameAsValueCount], [2, 2, 3]);
     const websiteComplete = await observe(jsonLd(site()), 'website-complete');
     assert.deepStrictEqual(Object.keys(quality(websiteComplete, 'website')).sort(), [
       'missingIdCount', 'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus',
@@ -172,10 +194,13 @@ function quality(signals, family) {
     const orgGraphScripts = await observe(jsonLd({ '@graph': [org(), site()] }) + jsonLd(org({ '@id': '#two' })), 'org-graph-scripts');
     assert.strictEqual(quality(orgGraphScripts, 'organization').nodeCount, 2);
     assert.strictEqual(quality(orgGraphScripts, 'website').nodeCount, 1);
+    const orgSameAsGraphScripts = await observe(jsonLd({ '@graph': [org({ sameAs: 'https://profiles.example.test/graph' })] }) + jsonLd(org({ '@id': '#two', sameAs: ['https://profiles.example.test/script'] })), 'org-sameas-graph-scripts');
+    assert.deepStrictEqual([quality(orgSameAsGraphScripts, 'organization').organizationNodesWithSameAsCount, quality(orgSameAsGraphScripts, 'organization').organizationSameAsValueCount], [2, 2]);
 
     const orgPartialParse = await observe('<script type="application/ld+json">{bad</script>' + jsonLd(org()), 'org-partial-parse');
     assert.strictEqual(quality(orgPartialParse, 'organization').parseStatus, 'parsed');
     assert.strictEqual(quality(orgPartialParse, 'organization').nodeCount, 1);
+    assert.strictEqual(quality(orgPartialParse, 'organization').organizationSameAsValueCount, 0);
     assert.strictEqual(orgPartialParse.structuredData.parseErrorsCount, 1);
     const orgTotalParse = await observe('<script type="application/ld+json">{bad</script>', 'org-total-parse');
     assert.strictEqual(quality(orgTotalParse, 'organization').observed, false);
