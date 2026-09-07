@@ -63,6 +63,8 @@ function quality(signals, family) {
     assert.strictEqual(quality(complete, 'faq').observed, true);
     assert.strictEqual(quality(complete, 'faq').questionCount, 2);
     assert.strictEqual(quality(complete, 'faq').missingAnswerTextCount, 0);
+    assert.strictEqual(quality(complete, 'organization').observed, false);
+    assert.strictEqual(quality(complete, 'website').observed, false);
     assert.strictEqual(complete.structuredData.hasBreadcrumbList, true);
     assert.strictEqual(complete.structuredData.hasFAQPage, true);
     assert.deepStrictEqual(complete.structuredDataQualityV1, complete.structuredData.structuredDataQualityV1);
@@ -131,6 +133,59 @@ function quality(signals, family) {
     assert.strictEqual(quality(absent, 'faq').observed, false);
     assert.strictEqual(absent.structuredData.hasBreadcrumbList, false);
     assert.strictEqual(absent.structuredData.hasFAQPage, false);
+
+    const org = (extra) => Object.assign({ '@type': 'Organization', '@id': 'https://example.test/#org', name: 'Example', url: '/company' }, extra || {});
+    const site = (extra) => Object.assign({ '@type': 'WebSite', '@id': 'https://example.test/#website', name: 'Example', url: '/' }, extra || {});
+    const orgComplete = await observe(jsonLd(org()), 'org-complete');
+    assert.deepStrictEqual(Object.keys(quality(orgComplete, 'organization')).sort(), [
+      'addressObservedCount', 'contactPointObservedCount', 'logoObservedCount', 'missingIdCount',
+      'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus', 'sameAsObservedCount',
+      'sourceFormat', 'telephoneObservedCount'
+    ].sort());
+    assert.strictEqual(quality(orgComplete, 'organization').nodeCount, 1);
+    assert.strictEqual(quality(orgComplete, 'organization').observed, true);
+    assert.strictEqual(quality(orgComplete, 'organization').parseStatus, 'parsed');
+    assert.strictEqual(quality(orgComplete, 'organization').missingIdCount, 0);
+    assert.strictEqual(quality(orgComplete, 'organization').missingNameCount, 0);
+    assert.strictEqual(quality(orgComplete, 'organization').missingUrlCount, 0); // relative URL is allowed
+    assert(Object.values(quality(orgComplete, 'organization')).every((value) => value == null || ['boolean', 'number', 'string'].includes(typeof value)));
+    const orgMissing = await observe(jsonLd(org({ '@id': '', name: '', url: '' })), 'org-missing');
+    assert.deepStrictEqual([quality(orgMissing, 'organization').missingIdCount, quality(orgMissing, 'organization').missingNameCount, quality(orgMissing, 'organization').missingUrlCount], [1, 1, 1]);
+    const orgOptional = await observe(jsonLd(org({ logo: '', sameAs: [], address: '', telephone: '', contactPoint: '' })), 'org-optional');
+    assert.deepStrictEqual([quality(orgOptional, 'organization').missingIdCount, quality(orgOptional, 'organization').missingNameCount, quality(orgOptional, 'organization').missingUrlCount], [0, 0, 0]);
+    const orgFamily = await observe(jsonLd([{ '@type': 'Corporation', '@id': '#c', name: 'C', url: '/' }, { '@type': 'LocalBusiness', '@id': '#l', name: 'L', url: '/' }]), 'org-family');
+    assert.strictEqual(quality(orgFamily, 'organization').nodeCount, 2);
+    const websiteComplete = await observe(jsonLd(site()), 'website-complete');
+    assert.deepStrictEqual(Object.keys(quality(websiteComplete, 'website')).sort(), [
+      'missingIdCount', 'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus',
+      'potentialActionObservedCount', 'publisherObservedCount', 'sourceFormat'
+    ].sort());
+    assert.strictEqual(quality(websiteComplete, 'website').nodeCount, 1);
+    assert.strictEqual(quality(websiteComplete, 'website').observed, true);
+    assert.strictEqual(quality(websiteComplete, 'website').parseStatus, 'parsed');
+    assert.deepStrictEqual([quality(websiteComplete, 'website').missingIdCount, quality(websiteComplete, 'website').missingNameCount, quality(websiteComplete, 'website').missingUrlCount], [0, 0, 0]);
+    assert(Object.values(quality(websiteComplete, 'website')).every((value) => value == null || ['boolean', 'number', 'string'].includes(typeof value)));
+    const websiteMissing = await observe(jsonLd(site({ '@id': '', name: '', url: '' })), 'website-missing');
+    assert.deepStrictEqual([quality(websiteMissing, 'website').missingIdCount, quality(websiteMissing, 'website').missingNameCount, quality(websiteMissing, 'website').missingUrlCount], [1, 1, 1]);
+    const websiteOptional = await observe(jsonLd(site({ publisher: '', potentialAction: '' })), 'website-optional');
+    assert.deepStrictEqual([quality(websiteOptional, 'website').missingIdCount, quality(websiteOptional, 'website').missingNameCount, quality(websiteOptional, 'website').missingUrlCount], [0, 0, 0]);
+    const orgGraphScripts = await observe(jsonLd({ '@graph': [org(), site()] }) + jsonLd(org({ '@id': '#two' })), 'org-graph-scripts');
+    assert.strictEqual(quality(orgGraphScripts, 'organization').nodeCount, 2);
+    assert.strictEqual(quality(orgGraphScripts, 'website').nodeCount, 1);
+
+    const orgPartialParse = await observe('<script type="application/ld+json">{bad</script>' + jsonLd(org()), 'org-partial-parse');
+    assert.strictEqual(quality(orgPartialParse, 'organization').parseStatus, 'parsed');
+    assert.strictEqual(quality(orgPartialParse, 'organization').nodeCount, 1);
+    assert.strictEqual(orgPartialParse.structuredData.parseErrorsCount, 1);
+    const orgTotalParse = await observe('<script type="application/ld+json">{bad</script>', 'org-total-parse');
+    assert.strictEqual(quality(orgTotalParse, 'organization').observed, false);
+    assert.strictEqual(quality(orgTotalParse, 'organization').parseStatus, 'parse_error');
+    assert.strictEqual(quality(orgTotalParse, 'website').parseStatus, 'parse_error');
+    const orgWebsiteAbsent = await observe(jsonLd({ '@type': 'Product', name: 'Example product' }), 'org-website-absent');
+    assert.strictEqual(quality(orgWebsiteAbsent, 'organization').observed, false);
+    assert.strictEqual(quality(orgWebsiteAbsent, 'website').observed, false);
+    assert.strictEqual(quality(orgWebsiteAbsent, 'organization').parseStatus, 'parsed');
+    assert.strictEqual(quality(orgWebsiteAbsent, 'website').parseStatus, 'parsed');
 
     console.log('structured-data-quality-observation: ok');
   } finally {
