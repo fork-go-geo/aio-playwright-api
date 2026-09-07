@@ -12663,6 +12663,106 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         serviceNodeObserved: false,
         serviceProviderLink: false
       };
+      // JSON-LD quality v1 is deliberately summary-only.  It reuses the same
+      // parsed rendered-DOM scripts as type detection and never returns node,
+      // name, URL, or FAQ-answer text to the caller.
+      const structuredDataQualityV1 = {
+        breadcrumb: {
+          observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0,
+          itemListElementCount: 0, itemCount: 0, listItemCount: 0,
+          missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0,
+          invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0
+        },
+        faq: {
+          observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0,
+          mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0,
+          missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0
+        }
+      };
+      const jsonLdTypeNames = (node) => {
+        const raw = node && node['@type'];
+        return (Array.isArray(raw) ? raw : (raw == null ? [] : [raw]))
+          .map((value) => clean(value).toLowerCase().replace(/^https?:\/\/schema\.org\//i, ''))
+          .filter(Boolean);
+      };
+      const hasJsonLdType = (node, name) => jsonLdTypeNames(node).includes(String(name || '').toLowerCase());
+      const nonEmptyValue = (value) => {
+        if (value == null) return false;
+        if (typeof value === 'string' || typeof value === 'number') return !!clean(value);
+        if (Array.isArray(value)) return value.length > 0;
+        return typeof value === 'object' && Object.keys(value).length > 0;
+      };
+      const itemReferencePresent = (value) => {
+        if (typeof value === 'string' || typeof value === 'number') return !!clean(value);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        return nonEmptyValue(value['@id']) || nonEmptyValue(value.url) || nonEmptyValue(value.id);
+      };
+      const flattenJsonLdQualityNodes = (value, out) => {
+        if (Array.isArray(value)) { value.forEach((entry) => flattenJsonLdQualityNodes(entry, out)); return; }
+        if (!value || typeof value !== 'object') return;
+        out.push(value);
+        if (Array.isArray(value['@graph'])) value['@graph'].forEach((entry) => flattenJsonLdQualityNodes(entry, out));
+      };
+      const observeBreadcrumbQualityNode = (node) => {
+        const quality = structuredDataQualityV1.breadcrumb;
+        quality.observed = true;
+        quality.nodeCount += 1;
+        const items = Array.isArray(node.itemListElement) ? node.itemListElement : (nonEmptyValue(node.itemListElement) ? [node.itemListElement] : []);
+        if (!items.length) { quality.missingItemListElementCount += 1; return; }
+        quality.itemListElementCount += 1;
+        quality.itemCount += items.length;
+        const positions = new Set();
+        items.forEach((item) => {
+          if (!item || typeof item !== 'object' || Array.isArray(item) || !hasJsonLdType(item, 'listitem')) {
+            quality.missingListItemCount += 1;
+            return;
+          }
+          quality.listItemCount += 1;
+          const position = item.position;
+          const normalizedPosition = typeof position === 'string' && clean(position) ? Number(clean(position)) : position;
+          if (position == null || (typeof position === 'string' && !clean(position))) quality.missingPositionCount += 1;
+          else if (!(typeof normalizedPosition === 'number' && Number.isInteger(normalizedPosition) && normalizedPosition > 0)) quality.invalidPositionCount += 1;
+          else if (positions.has(normalizedPosition)) quality.duplicatePositionCount += 1;
+          else positions.add(normalizedPosition);
+          if (!nonEmptyValue(item.name)) quality.missingNameCount += 1;
+          // A relative URL is deliberately accepted: only presence is observed.
+          if (!itemReferencePresent(item.item)) quality.missingItemCount += 1;
+        });
+      };
+      const observeFaqQualityNode = (node) => {
+        const quality = structuredDataQualityV1.faq;
+        quality.observed = true;
+        quality.nodeCount += 1;
+        const questions = Array.isArray(node.mainEntity) ? node.mainEntity : (nonEmptyValue(node.mainEntity) ? [node.mainEntity] : []);
+        if (!questions.length) { quality.missingMainEntityCount += 1; return; }
+        quality.mainEntityCount += questions.length;
+        questions.forEach((question) => {
+          if (!question || typeof question !== 'object' || Array.isArray(question) || !hasJsonLdType(question, 'question')) {
+            quality.missingQuestionCount += 1;
+            return;
+          }
+          quality.questionCount += 1;
+          if (!nonEmptyValue(question.name)) quality.missingQuestionNameCount += 1;
+          const answers = Array.isArray(question.acceptedAnswer) ? question.acceptedAnswer : (nonEmptyValue(question.acceptedAnswer) ? [question.acceptedAnswer] : []);
+          const answerNodes = answers.filter((answer) => answer && typeof answer === 'object' && !Array.isArray(answer) && hasJsonLdType(answer, 'answer'));
+          // A non-Answer acceptedAnswer does not satisfy the required Answer
+          // structure, so it is represented as a missing acceptedAnswer fact.
+          if (!answerNodes.length) {
+            quality.missingAcceptedAnswerCount += 1;
+            quality.missingAnswerTextCount += 1;
+            return;
+          }
+          if (!answerNodes.some((answer) => nonEmptyValue(answer.text))) quality.missingAnswerTextCount += 1;
+        });
+      };
+      const observeStructuredDataQuality = (parsed) => {
+        const nodes = [];
+        flattenJsonLdQualityNodes(parsed, nodes);
+        nodes.forEach((node) => {
+          if (hasJsonLdType(node, 'breadcrumblist')) observeBreadcrumbQualityNode(node);
+          if (hasJsonLdType(node, 'faqpage')) observeFaqQualityNode(node);
+        });
+      };
       const walkJsonLd = (node, depth = 0) => {
         if (depth > 8) return;
         if (Array.isArray(node)) {
@@ -12742,9 +12842,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           const parsed = JSON.parse(txt);
           parseableJsonLdCount += 1;
           walkJsonLd(parsed);
+          observeStructuredDataQuality(parsed);
         } catch (_) {
           parseErrorsCount += 1;
         }
+      });
+      [structuredDataQualityV1.breadcrumb, structuredDataQualityV1.faq].forEach((quality) => {
+        quality.parseStatus = parseableJsonLdCount > 0 ? 'parsed' : (rawJsonLd.length > 0 && parseErrorsCount > 0 ? 'parse_error' : 'parsed');
       });
       const typeList = limit(nodeTypes, 50);
       const typeSet = new Set(typeList.map((t) => String(t || '').toLowerCase()));
@@ -13397,6 +13501,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             source: 'seo_jsonld'
           },
           entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
+          structuredDataQualityV1,
           htmlScanSkipped: true,
           jsScanSkipped: true,
           chunkScanSkipped: true,
@@ -13999,6 +14104,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         source: (organizationProfileLight.telephone || organizationProfileLight.address) ? 'jsonld_profile_summary' : 'not_observed'
       },
       sameAsSummary: renderedStructured.sameAsSummary || (htmlContentJsonLdSummary && htmlContentJsonLdSummary.sameAsSummary) || null,
+      // Quality is rendered-DOM JSON-LD only in v1.  Do not merge HTML/static,
+      // script-src, or microdata observations into this contract.
+      structuredDataQualityV1: renderedStructured && renderedStructured.structuredDataQualityV1 || null,
       entityLinkSignals: entityLinkSignalsLight,
       htmlScanSkipped: true,
       jsScanSkipped: true,
@@ -14044,6 +14152,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       url: String(url || ''),
       navigationPathObservationsV1: observed.links && observed.links.navigationPathObservationsV1 || null,
       structuredData: structuredDataLight,
+      structuredDataQualityV1: structuredDataLight.structuredDataQualityV1 || null,
       entityLinkSignals: entityLinkSignalsLight,
       articleSignals,
       headings: {
@@ -17729,6 +17838,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           renderedDomParseableCount: null,
           renderedDomParseErrorsCount: 0,
           renderedDomTypes: [],
+          structuredDataQualityV1: {
+            breadcrumb: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
+            faq: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 }
+          },
           observed: false
         };
         const emptyHtml = {
@@ -17787,6 +17900,77 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             serviceNodeObserved: false,
             serviceProviderLink: false
           };
+          const structuredDataQualityV1 = {
+            breadcrumb: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
+            faq: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 }
+          };
+          const nonEmptyValue = (value) => {
+            if (Array.isArray(value)) return value.some(nonEmptyValue);
+            if (value && typeof value === 'object') return Object.keys(value).length > 0;
+            return clean(value).length > 0;
+          };
+          const hasItemReference = (value) => {
+            if (Array.isArray(value)) return value.some(hasItemReference);
+            if (!value || typeof value !== 'object') return nonEmptyValue(value);
+            return nonEmptyValue(value['@id']) || nonEmptyValue(value.url) || nonEmptyValue(value.id);
+          };
+          const observeQuality = (node, depth = 0) => {
+            if (depth > 8 || node == null) return;
+            if (Array.isArray(node)) return node.forEach((item) => observeQuality(item, depth + 1));
+            if (typeof node !== 'object') return;
+            const names = typeNames(node);
+            if (names.includes('breadcrumblist')) {
+              const summary = structuredDataQualityV1.breadcrumb;
+              summary.observed = true;
+              summary.nodeCount += 1;
+              const elements = Array.isArray(node.itemListElement) ? node.itemListElement : (node.itemListElement == null ? [] : [node.itemListElement]);
+              if (!elements.length) summary.missingItemListElementCount += 1;
+              else {
+                summary.itemListElementCount += 1;
+                summary.itemCount += elements.length;
+                const positions = new Map();
+                elements.forEach((element) => {
+                  if (!element || typeof element !== 'object' || !typeNames(element).includes('listitem')) {
+                    summary.missingListItemCount += 1;
+                    return;
+                  }
+                  summary.listItemCount += 1;
+                  const position = element.position;
+                  const numericPosition = typeof position === 'number' ? position : (typeof position === 'string' && /^\d+$/.test(position.trim()) ? Number(position.trim()) : NaN);
+                  if (position == null || clean(position).length === 0) summary.missingPositionCount += 1;
+                  else if (!Number.isInteger(numericPosition) || numericPosition <= 0) summary.invalidPositionCount += 1;
+                  else positions.set(numericPosition, (positions.get(numericPosition) || 0) + 1);
+                  if (!nonEmptyValue(element.name)) summary.missingNameCount += 1;
+                  // Relative item URLs are permitted: only a missing reference is observed here.
+                  if (!hasItemReference(element.item)) summary.missingItemCount += 1;
+                });
+                positions.forEach((count) => { if (count > 1) summary.duplicatePositionCount += count - 1; });
+              }
+            }
+            if (names.includes('faqpage')) {
+              const summary = structuredDataQualityV1.faq;
+              summary.observed = true;
+              summary.nodeCount += 1;
+              const entities = Array.isArray(node.mainEntity) ? node.mainEntity : (node.mainEntity == null ? [] : [node.mainEntity]);
+              if (!entities.length) summary.missingMainEntityCount += 1;
+              else {
+                summary.mainEntityCount += entities.length;
+                entities.forEach((entity) => {
+                  if (!entity || typeof entity !== 'object' || !typeNames(entity).includes('question')) {
+                    summary.missingQuestionCount += 1;
+                    return;
+                  }
+                  summary.questionCount += 1;
+                  if (!nonEmptyValue(entity.name)) summary.missingQuestionNameCount += 1;
+                  const answers = Array.isArray(entity.acceptedAnswer) ? entity.acceptedAnswer : (entity.acceptedAnswer == null ? [] : [entity.acceptedAnswer]);
+                  const validAnswers = answers.filter((answer) => answer && typeof answer === 'object' && typeNames(answer).includes('answer'));
+                  if (!validAnswers.length) summary.missingAcceptedAnswerCount += 1;
+                  if (!validAnswers.some((answer) => nonEmptyValue(answer.text))) summary.missingAnswerTextCount += 1;
+                });
+              }
+            }
+            if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => observeQuality(item, depth + 1));
+          };
           let orgNodeObserved = false;
           let seoNodeObserved = false;
           const walk = (node, depth = 0) => {
@@ -17835,7 +18019,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           };
           texts.forEach((txt) => {
             try {
-              walk(JSON.parse(txt), 0);
+              const parsed = JSON.parse(txt);
+              walk(parsed, 0);
+              observeQuality(parsed, 0);
               parseableCount += 1;
             } catch (_) {
               parseErrorsCount += 1;
@@ -17849,6 +18035,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           if (entityLinkPresence.serviceNodeObserved) {
             entityLinkSignals.hasServiceProviderLink = entityLinkPresence.serviceProviderLink === true;
           }
+          const qualityParseStatus = parseableCount > 0 ? 'parsed' : (texts.length > 0 && parseErrorsCount > 0 ? 'parse_error' : 'parsed');
+          structuredDataQualityV1.breadcrumb.parseStatus = qualityParseStatus;
+          structuredDataQualityV1.faq.parseStatus = qualityParseStatus;
           return {
             renderedDomRawCount: texts.length,
             renderedDomParseableCount: parseableCount,
@@ -17885,6 +18074,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               : [],
             contactPointSource: 'seo_jsonld',
             entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
+            structuredDataQualityV1,
             observed: true
           };
         }), 1200, 'structuredDataLight_renderedDom').catch((e) => Object.assign({}, emptyRendered, {
@@ -17905,6 +18095,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           renderedOrganizationSummary: rendered.organizationSummary || null,
           htmlOrganizationSummary: htmlSummary && htmlSummary.organizationSummary || null,
           renderedSameAsSummary: rendered.sameAsSummary || null,
+          renderedStructuredDataQualityV1: rendered.structuredDataQualityV1 || null,
           htmlSameAsSummary: htmlSummary && htmlSummary.sameAsSummary || null,
           renderedEntityLinkSignals: rendered.entityLinkSignals || null,
           htmlEntityLinkSignals: htmlSummary && htmlSummary.entityLinkSignals || null,
@@ -18643,6 +18834,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         hasOrganization: hasJsonLdObserved ? mergedTypeClass.hasOrganization : null,
         hasBreadcrumbList: hasJsonLdObserved ? mergedTypeClass.hasBreadcrumbList : null,
         hasFAQPage: hasJsonLdObserved ? mergedTypeClass.hasFAQPage : null,
+        // JSON-LD-only structure facts. HTML/microdata and script-src JSON-LD are deliberately excluded.
+        structuredDataQualityV1: structuredLight.renderedStructuredDataQualityV1 || null,
         breadcrumbObserved: hasJsonLdObserved ? true : null,
         breadcrumbMissing: hasJsonLdObserved ? !mergedTypeClass.hasBreadcrumbList : null,
         organizationSummary,
@@ -18729,6 +18922,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         generatedAt: new Date().toISOString(),
         url: String(finalUrl || urlToFetch || ''),
         structuredData: structuredDataLight,
+        structuredDataQualityV1: structuredDataLight.structuredDataQualityV1 || null,
         entityLinkSignals: entityLinkSignalsLight,
         articleSignals,
         geoThemeSignals,
@@ -19097,6 +19291,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         hasOrgJsonLd: structuredDataLight.hasOrganization,
         hasBreadcrumbJsonLd: structuredDataLight.hasBreadcrumbList,
         hasFaqJsonLd: structuredDataLight.hasFAQPage,
+        structuredDataQualityV1: structuredDataLight.structuredDataQualityV1 || null,
         entityLinkSignals: structuredDataLight.entityLinkSignals,
         articleSignals,
         structuredDataBreadcrumbObserved: structuredDataLight.breadcrumbObserved,
@@ -20719,6 +20914,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         structuredDataScriptSrcJsonLdTypes: Array.isArray(structuredObserved.scriptSrcJsonLdTypes) ? structuredObserved.scriptSrcJsonLdTypes.slice(0, 50) : [],
         structuredDataExcludedFromSeoTypes: Array.isArray(structuredObserved.excludedFromSeoTypes) ? structuredObserved.excludedFromSeoTypes.slice(0, 50) : [],
         structuredDataTypeClassificationSource: structuredObserved.typeClassificationSource || '',
+        structuredDataQualityV1: structuredObserved.structuredDataQualityV1 || null,
         organizationSummary: structuredObserved.organizationSummary || null,
         organizationProfile: structuredObserved.organizationProfile || { telephone: null, address: null },
         organizationProfileAudit: structuredObserved.organizationProfileAudit || {
