@@ -20914,7 +20914,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         structuredDataScriptSrcJsonLdTypes: Array.isArray(structuredObserved.scriptSrcJsonLdTypes) ? structuredObserved.scriptSrcJsonLdTypes.slice(0, 50) : [],
         structuredDataExcludedFromSeoTypes: Array.isArray(structuredObserved.excludedFromSeoTypes) ? structuredObserved.excludedFromSeoTypes.slice(0, 50) : [],
         structuredDataTypeClassificationSource: structuredObserved.typeClassificationSource || '',
-        structuredDataQualityV1: structuredObserved.structuredDataQualityV1 || null,
+        // `structuredObserved` is the legacy light bridge. The quality summary
+        // is emitted by the rendered JSON-LD observer on geoSignalsV1, so use
+        // that canonical observation when the legacy bridge has not adopted it.
+        structuredDataQualityV1: structuredObserved.structuredDataQualityV1 || (geoSignalsV1 && geoSignalsV1.structuredDataQualityV1) || null,
         organizationSummary: structuredObserved.organizationSummary || null,
         organizationProfile: structuredObserved.organizationProfile || { telephone: null, address: null },
         organizationProfileAudit: structuredObserved.organizationProfileAudit || {
