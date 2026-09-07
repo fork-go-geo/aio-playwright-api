@@ -12679,7 +12679,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0
         },
         organization: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
-        website: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 }
+        website: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
+        product: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
       };
       const jsonLdTypeNames = (node) => {
         const raw = node && node['@type'];
@@ -12764,14 +12765,20 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           if (hasJsonLdType(node, 'breadcrumblist')) observeBreadcrumbQualityNode(node);
           if (hasJsonLdType(node, 'faqpage')) observeFaqQualityNode(node);
           const types = jsonLdTypeNames(node);
-          const family = types.some((t) => ['organization', 'corporation', 'localbusiness'].includes(t)) ? 'organization' : (types.includes('website') ? 'website' : '');
+          const family = types.some((t) => ['organization', 'corporation', 'localbusiness'].includes(t)) ? 'organization' : (types.includes('website') ? 'website' : (types.includes('product') ? 'product' : ''));
           if (!family) return;
           const quality = structuredDataQualityV1[family];
           quality.observed = true; quality.nodeCount += 1;
           if (!nonEmptyValue(node['@id'])) quality.missingIdCount += 1;
           if (!nonEmptyValue(node.name)) quality.missingNameCount += 1;
           if (!nonEmptyValue(node.url)) quality.missingUrlCount += 1;
-          if (family === 'organization') {
+          if (family === 'product') {
+            if (!nonEmptyValue(node.description)) quality.missingDescriptionCount += 1;
+            if (nonEmptyValue(node.image)) quality.imageObservedCount += 1;
+            if (nonEmptyValue(node.brand)) quality.brandObservedCount += 1;
+            const offers = Array.isArray(node.offers) ? node.offers : (node.offers == null ? [] : [node.offers]);
+            offers.forEach((offer) => { if (!offer || typeof offer !== 'object') return; quality.offerObservedCount += 1; if (!nonEmptyValue(offer.price)) quality.offerMissingPriceCount += 1; if (!nonEmptyValue(offer.priceCurrency)) quality.offerMissingCurrencyCount += 1; });
+          } else if (family === 'organization') {
             ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) quality[`${key}ObservedCount`] += 1; });
           } else {
             if (nonEmptyValue(node.publisher)) quality.publisherObservedCount += 1;
@@ -17858,7 +17865,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             breadcrumb: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
             faq: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 },
             organization: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
-            website: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 }
+            website: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
+            product: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
           },
           observed: false
         };
@@ -17922,7 +17930,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             breadcrumb: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
             faq: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 },
             organization: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
-            website: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 }
+            website: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
+            product: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
           };
           const nonEmptyValue = (value) => {
             if (Array.isArray(value)) return value.some(nonEmptyValue);
@@ -17989,13 +17998,14 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
                 });
               }
             }
-            const family = names.some((name) => ['organization', 'corporation', 'localbusiness'].includes(name)) ? 'organization' : (names.includes('website') ? 'website' : '');
+            const family = names.some((name) => ['organization', 'corporation', 'localbusiness'].includes(name)) ? 'organization' : (names.includes('website') ? 'website' : (names.includes('product') ? 'product' : ''));
             if (family) {
               const summary = structuredDataQualityV1[family]; summary.observed = true; summary.nodeCount += 1;
               if (!nonEmptyValue(node['@id'])) summary.missingIdCount += 1;
               if (!nonEmptyValue(node.name)) summary.missingNameCount += 1;
               if (!nonEmptyValue(node.url)) summary.missingUrlCount += 1;
-              if (family === 'organization') ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) summary[`${key}ObservedCount`] += 1; });
+              if (family === 'product') { if (!nonEmptyValue(node.description)) summary.missingDescriptionCount += 1; if (nonEmptyValue(node.image)) summary.imageObservedCount += 1; if (nonEmptyValue(node.brand)) summary.brandObservedCount += 1; const offers=Array.isArray(node.offers)?node.offers:(node.offers==null?[]:[node.offers]); offers.forEach((offer)=>{if(!offer||typeof offer!=='object')return;summary.offerObservedCount+=1;if(!nonEmptyValue(offer.price))summary.offerMissingPriceCount+=1;if(!nonEmptyValue(offer.priceCurrency))summary.offerMissingCurrencyCount+=1;}); }
+              else if (family === 'organization') ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) summary[`${key}ObservedCount`] += 1; });
               else { if (nonEmptyValue(node.publisher)) summary.publisherObservedCount += 1; if (nonEmptyValue(node.potentialAction)) summary.potentialActionObservedCount += 1; }
             }
             if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => observeQuality(item, depth + 1));

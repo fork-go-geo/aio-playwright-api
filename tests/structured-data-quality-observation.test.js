@@ -187,6 +187,32 @@ function quality(signals, family) {
     assert.strictEqual(quality(orgWebsiteAbsent, 'organization').parseStatus, 'parsed');
     assert.strictEqual(quality(orgWebsiteAbsent, 'website').parseStatus, 'parsed');
 
+    const product = (extra) => Object.assign({ '@type': 'Product', name: 'Example product', description: 'Example description' }, extra || {});
+    const productComplete = await observe(jsonLd(product()), 'product-complete');
+    assert.strictEqual(quality(productComplete, 'product').observed, true);
+    assert.deepStrictEqual([quality(productComplete, 'product').missingNameCount, quality(productComplete, 'product').missingDescriptionCount], [0, 0]);
+    const productTypeOnly = await observe(jsonLd({ '@type': 'Product' }), 'product-type-only');
+    assert.deepStrictEqual([quality(productTypeOnly, 'product').missingNameCount, quality(productTypeOnly, 'product').missingDescriptionCount], [1, 1]);
+    const productMissingName = await observe(jsonLd(product({ name: '' })), 'product-missing-name');
+    assert.strictEqual(quality(productMissingName, 'product').missingNameCount, 1);
+    const productMissingDescription = await observe(jsonLd(product({ description: '' })), 'product-missing-description');
+    assert.strictEqual(quality(productMissingDescription, 'product').missingDescriptionCount, 1);
+    const productOptional = await observe(jsonLd(product({ '@id': '', url: '', image: '', brand: '', offers: { '@type': 'Offer' } })), 'product-optional');
+    assert.deepStrictEqual([quality(productOptional, 'product').missingNameCount, quality(productOptional, 'product').missingDescriptionCount], [0, 0]);
+    assert.strictEqual(quality(productOptional, 'product').offerMissingPriceCount, 1);
+    const productMany = await observe(jsonLd([{ '@type': 'Product', name: 'A', description: 'A' }, { '@type': 'Product', name: 'B' }]), 'product-multiple');
+    assert.strictEqual(quality(productMany, 'product').nodeCount, 2);
+    assert.strictEqual(quality(productMany, 'product').missingDescriptionCount, 1);
+    const productGraph = await observe(jsonLd({ '@graph': [product()] }) + jsonLd(product({ name: 'Second' })), 'product-graph-scripts');
+    assert.strictEqual(quality(productGraph, 'product').nodeCount, 2);
+    const productPartial = await observe('<script type="application/ld+json">{bad</script>' + jsonLd(product()), 'product-partial');
+    assert.strictEqual(quality(productPartial, 'product').parseStatus, 'parsed');
+    const productTotal = await observe('<script type="application/ld+json">{bad</script>', 'product-total');
+    assert.strictEqual(quality(productTotal, 'product').parseStatus, 'parse_error');
+    const productAbsent = await observe(jsonLd({ '@type': 'WebSite', name: 'Example' }), 'product-absent');
+    assert.strictEqual(quality(productAbsent, 'product').observed, false);
+    assert.strictEqual(quality(productAbsent, 'product').parseStatus, 'parsed');
+
     console.log('structured-data-quality-observation: ok');
   } finally {
     await globalThis.__structuredQualityBrowser.close();
