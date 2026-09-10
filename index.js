@@ -9807,6 +9807,22 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
     }
+    // The producer is a response contract, not a successful-coverage contract.
+    // Seed a fail-closed UNKNOWN before any coverage early return; the normal
+    // discovery/observation path below replaces it with completed evidence.
+    geoSignalsV1.operatorIdentityObservationV1 = buildOperatorIdentityObservationV1_({
+      siteMode,
+      inputObserved: false,
+      observationLimited: null,
+      discoveryComplete: false,
+      candidateCount: null,
+      selectedCount: null,
+      candidateCapped: null,
+      baseScopeComplete: false,
+      completedRoles: [],
+      pages: [],
+      limitations: ['coverage_not_completed']
+    });
     // coverage は core DOM の後段補助観測。残予算が少なければ core response を
     // 守るために丸ごと skip し、partial core response を失敗扱いにはしない。
     if (lightBudget && getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESERVE_MS) < 1200) {
