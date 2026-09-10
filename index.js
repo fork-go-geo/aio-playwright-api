@@ -4789,6 +4789,33 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
           : 'structural_breadcrumb';
         return true;
       });
+      // COVER_ONLY source evidence: values remain scoped in memory and are
+      // compacted before the public producer record is emitted.
+      const operatorIdentityEvidence = [];
+      const operatorLabel = /(?:会社名|法人名|事業者名|販売業者|運営(?:会社|者)|代表者|名称|商号|company|corporate|operator|seller|publisher|editor)/i;
+      const addOperatorEvidence = (label, value, el) => {
+        const cleanLabel = clean(label).slice(0, 80);
+        const cleanValue = clean(value).slice(0, 160);
+        if (!cleanLabel || !cleanValue || !operatorLabel.test(cleanLabel) || !isVisible(el)) return;
+        const key = `${cleanLabel}\n${cleanValue}`;
+        if (operatorIdentityEvidence.some(item => item.key === key) || operatorIdentityEvidence.length >= 6) return;
+        operatorIdentityEvidence.push({ key, label: cleanLabel, value: cleanValue, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
+      };
+      Array.from(document.querySelectorAll('table tr')).slice(0, 120).forEach(row => {
+        const cells = Array.from(row.querySelectorAll('th,td'));
+        if (cells.length >= 2) addOperatorEvidence(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row);
+      });
+      Array.from(document.querySelectorAll('dl')).slice(0, 40).forEach(dl => {
+        Array.from(dl.querySelectorAll('dt')).slice(0, 30).forEach(dt => {
+          const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName || '').toLowerCase() === 'dd' ? dt.nextElementSibling : null;
+          if (dd) addOperatorEvidence(dt.textContent, dd.textContent, dt);
+        });
+      });
+      Array.from(document.querySelectorAll('[data-operator], [class*="operator" i], [class*="company" i], [class*="corporate" i], [class*="seller" i], [class*="publisher" i]')).slice(0, 40).forEach(block => {
+        const text = clean(block.innerText || block.textContent);
+        const match = text.match(/([^:：\n]{1,40}(?:会社名|法人名|事業者名|販売業者|運営(?:会社|者)|代表者|名称|商号|company|corporate|operator|seller|publisher|editor)[^:：\n]{0,20})\s*[:：]\s*([^\n]{1,160})/i);
+        if (match) addOperatorEvidence(match[1], match[2], block);
+      });
       return {
         title: clean(document.title).slice(0, 180),
         canonical,
@@ -4805,6 +4832,7 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
         externalLinkCount,
         bodyTextLength: scopedText.length,
         sampledText: scopedText.slice(0, 500),
+        operatorIdentityEvidence,
         scopedAudit: {
           domProbe: {
             titleLength: clean(document.title).length,
