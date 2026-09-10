@@ -4318,6 +4318,8 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
       const isVisible = el => {
         try {
           if (!el || !el.getBoundingClientRect) return false;
+          if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+          if (el.closest && el.closest('[aria-hidden="true"]')) return false;
           const style = window.getComputedStyle(el);
           if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
           const rect = el.getBoundingClientRect();
@@ -4542,6 +4544,34 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
           else externalLinkCount += 1;
         } catch (_) {}
       });
+      // This is deliberately limited to visible label/value structures.  The values
+      // remain in the in-memory scoped observation only; the public COVER_ONLY
+      // payload below emits no operator name, address, telephone, or raw text.
+      const operatorIdentityEvidence = [];
+      const operatorLabel = /(?:会社名|法人名|事業者名|販売業者|運営(?:会社|者)|代表者|名称|商号|company|corporate|operator|seller|publisher|editor)/i;
+      const addOperatorEvidence = (label, value, el) => {
+        const cleanLabel = clean(label).slice(0, 80);
+        const cleanValue = clean(value).slice(0, 160);
+        if (!cleanLabel || !cleanValue || !operatorLabel.test(cleanLabel) || !isVisible(el)) return;
+        const key = `${cleanLabel}\n${cleanValue}`;
+        if (operatorIdentityEvidence.some(item => item.key === key) || operatorIdentityEvidence.length >= 6) return;
+        operatorIdentityEvidence.push({ key, label: cleanLabel, value: cleanValue, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
+      };
+      Array.from(document.querySelectorAll('table tr')).slice(0, 120).forEach(row => {
+        const cells = Array.from(row.querySelectorAll('th,td'));
+        if (cells.length >= 2) addOperatorEvidence(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row);
+      });
+      Array.from(document.querySelectorAll('dl')).slice(0, 40).forEach(dl => {
+        Array.from(dl.querySelectorAll('dt')).slice(0, 30).forEach(dt => {
+          const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName || '').toLowerCase() === 'dd' ? dt.nextElementSibling : null;
+          if (dd) addOperatorEvidence(dt.textContent, dd.textContent, dt);
+        });
+      });
+      Array.from(document.querySelectorAll('[data-operator], [class*="operator" i], [class*="company" i], [class*="corporate" i], [class*="seller" i], [class*="publisher" i]')).slice(0, 40).forEach(block => {
+        const text = clean(block.innerText || block.textContent);
+        const match = text.match(/([^:：\n]{1,40}(?:会社名|法人名|事業者名|販売業者|運営(?:会社|者)|代表者|名称|商号|company|corporate|operator|seller|publisher|editor)[^:：\n]{0,20})\s*[:：]\s*([^\n]{1,160})/i);
+        if (match) addOperatorEvidence(match[1], match[2], block);
+      });
       return {
         title: clean(document.title).slice(0, 180),
         canonical,
@@ -4557,6 +4587,7 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
         externalLinkCount,
         bodyTextLength: scopedText.length,
         sampledText: scopedText.slice(0, 500),
+        operatorIdentityEvidence,
         scopedAudit: {
           domProbe: {
             titleLength: clean(document.title).length,
@@ -4729,6 +4760,9 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
       externalLinkCount: Number(observed.externalLinkCount || 0),
       bodyTextLength: Number(observed.bodyTextLength || 0),
       sampledText: normalizeSubpageJsonLdText(observed.sampledText).slice(0, 500),
+      operatorIdentityEvidence: Array.isArray(observed.operatorIdentityEvidence)
+        ? observed.operatorIdentityEvidence.slice(0, 6)
+        : [],
       scopedExtractionSource: 'playwright_scoped_light',
       scopedTextSource: scopedAudit.textProbe && scopedAudit.textProbe.selectedTextSource || '',
       scopedHeadingSource: scopedAudit.headingProbe && scopedAudit.headingProbe.selectedHeadingSource || '',
@@ -9303,6 +9337,255 @@ function pickBestContactSignals_(pages) {
   };
 }
 
+const OPERATOR_IDENTITY_OBSERVATION_V1_AUTHORITY = 'geoSignalsV1_operator_identity_v1';
+
+function normalizeOperatorIdentitySiteMode_(siteMode) {
+  const mode = String(siteMode || '').toLowerCase();
+  if (mode === 'corporate' || mode === 'corp') return 'corp';
+  if (mode === 'service' || mode === 'saas') return 'saas';
+  if (mode === 'ec' || mode === 'ecommerce' || mode === 'e-commerce') return 'ec';
+  if (mode === 'media') return 'media';
+  if (mode === 'shop' || mode === 'facility') return 'shop_facility';
+  return 'unknown';
+}
+
+function operatorIdentityRoleForCandidate_(candidate) {
+  const text = [candidate && candidate.url, candidate && candidate.path, candidate && candidate.label]
+    .map(value => String(value || '').toLowerCase()).join(' ');
+  if (isLegalOperatorCandidatePath_(text) || isLegalOperatorCandidateText_(text)) return 'legal';
+  if (/(?:about|company|corporate|profile|outline|about-us|会社概要|企業情報|運営会社)/i.test(text)) return 'about';
+  if (/(?:editorial|publisher|編集|発行者|運営者)/i.test(text)) return 'publisher';
+  return null;
+}
+
+function getOperatorIdentityRequiredRoles_(siteMode) {
+  if (siteMode === 'media') return ['publisher', 'legal'];
+  if (siteMode === 'ec') return ['about', 'legal'];
+  if (siteMode === 'corp' || siteMode === 'saas') return ['about', 'legal'];
+  return [];
+}
+
+function getOperatorIdentityAdditionalFetchCap_(siteMode) {
+  return ({ corp: 2, saas: 2, ec: 3, media: 2, shop_facility: 0 })[siteMode] || 0;
+}
+
+function compactOperatorIdentityEvidence_(pages) {
+  const evidence = [];
+  const identityTokensByRole = new Map();
+  (Array.isArray(pages) ? pages : []).forEach(page => {
+    if (!page || page.ok !== true || page.observationMethod !== 'playwright_scoped_light') return;
+    const sourceUrl = String(page.finalUrl || page.url || '');
+    let sourcePath = '';
+    try { sourcePath = new URL(sourceUrl).pathname || '/'; } catch (_) { sourcePath = sourceUrl.slice(0, 160); }
+    (Array.isArray(page.operatorIdentityEvidence) ? page.operatorIdentityEvidence : []).forEach(item => {
+      if (!item || !String(item.value || '').trim()) return;
+      const role = page.operatorIdentityRole || operatorIdentityRoleForCandidate_(page) || 'top';
+      if (!identityTokensByRole.has(role)) identityTokensByRole.set(role, new Set());
+      identityTokensByRole.get(role).add(String(item.value).replace(/\s+/g, ' ').trim().toLowerCase());
+      if (evidence.length < 3) evidence.push({
+        type: 'visible_label_value',
+        role,
+        sourcePath: String(sourcePath || '/').slice(0, 160),
+        sourceScope: item.sourceScope === 'footer' ? 'footer' : 'content',
+        extractionMethod: 'rendered_visible_label_value',
+        label: String(item.label || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+      });
+    });
+  });
+  return { evidence, conflict: Array.from(identityTokensByRole.values()).some(tokens => tokens.size > 1) };
+}
+
+// Pure finalizer: false is intentionally impossible unless every completion
+// condition is explicit.  Runtime fetch/discovery issues therefore fail closed
+// to unknown, while strong rendered evidence can still establish true.
+function buildOperatorIdentityObservationV1_(input = {}) {
+  const siteMode = normalizeOperatorIdentitySiteMode_(input.siteMode);
+  const maxAdditionalFetch = getOperatorIdentityAdditionalFetchCap_(siteMode);
+  const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
+  const pages = Array.isArray(input.pages) ? input.pages : [];
+  const compacted = compactOperatorIdentityEvidence_(pages);
+  const limitations = Array.isArray(input.limitations) ? input.limitations.filter(Boolean).slice(0, 5) : [];
+  const failures = Array.isArray(input.failures) ? input.failures.filter(Boolean).slice(0, 5) : [];
+  const completedRoles = Array.isArray(input.completedRoles) ? input.completedRoles : [];
+  const requiredScopesComplete = requiredRoles.every(role => completedRoles.includes(role));
+  const conflict = compacted.conflict;
+  const baseScopeComplete = input.baseScopeComplete === true;
+  const discoveryComplete = input.discoveryComplete === true;
+  const fetchedCount = Math.max(0, Number(input.additionalFetchCount || 0) || 0);
+  let status = 'unknown';
+  let reasonCodes = [];
+  let applicability = 'applicable';
+  if (siteMode === 'shop_facility') {
+    applicability = 'not_applicable';
+    reasonCodes = ['site_mode_not_applicable'];
+  } else if (compacted.evidence.length > 0 && !conflict) {
+    status = 'true';
+    reasonCodes = ['visible_rendered_operator_identity_evidence'];
+  } else if (conflict) {
+    reasonCodes = ['operator_identity_conflict'];
+  } else if (!discoveryComplete) {
+    reasonCodes = ['discovery_incomplete'];
+  } else if (!baseScopeComplete) {
+    reasonCodes = ['base_scope_incomplete'];
+  } else if (input.inputObserved !== true) {
+    reasonCodes = ['input_not_observed'];
+  } else if (input.observationLimited !== false) {
+    reasonCodes = ['observation_completion_missing'];
+  } else if (!requiredScopesComplete) {
+    reasonCodes = ['required_scope_incomplete'];
+  } else if (input.candidateCapped === true) {
+    reasonCodes = ['candidate_cap_reached'];
+  } else if (limitations.length) {
+    reasonCodes = ['observation_limited'];
+  } else if (failures.length) {
+    reasonCodes = ['required_fetch_failed'];
+  } else {
+    status = 'false';
+    reasonCodes = ['all_required_rendered_scopes_completed_without_identity_evidence'];
+  }
+  return {
+    version: 1,
+    authority: OPERATOR_IDENTITY_OBSERVATION_V1_AUTHORITY,
+    siteMode,
+    applicability,
+    signalState: status,
+    inputObserved: input.inputObserved === true ? true : (input.inputObserved === false ? false : null),
+    observationLimited: limitations.length > 0 ? true : (input.observationLimited === false ? false : null),
+    discovery: {
+      complete: discoveryComplete ? true : (input.discoveryComplete === false ? false : null),
+      candidateCount: Number.isFinite(Number(input.candidateCount)) ? Number(input.candidateCount) : null,
+      selectedCount: Number.isFinite(Number(input.selectedCount)) ? Number(input.selectedCount) : null,
+      capped: input.candidateCapped === true ? true : (input.candidateCapped === false ? false : null)
+    },
+    reasonCodes,
+    scopes: {
+      required: requiredRoles,
+      observed: completedRoles.filter(role => requiredRoles.includes(role)),
+      failed: failures.map(value => String(value).replace(/^required_|_(?:fetch_)?failed$/g, '')).slice(0, 5)
+    },
+    scopeComplete: baseScopeComplete && requiredScopesComplete && input.candidateCapped === false && limitations.length === 0 && failures.length === 0,
+    additionalFetchCount: fetchedCount,
+    maxAdditionalFetch,
+    strongEvidenceCount: compacted.evidence.length,
+    evidence: compacted.evidence,
+    conflict,
+    failureReasons: Array.from(new Set([...failures, ...limitations])).slice(0, 5)
+  };
+}
+
+async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
+  const siteMode = normalizeOperatorIdentitySiteMode_(input.siteMode);
+  const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
+  const cap = getOperatorIdentityAdditionalFetchCap_(siteMode);
+  const candidates = Array.isArray(input.candidates) ? input.candidates : [];
+  const pages = (Array.isArray(input.pages) ? input.pages : []).map(page => Object.assign({}, page || {}, {
+    operatorIdentityRole: operatorIdentityRoleForCandidate_(page)
+  }));
+  const limitations = Array.isArray(input.limitations) ? input.limitations.slice() : [];
+  const failures = [];
+  const selectedByRole = new Map();
+  requiredRoles.forEach(role => {
+    const candidate = candidates.find(item => operatorIdentityRoleForCandidate_(item) === role);
+    if (candidate) selectedByRole.set(role, candidate);
+  });
+  let additionalFetchCount = 0;
+  for (const [role, candidate] of selectedByRole.entries()) {
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    const existing = pages.find(page => key && discoverSubpageCandidateKey(page && (page.finalUrl || page.url) || '') === key);
+    if (existing && existing.observationMethod === 'playwright_scoped_light') continue;
+    if (additionalFetchCount >= cap) {
+      limitations.push('additional_fetch_cap_reached');
+      continue;
+    }
+    if (!input.context || typeof input.context.newPage !== 'function') {
+      limitations.push('playwright_context_unavailable');
+      continue;
+    }
+    // HTML-only coverage is not treated as rendered evidence; this bounded
+    // Playwright observation is the only additional fetch allowed here.
+    const page = await fetchSubpagePlaywrightScopedLight(candidate.url, {
+      context: input.context,
+      siteMode,
+      timeout: 8000
+    });
+    additionalFetchCount += 1;
+    const sameOrigin = (() => {
+      try { return new URL(page && (page.finalUrl || page.url) || '').origin === String(input.origin || ''); } catch (_) { return false; }
+    })();
+    if (page && page.ok === true && sameOrigin) {
+      pages.push(Object.assign({}, page, { operatorIdentityRole: role }));
+    } else {
+      failures.push(sameOrigin ? `required_${role}_fetch_failed` : 'redirect_outside_origin');
+    }
+  }
+  const completedRoles = requiredRoles.filter(role => {
+    const candidate = selectedByRole.get(role);
+    if (!candidate) return false;
+    const key = discoverSubpageCandidateKey(candidate.url || '');
+    return pages.some(page => key && discoverSubpageCandidateKey(page && (page.finalUrl || page.url) || '') === key &&
+      page.ok === true && page.observationMethod === 'playwright_scoped_light');
+  });
+  if (Number(input.candidateCount || 0) === 0 && input.discoveryComplete === true) {
+    requiredRoles.forEach(role => {
+      if (!completedRoles.includes(role)) completedRoles.push(role);
+    });
+  }
+  requiredRoles.forEach(role => {
+    if (!selectedByRole.has(role)) limitations.push(`required_${role}_candidate_missing`);
+  });
+  return buildOperatorIdentityObservationV1_({
+    siteMode,
+    pages,
+    completedRoles,
+    baseScopeComplete: input.baseScopeComplete === true,
+    discoveryComplete: input.discoveryComplete === true,
+    limitations,
+    failures,
+    additionalFetchCount,
+    inputObserved: input.inputObserved,
+    observationLimited: input.observationLimited,
+    candidateCount: input.candidateCount,
+    selectedCount: input.selectedCount,
+    candidateCapped: input.candidateCapped
+  });
+}
+
+async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  try {
+    const evidence = await page.evaluate(() => {
+      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        if (!el || el.getAttribute('aria-hidden') === 'true' || el.closest('[aria-hidden="true"]')) return false;
+        const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+      };
+      const labelRx = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|company|corporate|operator|seller|merchant|publisher)/i;
+      const out = [];
+      const add = (label, value, el) => {
+        label = clean(label).slice(0, 80); value = clean(value).slice(0, 160);
+        if (!label || !value || !labelRx.test(label) || !visible(el) || out.length >= 6) return;
+        if (!out.some(item => item.label === label && item.value === value)) out.push({ label, value, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
+      };
+      Array.from(document.querySelectorAll('table tr')).slice(0, 100).forEach(row => {
+        const cells = Array.from(row.querySelectorAll('th,td'));
+        if (cells.length > 1) add(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row);
+      });
+      Array.from(document.querySelectorAll('dl dt')).slice(0, 80).forEach(dt => {
+        const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName).toLowerCase() === 'dd' ? dt.nextElementSibling : null;
+        if (dd) add(dt.textContent, dd.textContent, dt);
+      });
+      return {
+        evidence: out,
+        baseScopeComplete: !!document.body && !!document.querySelector('header') && !!document.querySelector('nav,[role="navigation"]') && !!document.querySelector('footer,[role="contentinfo"]')
+      };
+    });
+    return { url, finalUrl: url, ok: true, observationMethod: 'playwright_scoped_light', operatorIdentityRole: 'top', operatorIdentityEvidence: evidence && evidence.evidence || [], baseScopeComplete: evidence && evidence.baseScopeComplete === true };
+  } catch (_) {
+    return null;
+  }
+}
+
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const lightBudget = opts && opts.lightBudget || null;
   const normalized = normalizeDiscoverTopUrl(topUrl);
@@ -10007,6 +10290,33 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const budgetLimitedCandidateCount = observations.filter(page => page && page.errorStage === 'budget').length;
     const timedOutCandidateCount = observations.filter(page => page && page.errorStage === 'timeout').length;
     const observationLimited = budgetLimitedCandidateCount > 0 || timedOutCandidateCount > 0 || coverageBudgetStages.length > 0;
+    // COVER_ONLY producer. This remains independent of GAS, rules, cards,
+    // scoring, persistence, and PDF. Existing scoped pages are reused first.
+    const topOperatorIdentityPage = await collectTopOperatorIdentityRenderedEvidence_(opts && opts.page, normalized.topUrl);
+    geoSignalsV1.operatorIdentityObservationV1 = await buildRuntimeOperatorIdentityObservationV1_({
+      siteMode,
+      candidates: discovered.candidates,
+      pages: topOperatorIdentityPage ? observed.pages.concat([topOperatorIdentityPage]) : observed.pages,
+      context: opts && opts.context,
+      origin: normalized.origin,
+      baseScopeComplete: !!(topOperatorIdentityPage && topOperatorIdentityPage.baseScopeComplete === true),
+      // Sitemap absence is non-fatal when the normal nav/footer discovery
+      // completed. Other discovery errors remain an explicit unknown.
+      discoveryComplete: (() => {
+        const errors = Array.isArray(discovered.errors) ? discovered.errors : null;
+        if (!errors) return false;
+        const nonSitemapError = errors.some(error => !/^(?:sitemap|htmlSitemap)$/i.test(String(error && error.source || '')));
+        const sources = discovered.sourceSummary && typeof discovered.sourceSummary === 'object' ? discovered.sourceSummary : {};
+        const fallbackObserved = Number(sources.nav || 0) > 0 || Number(sources.footer || 0) > 0 || Number(sources.article || 0) > 0;
+        return !nonSitemapError && (errors.length === 0 || fallbackObserved);
+      })(),
+      limitations: observationLimited ? ['observation_limited'] : [],
+      inputObserved: true,
+      observationLimited,
+      candidateCount: discovered.totalCandidates,
+      selectedCount: selectedCandidates.length,
+      candidateCapped: discovered.totalCandidates > (Array.isArray(discovered.candidates) ? discovered.candidates.length : 0)
+    });
     const payload = {
       topUrl: normalized.topUrl,
       origin: normalized.origin,
@@ -24043,6 +24353,12 @@ module.exports.__lightBudgetTestHooks = {
   LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
+  buildOperatorIdentityObservationV1_,
+  buildRuntimeOperatorIdentityObservationV1_,
+  collectTopOperatorIdentityRenderedEvidence_,
+  normalizeOperatorIdentitySiteMode_,
+  operatorIdentityRoleForCandidate_,
+  getOperatorIdentityAdditionalFetchCap_,
   isEcProductDetailCandidate_,
   extractSubpageProductPriceSignal_,
   extractSubpageProductDescriptionSignal_,
