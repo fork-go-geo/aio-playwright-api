@@ -49,6 +49,15 @@ function quality(signals, family) {
   return signals.structuredDataQualityV1 && signals.structuredDataQualityV1[family];
 }
 
+function valueQuality(signals, family) {
+  return quality(signals, family) && quality(signals, family).valueQualityV1;
+}
+
+function hasReason(signals, family, field, reason) {
+  const detail = valueQuality(signals, family);
+  return Boolean(detail && detail.fieldReasonCodes && Array.isArray(detail.fieldReasonCodes[field]) && detail.fieldReasonCodes[field].includes(reason));
+}
+
 (async () => {
   globalThis.__structuredQualityBrowser = await chromium.launch({ headless: true });
   try {
@@ -141,7 +150,7 @@ function quality(signals, family) {
       'addressObservedCount', 'contactPointObservedCount', 'logoObservedCount', 'missingIdCount',
       'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus', 'sameAsObservedCount',
       'organizationNodesWithSameAsCount', 'organizationSameAsValueCount', 'emptySameAsValueCount',
-      'sourceFormat', 'telephoneObservedCount'
+      'sourceFormat', 'telephoneObservedCount', 'valueQualityV1'
     ].sort());
     assert.strictEqual(quality(orgComplete, 'organization').nodeCount, 1);
     assert.strictEqual(quality(orgComplete, 'organization').observed, true);
@@ -149,7 +158,8 @@ function quality(signals, family) {
     assert.strictEqual(quality(orgComplete, 'organization').missingIdCount, 0);
     assert.strictEqual(quality(orgComplete, 'organization').missingNameCount, 0);
     assert.strictEqual(quality(orgComplete, 'organization').missingUrlCount, 0); // relative URL is allowed
-    assert(Object.values(quality(orgComplete, 'organization')).every((value) => value == null || ['boolean', 'number', 'string'].includes(typeof value)));
+    assert.strictEqual(valueQuality(orgComplete, 'organization').checked, true);
+    assert.strictEqual(valueQuality(orgComplete, 'organization').completeness, 'complete');
     const orgMissing = await observe(jsonLd(org({ '@id': '', name: '', url: '' })), 'org-missing');
     assert.deepStrictEqual([quality(orgMissing, 'organization').missingIdCount, quality(orgMissing, 'organization').missingNameCount, quality(orgMissing, 'organization').missingUrlCount], [1, 1, 1]);
     const orgOptional = await observe(jsonLd(org({ logo: '', sameAs: [], address: '', telephone: '', contactPoint: '' })), 'org-optional');
@@ -180,17 +190,93 @@ function quality(signals, family) {
     const websiteComplete = await observe(jsonLd(site()), 'website-complete');
     assert.deepStrictEqual(Object.keys(quality(websiteComplete, 'website')).sort(), [
       'missingIdCount', 'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus',
-      'potentialActionObservedCount', 'publisherObservedCount', 'sourceFormat'
+      'potentialActionObservedCount', 'publisherObservedCount', 'sourceFormat', 'valueQualityV1'
     ].sort());
     assert.strictEqual(quality(websiteComplete, 'website').nodeCount, 1);
     assert.strictEqual(quality(websiteComplete, 'website').observed, true);
     assert.strictEqual(quality(websiteComplete, 'website').parseStatus, 'parsed');
     assert.deepStrictEqual([quality(websiteComplete, 'website').missingIdCount, quality(websiteComplete, 'website').missingNameCount, quality(websiteComplete, 'website').missingUrlCount], [0, 0, 0]);
-    assert(Object.values(quality(websiteComplete, 'website')).every((value) => value == null || ['boolean', 'number', 'string'].includes(typeof value)));
+    assert.strictEqual(valueQuality(websiteComplete, 'website').checked, true);
+    assert.strictEqual(valueQuality(websiteComplete, 'website').completeness, 'complete');
     const websiteMissing = await observe(jsonLd(site({ '@id': '', name: '', url: '' })), 'website-missing');
     assert.deepStrictEqual([quality(websiteMissing, 'website').missingIdCount, quality(websiteMissing, 'website').missingNameCount, quality(websiteMissing, 'website').missingUrlCount], [1, 1, 1]);
     const websiteOptional = await observe(jsonLd(site({ publisher: '', potentialAction: '' })), 'website-optional');
     assert.deepStrictEqual([quality(websiteOptional, 'website').missingIdCount, quality(websiteOptional, 'website').missingNameCount, quality(websiteOptional, 'website').missingUrlCount], [0, 0, 0]);
+
+    // PR #6 value-quality contract: values are classified without returning
+    // their contents, and relative / fragment IRIs are deliberately accepted.
+    const orgAbsolute = await observe(jsonLd(org({ url: 'https://example.test/company' })), 'org-url-absolute');
+    assert.strictEqual(valueQuality(orgAbsolute, 'organization').invalidValueCount, 0);
+    const orgFragment = await observe(jsonLd(org({ url: '#organization' })), 'org-url-fragment');
+    assert.strictEqual(valueQuality(orgFragment, 'organization').invalidValueCount, 0);
+    const orgMalformedUrl = await observe(jsonLd(org({ url: 'http://[bad' })), 'org-url-malformed');
+    assert(valueQuality(orgMalformedUrl, 'organization').invalidFields.includes('url'));
+    assert(hasReason(orgMalformedUrl, 'organization', 'url', 'iri_unparseable'));
+    const orgWrongUrlType = await observe(jsonLd(org({ url: { unsupported: true } })), 'org-url-wrong-type');
+    assert(hasReason(orgWrongUrlType, 'organization', 'url', 'iri_value_shape_invalid'));
+
+    const logoUrl = await observe(jsonLd(org({ logo: '/logo.png' })), 'org-logo-url');
+    assert.strictEqual(valueQuality(logoUrl, 'organization').invalidFields.includes('logo'), false);
+    const logoImageObject = await observe(jsonLd(org({ logo: { '@type': 'ImageObject', url: '/logo.png' } })), 'org-logo-imageobject-url');
+    assert.strictEqual(valueQuality(logoImageObject, 'organization').invalidFields.includes('logo'), false);
+    const logoContentUrl = await observe(jsonLd(org({ logo: { '@type': 'ImageObject', contentUrl: '/logo.png' } })), 'org-logo-imageobject-contenturl');
+    assert.strictEqual(valueQuality(logoContentUrl, 'organization').invalidFields.includes('logo'), false);
+    const logoMalformed = await observe(jsonLd(org({ logo: 42 })), 'org-logo-malformed');
+    assert(hasReason(logoMalformed, 'organization', 'logo', 'logo_value_shape_invalid'));
+    assert.strictEqual(valueQuality(orgOptional, 'organization').invalidFields.includes('logo'), false);
+
+    const sameAsValid = await observe(jsonLd(org({ sameAs: ['https://profiles.example.test/org', '#official'] })), 'org-sameas-valid');
+    assert.strictEqual(valueQuality(sameAsValid, 'organization').invalidFields.includes('sameAs'), false);
+    const sameAsMalformed = await observe(jsonLd(org({ sameAs: 'http://[bad' })), 'org-sameas-malformed');
+    assert(hasReason(sameAsMalformed, 'organization', 'sameAs', 'iri_unparseable'));
+    const sameAsMixed = await observe(jsonLd(org({ sameAs: ['https://profiles.example.test/org', 'http://[bad'] })), 'org-sameas-mixed');
+    assert.strictEqual(valueQuality(sameAsMixed, 'organization').validValueCount >= 2, true);
+    assert.strictEqual(valueQuality(sameAsMixed, 'organization').invalidFields.includes('sameAs'), true);
+    assert.strictEqual(valueQuality(sameAsMixed, 'organization').weakFields.length, 0);
+
+    const addressText = await observe(jsonLd(org({ address: 'Tokyo, Japan' })), 'org-address-text');
+    assert.strictEqual(valueQuality(addressText, 'organization').invalidFields.includes('address'), false);
+    const addressPostal = await observe(jsonLd(org({ address: { '@type': 'PostalAddress', addressLocality: 'Tokyo' } })), 'org-address-postal');
+    assert.strictEqual(valueQuality(addressPostal, 'organization').invalidFields.includes('address'), false);
+    const addressArray = await observe(jsonLd(org({ address: ['Tokyo, Japan', { '@type': 'PostalAddress', postalCode: '100-0001' }] })), 'org-address-array');
+    assert.strictEqual(valueQuality(addressArray, 'organization').invalidFields.includes('address'), false);
+    const addressMalformed = await observe(jsonLd(org({ address: 42 })), 'org-address-malformed');
+    assert(hasReason(addressMalformed, 'organization', 'address', 'address_value_shape_invalid'));
+    assert.strictEqual(valueQuality(orgOptional, 'organization').invalidFields.includes('address'), false);
+
+    for (const telephone of ['+81 3 1234 5678', '03-1234-5678', '(03) 1234 5678', '03 1234 5678', '+81-3-1234-5678 ext. 9']) {
+      const phone = await observe(jsonLd(org({ telephone })), `org-phone-${telephone.length}`);
+      assert.strictEqual(valueQuality(phone, 'organization').invalidFields.includes('telephone'), false);
+    }
+    const telephoneEmpty = await observe(jsonLd(org({ telephone: '' })), 'org-phone-empty');
+    assert(hasReason(telephoneEmpty, 'organization', 'telephone', 'telephone_empty'));
+    const telephoneMalformed = await observe(jsonLd(org({ telephone: 42 })), 'org-phone-malformed');
+    assert(hasReason(telephoneMalformed, 'organization', 'telephone', 'telephone_value_shape_invalid'));
+    assert(hasReason(orgOptional, 'organization', 'telephone', 'telephone_empty'));
+
+    const contactPointValid = await observe(jsonLd(org({ contactPoint: { '@type': 'ContactPoint', telephone: '+81 3 1234 5678' } })), 'contactpoint-valid');
+    assert.strictEqual(quality(contactPointValid, 'contactPoint').observed, true);
+    assert.strictEqual(valueQuality(contactPointValid, 'contactPoint').invalidFields.includes('telephone'), false);
+    const contactPointMalformed = await observe(jsonLd(org({ contactPoint: { '@type': 'ContactPoint', telephone: 42 } })), 'contactpoint-malformed');
+    assert(hasReason(contactPointMalformed, 'contactPoint', 'telephone', 'telephone_value_shape_invalid'));
+    const contactPointAbsent = await observe(jsonLd(org()), 'contactpoint-absent');
+    assert.strictEqual(quality(contactPointAbsent, 'contactPoint').observed, false);
+    const contactPointWithoutTelephone = await observe(jsonLd(org({ contactPoint: { '@type': 'ContactPoint' } })), 'contactpoint-without-telephone');
+    assert.strictEqual(quality(contactPointWithoutTelephone, 'contactPoint').observed, true);
+    assert.strictEqual(valueQuality(contactPointWithoutTelephone, 'contactPoint').invalidValueCount, 0);
+    const contactPointUnsupported = await observe(jsonLd(org({ contactPoint: 'unsupported-shape' })), 'contactpoint-unsupported');
+    assert.strictEqual(valueQuality(contactPointUnsupported, 'contactPoint').completeness, 'limited');
+
+    const websiteAbsolute = await observe(jsonLd(site({ url: 'https://example.test/' })), 'website-url-absolute');
+    assert.strictEqual(valueQuality(websiteAbsolute, 'website').invalidFields.includes('url'), false);
+    const websiteFragment = await observe(jsonLd(site({ url: '#website' })), 'website-url-fragment');
+    assert.strictEqual(valueQuality(websiteFragment, 'website').invalidFields.includes('url'), false);
+    const websiteMalformed = await observe(jsonLd(site({ url: 'http://[bad' })), 'website-url-malformed');
+    assert(hasReason(websiteMalformed, 'website', 'url', 'iri_unparseable'));
+    const websiteWrongType = await observe(jsonLd(site({ url: { unsupported: true } })), 'website-url-wrong-type');
+    assert(hasReason(websiteWrongType, 'website', 'url', 'iri_value_shape_invalid'));
+    assert.strictEqual(quality(websiteMissing, 'website').missingUrlCount, 1);
+
     const orgGraphScripts = await observe(jsonLd({ '@graph': [org(), site()] }) + jsonLd(org({ '@id': '#two' })), 'org-graph-scripts');
     assert.strictEqual(quality(orgGraphScripts, 'organization').nodeCount, 2);
     assert.strictEqual(quality(orgGraphScripts, 'website').nodeCount, 1);

@@ -12678,8 +12678,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0,
           missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0
         },
-        organization: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
-        website: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
+        organization: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0, valueQualityV1: null },
+        contactPoint: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, valueQualityV1: null },
+        website: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0, valueQualityV1: null },
         product: { observed: false, parseStatus: 'not_observed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
       };
       const jsonLdTypeNames = (node) => {
@@ -12699,6 +12700,99 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         if (typeof value === 'string' || typeof value === 'number') return !!clean(value);
         if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
         return nonEmptyValue(value['@id']) || nonEmptyValue(value.url) || nonEmptyValue(value.id);
+      };
+      // Value quality is a compact, value-free summary.  URL references are
+      // resolved against the audited entry URL, so relative and fragment IRIs
+      // remain valid observations rather than false positives.
+      const createValueQuality = () => ({
+        checked: false,
+        completeness: 'not_observed',
+        invalidFields: [],
+        weakFields: [],
+        fieldReasonCodes: {},
+        validValueCount: 0,
+        invalidValueCount: 0,
+        weakValueCount: 0
+      });
+      const noteValueQuality = (summary, field, result) => {
+        const quality = summary.valueQualityV1 || (summary.valueQualityV1 = createValueQuality());
+        if (!result || result.state === 'absent') return;
+        quality.checked = true;
+        if (quality.completeness === 'not_observed') quality.completeness = 'complete';
+        if (result.state === 'valid') quality.validValueCount += 1;
+        if (result.state === 'weak') {
+          quality.weakValueCount += 1;
+          if (!quality.weakFields.includes(field)) quality.weakFields.push(field);
+        }
+        if (result.state === 'invalid') {
+          quality.invalidValueCount += 1;
+          if (!quality.invalidFields.includes(field)) quality.invalidFields.push(field);
+        }
+        if ((result.state === 'invalid' || result.state === 'weak') && result.reason) {
+          const reasons = quality.fieldReasonCodes[field] || (quality.fieldReasonCodes[field] = []);
+          if (!reasons.includes(result.reason)) reasons.push(result.reason);
+        }
+      };
+      const iriValueQuality = (value) => {
+        let raw = null;
+        if (typeof value === 'string') raw = clean(value);
+        else if (value && typeof value === 'object' && !Array.isArray(value) && typeof value['@id'] === 'string') raw = clean(value['@id']);
+        else return { state: 'invalid', reason: 'iri_value_shape_invalid' };
+        if (!raw) return { state: 'invalid', reason: 'iri_empty' };
+        try { new URL(raw, inputUrl); return { state: 'valid' }; }
+        catch (_) { return { state: 'invalid', reason: 'iri_unparseable' }; }
+      };
+      const eachValue = (value) => Array.isArray(value) ? value : [value];
+      const observeIriField = (summary, field, value) => {
+        if (value == null || value === '' || (Array.isArray(value) && !value.length)) return;
+        eachValue(value).forEach((entry) => noteValueQuality(summary, field, iriValueQuality(entry)));
+      };
+      const observeLogoField = (summary, value) => {
+        if (value == null || value === '' || (Array.isArray(value) && !value.length)) return;
+        eachValue(value).forEach((entry) => {
+          if (typeof entry === 'string') return noteValueQuality(summary, 'logo', iriValueQuality(entry));
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return noteValueQuality(summary, 'logo', { state: 'invalid', reason: 'logo_value_shape_invalid' });
+          const candidate = entry.url || entry.contentUrl || entry['@id'];
+          if (candidate == null) return noteValueQuality(summary, 'logo', { state: 'invalid', reason: 'logo_value_shape_invalid' });
+          const result = iriValueQuality(candidate);
+          if (result.state === 'invalid') result.reason = 'logo_' + result.reason;
+          noteValueQuality(summary, 'logo', result);
+        });
+      };
+      const observeAddressField = (summary, value) => {
+        if (value == null || value === '' || (Array.isArray(value) && !value.length)) return;
+        eachValue(value).forEach((entry) => {
+          if (typeof entry === 'string' && clean(entry)) return noteValueQuality(summary, 'address', { state: 'valid' });
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return noteValueQuality(summary, 'address', { state: 'invalid', reason: 'address_value_shape_invalid' });
+          const types = jsonLdTypeNames(entry);
+          const isPostalAddress = types.includes('postaladdress') || ['streetAddress', 'addressLocality', 'addressRegion', 'postalCode', 'addressCountry'].some((key) => Object.prototype.hasOwnProperty.call(entry, key));
+          noteValueQuality(summary, 'address', isPostalAddress ? { state: 'valid' } : { state: 'invalid', reason: 'address_value_shape_invalid' });
+        });
+      };
+      const observeTelephoneField = (summary, value) => {
+        if (value == null) return;
+        if (value === '' || (Array.isArray(value) && !value.length)) return noteValueQuality(summary, 'telephone', { state: 'invalid', reason: 'telephone_empty' });
+        eachValue(value).forEach((entry) => noteValueQuality(summary, 'telephone', (typeof entry === 'string' && clean(entry)) ? { state: 'valid' } : { state: 'invalid', reason: 'telephone_value_shape_invalid' }));
+      };
+      const observeContactPointQuality = (value) => {
+        if (value == null || value === '' || (Array.isArray(value) && !value.length)) return;
+        eachValue(value).forEach((entry) => {
+          const quality = structuredDataQualityV1.contactPoint;
+          quality.observed = true;
+          quality.nodeCount += 1;
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            const valueQuality = quality.valueQualityV1 || (quality.valueQualityV1 = createValueQuality());
+            valueQuality.checked = false;
+            valueQuality.completeness = 'limited';
+            return;
+          }
+          if (Object.prototype.hasOwnProperty.call(entry, 'telephone')) observeTelephoneField(quality, entry.telephone);
+          else {
+            const valueQuality = quality.valueQualityV1 || (quality.valueQualityV1 = createValueQuality());
+            valueQuality.checked = true;
+            valueQuality.completeness = 'complete';
+          }
+        });
       };
       const flattenJsonLdQualityNodes = (value, out) => {
         if (Array.isArray(value)) { value.forEach((entry) => flattenJsonLdQualityNodes(entry, out)); return; }
@@ -12769,6 +12863,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           if (!family) return;
           const quality = structuredDataQualityV1[family];
           quality.observed = true; quality.nodeCount += 1;
+          if ((family === 'organization' || family === 'website') && !quality.valueQualityV1) {
+            quality.valueQualityV1 = createValueQuality();
+            quality.valueQualityV1.checked = true;
+            quality.valueQualityV1.completeness = 'complete';
+          }
           if (!nonEmptyValue(node['@id'])) quality.missingIdCount += 1;
           if (!nonEmptyValue(node.name)) quality.missingNameCount += 1;
           if (!nonEmptyValue(node.url)) quality.missingUrlCount += 1;
@@ -12780,6 +12879,14 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             offers.forEach((offer) => { if (!offer || typeof offer !== 'object') return; quality.offerObservedCount += 1; if (!nonEmptyValue(offer.price)) quality.offerMissingPriceCount += 1; if (!nonEmptyValue(offer.priceCurrency)) quality.offerMissingCurrencyCount += 1; });
           } else if (family === 'organization') {
             ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) quality[`${key}ObservedCount`] += 1; });
+            // Optional fields are observed only when supplied.  Their absence
+            // is intentionally not converted into a missing or invalid fact.
+            observeIriField(quality, 'url', node.url);
+            observeLogoField(quality, node.logo);
+            observeIriField(quality, 'sameAs', node.sameAs);
+            observeAddressField(quality, node.address);
+            observeTelephoneField(quality, node.telephone);
+            observeContactPointQuality(node.contactPoint);
             // sameAs quality intentionally records only structural facts.  It
             // does not judge URL syntax, officialness, reachability, or whether
             // an external profile represents this organization.
@@ -12798,6 +12905,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           } else {
             if (nonEmptyValue(node.publisher)) quality.publisherObservedCount += 1;
             if (nonEmptyValue(node.potentialAction)) quality.potentialActionObservedCount += 1;
+            observeIriField(quality, 'url', node.url);
           }
         });
       };
@@ -17879,8 +17987,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           structuredDataQualityV1: {
             breadcrumb: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
             faq: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 },
-            organization: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
-            website: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
+            organization: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0, valueQualityV1: null },
+            contactPoint: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, valueQualityV1: null },
+            website: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0, valueQualityV1: null },
             product: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
           },
           observed: false
@@ -17944,8 +18053,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           const structuredDataQualityV1 = {
             breadcrumb: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
             faq: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 },
-            organization: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0 },
-            website: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0 },
+            organization: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0, valueQualityV1: null },
+            contactPoint: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, valueQualityV1: null },
+            website: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0, valueQualityV1: null },
             product: { observed: false, parseStatus: 'parsed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
           };
           const nonEmptyValue = (value) => {
@@ -17958,6 +18068,31 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             if (!value || typeof value !== 'object') return nonEmptyValue(value);
             return nonEmptyValue(value['@id']) || nonEmptyValue(value.url) || nonEmptyValue(value.id);
           };
+          const createValueQuality = () => ({ checked:false, completeness:'not_observed', invalidFields:[], weakFields:[], fieldReasonCodes:{}, validValueCount:0, invalidValueCount:0, weakValueCount:0 });
+          const noteValueQuality = (summary, field, result) => {
+            const quality = summary.valueQualityV1 || (summary.valueQualityV1 = createValueQuality());
+            if (!result || result.state === 'absent') return;
+            quality.checked = true;
+            if (quality.completeness === 'not_observed') quality.completeness = 'complete';
+            if (result.state === 'valid') quality.validValueCount += 1;
+            if (result.state === 'invalid') { quality.invalidValueCount += 1; if (!quality.invalidFields.includes(field)) quality.invalidFields.push(field); }
+            if (result.state === 'weak') { quality.weakValueCount += 1; if (!quality.weakFields.includes(field)) quality.weakFields.push(field); }
+            if ((result.state === 'invalid' || result.state === 'weak') && result.reason) { const reasons=quality.fieldReasonCodes[field]||(quality.fieldReasonCodes[field]=[]); if(!reasons.includes(result.reason)) reasons.push(result.reason); }
+          };
+          const iriValueQuality = (value) => {
+            let raw = null;
+            if (typeof value === 'string') raw = clean(value);
+            else if (value && typeof value === 'object' && !Array.isArray(value) && typeof value['@id'] === 'string') raw = clean(value['@id']);
+            else return { state:'invalid', reason:'iri_value_shape_invalid' };
+            if (!raw) return { state:'invalid', reason:'iri_empty' };
+            try { new URL(raw, location.href); return { state:'valid' }; } catch (_) { return { state:'invalid', reason:'iri_unparseable' }; }
+          };
+          const eachValue = (value) => Array.isArray(value) ? value : [value];
+          const observeIriField = (summary, field, value) => { if (value == null || value === '' || (Array.isArray(value) && !value.length)) return; eachValue(value).forEach((entry) => noteValueQuality(summary, field, iriValueQuality(entry))); };
+          const observeLogoField = (summary, value) => { if (value == null || value === '' || (Array.isArray(value) && !value.length)) return; eachValue(value).forEach((entry) => { if(typeof entry === 'string') return noteValueQuality(summary,'logo',iriValueQuality(entry)); if(!entry || typeof entry !== 'object' || Array.isArray(entry)) return noteValueQuality(summary,'logo',{state:'invalid',reason:'logo_value_shape_invalid'}); const candidate=entry.url||entry.contentUrl||entry['@id']; if(candidate==null) return noteValueQuality(summary,'logo',{state:'invalid',reason:'logo_value_shape_invalid'}); const result=iriValueQuality(candidate); if(result.state==='invalid') result.reason='logo_'+result.reason; noteValueQuality(summary,'logo',result); }); };
+          const observeAddressField = (summary, value) => { if(value == null || value === '' || (Array.isArray(value) && !value.length)) return; eachValue(value).forEach((entry) => { if(typeof entry === 'string' && clean(entry)) return noteValueQuality(summary,'address',{state:'valid'}); if(!entry || typeof entry !== 'object' || Array.isArray(entry)) return noteValueQuality(summary,'address',{state:'invalid',reason:'address_value_shape_invalid'}); const postal=typeNames(entry).includes('postaladdress') || ['streetAddress','addressLocality','addressRegion','postalCode','addressCountry'].some((key)=>Object.prototype.hasOwnProperty.call(entry,key)); noteValueQuality(summary,'address',postal?{state:'valid'}:{state:'invalid',reason:'address_value_shape_invalid'}); }); };
+          const observeTelephoneField = (summary, value) => { if(value == null) return; if(value === '' || (Array.isArray(value) && !value.length)) return noteValueQuality(summary,'telephone',{state:'invalid',reason:'telephone_empty'}); eachValue(value).forEach((entry)=>noteValueQuality(summary,'telephone',(typeof entry === 'string' && clean(entry))?{state:'valid'}:{state:'invalid',reason:'telephone_value_shape_invalid'})); };
+          const observeContactPointQuality = (value) => { if(value == null || value === '' || (Array.isArray(value) && !value.length)) return; eachValue(value).forEach((entry)=>{ const summary=structuredDataQualityV1.contactPoint; summary.observed=true; summary.nodeCount+=1; if(!entry || typeof entry !== 'object' || Array.isArray(entry)){const quality=summary.valueQualityV1||(summary.valueQualityV1=createValueQuality());quality.checked=false;quality.completeness='limited';return;} if(Object.prototype.hasOwnProperty.call(entry,'telephone')) observeTelephoneField(summary,entry.telephone); else {const quality=summary.valueQualityV1||(summary.valueQualityV1=createValueQuality());quality.checked=true;quality.completeness='complete';} }); };
           const observeQuality = (node, depth = 0) => {
             if (depth > 8 || node == null) return;
             if (Array.isArray(node)) return node.forEach((item) => observeQuality(item, depth + 1));
@@ -18016,12 +18151,21 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             const family = names.some((name) => ['organization', 'corporation', 'localbusiness'].includes(name)) ? 'organization' : (names.includes('website') ? 'website' : (names.includes('product') ? 'product' : ''));
             if (family) {
               const summary = structuredDataQualityV1[family]; summary.observed = true; summary.nodeCount += 1;
+              if ((family === 'organization' || family === 'website') && !summary.valueQualityV1) {
+                summary.valueQualityV1 = createValueQuality(); summary.valueQualityV1.checked = true; summary.valueQualityV1.completeness = 'complete';
+              }
               if (!nonEmptyValue(node['@id'])) summary.missingIdCount += 1;
               if (!nonEmptyValue(node.name)) summary.missingNameCount += 1;
               if (!nonEmptyValue(node.url)) summary.missingUrlCount += 1;
               if (family === 'product') { if (!nonEmptyValue(node.description)) summary.missingDescriptionCount += 1; if (nonEmptyValue(node.image)) summary.imageObservedCount += 1; if (nonEmptyValue(node.brand)) summary.brandObservedCount += 1; const offers=Array.isArray(node.offers)?node.offers:(node.offers==null?[]:[node.offers]); offers.forEach((offer)=>{if(!offer||typeof offer!=='object')return;summary.offerObservedCount+=1;if(!nonEmptyValue(offer.price))summary.offerMissingPriceCount+=1;if(!nonEmptyValue(offer.priceCurrency))summary.offerMissingCurrencyCount+=1;}); }
               else if (family === 'organization') {
                 ['logo', 'sameAs', 'address', 'telephone', 'contactPoint'].forEach((key) => { if (nonEmptyValue(node[key])) summary[`${key}ObservedCount`] += 1; });
+                observeIriField(summary, 'url', node.url);
+                observeLogoField(summary, node.logo);
+                observeIriField(summary, 'sameAs', node.sameAs);
+                observeAddressField(summary, node.address);
+                observeTelephoneField(summary, node.telephone);
+                observeContactPointQuality(node.contactPoint);
                 // Structural only: preserve raw value cardinality without
                 // judging profile officialness or URL validity.
                 const rawSameAs = node.sameAs;
@@ -18037,7 +18181,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
                   summary.organizationSameAsValueCount += nonEmptySameAsValues;
                 }
               }
-              else { if (nonEmptyValue(node.publisher)) summary.publisherObservedCount += 1; if (nonEmptyValue(node.potentialAction)) summary.potentialActionObservedCount += 1; }
+              else { if (nonEmptyValue(node.publisher)) summary.publisherObservedCount += 1; if (nonEmptyValue(node.potentialAction)) summary.potentialActionObservedCount += 1; observeIriField(summary, 'url', node.url); }
             }
             if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => observeQuality(item, depth + 1));
           };
