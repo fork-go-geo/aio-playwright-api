@@ -81,6 +81,13 @@ assert.equal(hooks.getOperatorIdentityAdditionalFetchCap_('saas'), 2);
 assert.equal(hooks.getOperatorIdentityAdditionalFetchCap_('ec'), 3);
 assert.equal(hooks.getOperatorIdentityAdditionalFetchCap_('media'), 2);
 assert.equal(hooks.getOperatorIdentityAdditionalFetchCap_('shop_facility'), 0);
+assert.equal(hooks.operatorIdentityRoleForCandidate_({ path: '/guide/legal/', label: '特定商取引法に基づく表記' }), 'commercial_law');
+assert.equal(hooks.operatorIdentityRoleForCandidate_({ path: '/info/', label: '運営元' }), 'publisher');
+assert.equal(hooks.normalizeOperatorIdentitySiteMode_('shop_facility'), 'shop_facility');
+
+// Positive evidence remains positive even when an unrelated scope is incomplete.
+result = build({ candidateCapped: true, completedRoles: ['about'], pages: [renderedPage('https://example.test/about', 'Example Corporation')] });
+assert.equal(result.signalState, 'true');
 
 // Compactness and serialization contract.
 result = build({

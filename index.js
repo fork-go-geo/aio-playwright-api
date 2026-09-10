@@ -9345,13 +9345,15 @@ function normalizeOperatorIdentitySiteMode_(siteMode) {
   if (mode === 'service' || mode === 'saas') return 'saas';
   if (mode === 'ec' || mode === 'ecommerce' || mode === 'e-commerce') return 'ec';
   if (mode === 'media') return 'media';
-  if (mode === 'shop' || mode === 'facility') return 'shop_facility';
+  if (mode === 'shop' || mode === 'facility' || mode === 'shop_facility' || mode === 'shop-facility') return 'shop_facility';
   return 'unknown';
 }
 
 function operatorIdentityRoleForCandidate_(candidate) {
-  const text = [candidate && candidate.url, candidate && candidate.path, candidate && candidate.label]
+  const text = [candidate && candidate.url, candidate && candidate.path, candidate && candidate.label, candidate && candidate.reason, candidate && candidate.title]
     .map(value => String(value || '').toLowerCase()).join(' ');
+  if (/(?:tokushoho|tokushouhou|commercial[-_ ]?law|specified[-_ ]?commercial|legal[-_ ]?notice|特定商取引|特商法|販売(?:業者|事業者))/i.test(text)) return 'commercial_law';
+  if (/(?:publisher|editorial|operator|運営(?:会社|元|者)|発行元|編集部|媒体運営)/i.test(text)) return 'publisher';
   if (isLegalOperatorCandidatePath_(text) || isLegalOperatorCandidateText_(text)) return 'legal';
   if (/(?:about|company|corporate|profile|outline|about-us|会社概要|企業情報|運営会社)/i.test(text)) return 'about';
   if (/(?:editorial|publisher|編集|発行者|運営者)/i.test(text)) return 'publisher';
@@ -9360,7 +9362,7 @@ function operatorIdentityRoleForCandidate_(candidate) {
 
 function getOperatorIdentityRequiredRoles_(siteMode) {
   if (siteMode === 'media') return ['publisher', 'legal'];
-  if (siteMode === 'ec') return ['about', 'legal'];
+  if (siteMode === 'ec') return ['commercial_law', 'legal', 'about'];
   if (siteMode === 'corp' || siteMode === 'saas') return ['about', 'legal'];
   return [];
 }
@@ -9485,7 +9487,9 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
   const failures = [];
   const selectedByRole = new Map();
   requiredRoles.forEach(role => {
-    const candidate = candidates.find(item => operatorIdentityRoleForCandidate_(item) === role);
+    const candidate = candidates.find(item => operatorIdentityRoleForCandidate_(item) === role) ||
+      (role === 'legal' ? candidates.find(item => operatorIdentityRoleForCandidate_(item) === 'commercial_law') : null) ||
+      (role === 'publisher' ? candidates.find(item => operatorIdentityRoleForCandidate_(item) === 'about') : null);
     if (candidate) selectedByRole.set(role, candidate);
   });
   let additionalFetchCount = 0;
@@ -9565,6 +9569,7 @@ async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
       const add = (label, value, el) => {
         label = clean(label).slice(0, 80); value = clean(value).slice(0, 160);
         if (!label || !value || !labelRx.test(label) || !visible(el) || out.length >= 6) return;
+        if (/^(?:こちら|詳細はこちら|お問い合わせ|https?:\/\/|\d[\d\-() ]{5,}|〒?\d{3}-?\d{4})$/i.test(value) || value === label) return;
         if (!out.some(item => item.label === label && item.value === value)) out.push({ label, value, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
       };
       Array.from(document.querySelectorAll('table tr')).slice(0, 100).forEach(row => {
@@ -9574,6 +9579,18 @@ async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
       Array.from(document.querySelectorAll('dl dt')).slice(0, 80).forEach(dt => {
         const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName).toLowerCase() === 'dd' ? dt.nextElementSibling : null;
         if (dd) add(dt.textContent, dd.textContent, dt);
+      });
+      Array.from(document.querySelectorAll('p,div,li')).slice(0, 300).forEach(block => {
+        if (!visible(block)) return;
+        const strong = block.querySelector('strong,b');
+        if (strong) {
+          const value = clean(String(block.innerText || block.textContent || '').replace(String(strong.innerText || strong.textContent || ''), ''));
+          add(strong.textContent, value, block);
+        }
+        const lines = String(block.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+        if (lines.length >= 2) add(lines[0], lines.slice(1).join(' '), block);
+        const pair = clean(block.innerText || block.textContent).match(/^([^:：]{1,80})\s*[:：]\s*(.{1,160})$/);
+        if (pair) add(pair[1], pair[2], block);
       });
       return {
         evidence: out,
