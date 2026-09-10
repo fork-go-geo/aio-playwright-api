@@ -9692,6 +9692,272 @@ function pickBestContactSignals_(pages) {
   };
 }
 
+const OPERATOR_IDENTITY_OBSERVATION_V1_AUTHORITY = 'geoSignalsV1_operator_identity_v1';
+
+function normalizeOperatorIdentitySiteMode_(siteMode) {
+  const mode = String(siteMode || '').toLowerCase();
+  if (mode === 'corporate' || mode === 'corp') return 'corp';
+  if (mode === 'service' || mode === 'saas') return 'saas';
+  if (mode === 'ec' || mode === 'ecommerce' || mode === 'e-commerce') return 'ec';
+  if (mode === 'media') return 'media';
+  if (mode === 'shop' || mode === 'facility' || mode === 'shop_facility' || mode === 'shop-facility') return 'shop_facility';
+  return 'unknown';
+}
+
+function operatorIdentityRoleForCandidate_(candidate) {
+  const text = [candidate && candidate.url, candidate && candidate.path, candidate && candidate.label, candidate && candidate.reason, candidate && candidate.title]
+    .map(value => String(value || '').toLowerCase()).join(' ');
+  if (/(?:tokushoho|tokushouhou|commercial[-_ ]?law|specified[-_ ]?commercial|legal[-_ ]?notice|特定商取引|特商法|販売(?:業者|事業者))/i.test(text)) return 'commercial_law';
+  if (/(?:publisher|editorial|operator|運営(?:会社|元|者)|発行元|編集部|媒体運営)/i.test(text)) return 'publisher';
+  if (isLegalOperatorCandidatePath_(text) || isLegalOperatorCandidateText_(text)) return 'legal';
+  if (/(?:about|company|corporate|profile|outline|about-us|会社概要|企業情報|運営会社)/i.test(text)) return 'about';
+  if (/(?:editorial|publisher|編集|発行者|運営者)/i.test(text)) return 'publisher';
+  return null;
+}
+
+function getOperatorIdentityRequiredRoles_(siteMode) {
+  if (siteMode === 'media') return ['publisher', 'legal'];
+  if (siteMode === 'ec') return ['commercial_law', 'legal', 'about'];
+  if (siteMode === 'corp' || siteMode === 'saas') return ['about', 'legal'];
+  return [];
+}
+
+function getOperatorIdentityAdditionalFetchCap_(siteMode) {
+  return ({ corp: 2, saas: 2, ec: 3, media: 2, shop_facility: 0 })[siteMode] || 0;
+}
+
+function compactOperatorIdentityEvidence_(pages) {
+  const evidence = [];
+  const identityTokensByRole = new Map();
+  (Array.isArray(pages) ? pages : []).forEach(page => {
+    if (!page || page.ok !== true || page.observationMethod !== 'playwright_scoped_light') return;
+    const sourceUrl = String(page.finalUrl || page.url || '');
+    let sourcePath = '';
+    try { sourcePath = new URL(sourceUrl).pathname || '/'; } catch (_) { sourcePath = sourceUrl.slice(0, 160); }
+    (Array.isArray(page.operatorIdentityEvidence) ? page.operatorIdentityEvidence : []).forEach(item => {
+      if (!item || !String(item.value || '').trim()) return;
+      const role = page.operatorIdentityRole || operatorIdentityRoleForCandidate_(page) || 'top';
+      if (!identityTokensByRole.has(role)) identityTokensByRole.set(role, new Set());
+      identityTokensByRole.get(role).add(String(item.value).replace(/\s+/g, ' ').trim().toLowerCase());
+      if (evidence.length < 3) evidence.push({
+        type: 'visible_label_value',
+        role,
+        sourcePath: String(sourcePath || '/').slice(0, 160),
+        sourceScope: item.sourceScope === 'footer' ? 'footer' : 'content',
+        extractionMethod: 'rendered_visible_label_value',
+        label: String(item.label || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+      });
+    });
+  });
+  return { evidence, conflict: Array.from(identityTokensByRole.values()).some(tokens => tokens.size > 1) };
+}
+
+// Pure finalizer: false is intentionally impossible unless every completion
+// condition is explicit.  Runtime fetch/discovery issues therefore fail closed
+// to unknown, while strong rendered evidence can still establish true.
+function buildOperatorIdentityObservationV1_(input = {}) {
+  const siteMode = normalizeOperatorIdentitySiteMode_(input.siteMode);
+  const maxAdditionalFetch = getOperatorIdentityAdditionalFetchCap_(siteMode);
+  const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
+  const pages = Array.isArray(input.pages) ? input.pages : [];
+  const compacted = compactOperatorIdentityEvidence_(pages);
+  const limitations = Array.isArray(input.limitations) ? input.limitations.filter(Boolean).slice(0, 5) : [];
+  const failures = Array.isArray(input.failures) ? input.failures.filter(Boolean).slice(0, 5) : [];
+  const completedRoles = Array.isArray(input.completedRoles) ? input.completedRoles : [];
+  const requiredScopesComplete = requiredRoles.every(role => completedRoles.includes(role));
+  const conflict = compacted.conflict;
+  const baseScopeComplete = input.baseScopeComplete === true;
+  const discoveryComplete = input.discoveryComplete === true;
+  const fetchedCount = Math.max(0, Number(input.additionalFetchCount || 0) || 0);
+  let status = 'unknown';
+  let reasonCodes = [];
+  let applicability = 'applicable';
+  if (siteMode === 'shop_facility') {
+    applicability = 'not_applicable';
+    reasonCodes = ['site_mode_not_applicable'];
+  } else if (compacted.evidence.length > 0 && !conflict) {
+    status = 'true';
+    reasonCodes = ['visible_rendered_operator_identity_evidence'];
+  } else if (conflict) {
+    reasonCodes = ['operator_identity_conflict'];
+  } else if (!discoveryComplete) {
+    reasonCodes = ['discovery_incomplete'];
+  } else if (!baseScopeComplete) {
+    reasonCodes = ['base_scope_incomplete'];
+  } else if (input.inputObserved !== true) {
+    reasonCodes = ['input_not_observed'];
+  } else if (input.observationLimited !== false) {
+    reasonCodes = ['observation_completion_missing'];
+  } else if (!requiredScopesComplete) {
+    reasonCodes = ['required_scope_incomplete'];
+  } else if (input.candidateCapped === true) {
+    reasonCodes = ['candidate_cap_reached'];
+  } else if (limitations.length) {
+    reasonCodes = ['observation_limited'];
+  } else if (failures.length) {
+    reasonCodes = ['required_fetch_failed'];
+  } else {
+    status = 'false';
+    reasonCodes = ['all_required_rendered_scopes_completed_without_identity_evidence'];
+  }
+  return {
+    version: 1,
+    authority: OPERATOR_IDENTITY_OBSERVATION_V1_AUTHORITY,
+    siteMode,
+    applicability,
+    signalState: status,
+    inputObserved: input.inputObserved === true ? true : (input.inputObserved === false ? false : null),
+    observationLimited: limitations.length > 0 ? true : (input.observationLimited === false ? false : null),
+    discovery: {
+      complete: discoveryComplete ? true : (input.discoveryComplete === false ? false : null),
+      candidateCount: Number.isFinite(Number(input.candidateCount)) ? Number(input.candidateCount) : null,
+      selectedCount: Number.isFinite(Number(input.selectedCount)) ? Number(input.selectedCount) : null,
+      capped: input.candidateCapped === true ? true : (input.candidateCapped === false ? false : null)
+    },
+    reasonCodes,
+    scopes: {
+      required: requiredRoles,
+      observed: completedRoles.filter(role => requiredRoles.includes(role)),
+      failed: failures.map(value => String(value).replace(/^required_|_(?:fetch_)?failed$/g, '')).slice(0, 5)
+    },
+    scopeComplete: baseScopeComplete && requiredScopesComplete && input.candidateCapped === false && limitations.length === 0 && failures.length === 0,
+    additionalFetchCount: fetchedCount,
+    maxAdditionalFetch,
+    strongEvidenceCount: compacted.evidence.length,
+    evidence: compacted.evidence,
+    conflict,
+    failureReasons: Array.from(new Set([...failures, ...limitations])).slice(0, 5)
+  };
+}
+
+async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
+  const siteMode = normalizeOperatorIdentitySiteMode_(input.siteMode);
+  const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
+  const cap = getOperatorIdentityAdditionalFetchCap_(siteMode);
+  const candidates = Array.isArray(input.candidates) ? input.candidates : [];
+  const pages = (Array.isArray(input.pages) ? input.pages : []).map(page => Object.assign({}, page || {}, {
+    operatorIdentityRole: operatorIdentityRoleForCandidate_(page)
+  }));
+  const limitations = Array.isArray(input.limitations) ? input.limitations.slice() : [];
+  const failures = [];
+  const selectedByRole = new Map();
+  requiredRoles.forEach(role => {
+    const candidate = candidates.find(item => operatorIdentityRoleForCandidate_(item) === role) ||
+      (role === 'legal' ? candidates.find(item => operatorIdentityRoleForCandidate_(item) === 'commercial_law') : null) ||
+      (role === 'publisher' ? candidates.find(item => operatorIdentityRoleForCandidate_(item) === 'about') : null);
+    if (candidate) selectedByRole.set(role, candidate);
+  });
+  let additionalFetchCount = 0;
+  for (const [role, candidate] of selectedByRole.entries()) {
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    const existing = pages.find(page => key && discoverSubpageCandidateKey(page && (page.finalUrl || page.url) || '') === key);
+    if (existing && existing.observationMethod === 'playwright_scoped_light') continue;
+    if (additionalFetchCount >= cap) {
+      limitations.push('additional_fetch_cap_reached');
+      continue;
+    }
+    if (!input.context || typeof input.context.newPage !== 'function') {
+      limitations.push('playwright_context_unavailable');
+      continue;
+    }
+    // HTML-only coverage is not treated as rendered evidence; this bounded
+    // Playwright observation is the only additional fetch allowed here.
+    const page = await fetchSubpagePlaywrightScopedLight(candidate.url, {
+      context: input.context,
+      siteMode,
+      timeout: 8000
+    });
+    additionalFetchCount += 1;
+    const sameOrigin = (() => {
+      try { return new URL(page && (page.finalUrl || page.url) || '').origin === String(input.origin || ''); } catch (_) { return false; }
+    })();
+    if (page && page.ok === true && sameOrigin) {
+      pages.push(Object.assign({}, page, { operatorIdentityRole: role }));
+    } else {
+      failures.push(sameOrigin ? `required_${role}_fetch_failed` : 'redirect_outside_origin');
+    }
+  }
+  const completedRoles = requiredRoles.filter(role => {
+    const candidate = selectedByRole.get(role);
+    if (!candidate) return false;
+    const key = discoverSubpageCandidateKey(candidate.url || '');
+    return pages.some(page => key && discoverSubpageCandidateKey(page && (page.finalUrl || page.url) || '') === key &&
+      page.ok === true && page.observationMethod === 'playwright_scoped_light');
+  });
+  if (Number(input.candidateCount || 0) === 0 && input.discoveryComplete === true) {
+    requiredRoles.forEach(role => {
+      if (!completedRoles.includes(role)) completedRoles.push(role);
+    });
+  }
+  requiredRoles.forEach(role => {
+    if (!selectedByRole.has(role)) limitations.push(`required_${role}_candidate_missing`);
+  });
+  return buildOperatorIdentityObservationV1_({
+    siteMode,
+    pages,
+    completedRoles,
+    baseScopeComplete: input.baseScopeComplete === true,
+    discoveryComplete: input.discoveryComplete === true,
+    limitations,
+    failures,
+    additionalFetchCount,
+    inputObserved: input.inputObserved,
+    observationLimited: input.observationLimited,
+    candidateCount: input.candidateCount,
+    selectedCount: input.selectedCount,
+    candidateCapped: input.candidateCapped
+  });
+}
+
+async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  try {
+    const evidence = await page.evaluate(() => {
+      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        if (!el || el.getAttribute('aria-hidden') === 'true' || el.closest('[aria-hidden="true"]')) return false;
+        const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+      };
+      const labelRx = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|company|corporate|operator|seller|merchant|publisher)/i;
+      const out = [];
+      const add = (label, value, el) => {
+        label = clean(label).slice(0, 80); value = clean(value).slice(0, 160);
+        if (!label || !value || !labelRx.test(label) || !visible(el) || out.length >= 6) return;
+        if (/^(?:こちら|詳細はこちら|お問い合わせ|https?:\/\/|\d[\d\-() ]{5,}|〒?\d{3}-?\d{4})$/i.test(value) || value === label) return;
+        if (!out.some(item => item.label === label && item.value === value)) out.push({ label, value, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
+      };
+      Array.from(document.querySelectorAll('table tr')).slice(0, 100).forEach(row => {
+        const cells = Array.from(row.querySelectorAll('th,td'));
+        if (cells.length > 1) add(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row);
+      });
+      Array.from(document.querySelectorAll('dl dt')).slice(0, 80).forEach(dt => {
+        const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName).toLowerCase() === 'dd' ? dt.nextElementSibling : null;
+        if (dd) add(dt.textContent, dd.textContent, dt);
+      });
+      Array.from(document.querySelectorAll('p,div,li')).slice(0, 300).forEach(block => {
+        if (!visible(block)) return;
+        const strong = block.querySelector('strong,b');
+        if (strong) {
+          const value = clean(String(block.innerText || block.textContent || '').replace(String(strong.innerText || strong.textContent || ''), ''));
+          add(strong.textContent, value, block);
+        }
+        const lines = String(block.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+        if (lines.length >= 2) add(lines[0], lines.slice(1).join(' '), block);
+        const pair = clean(block.innerText || block.textContent).match(/^([^:：]{1,80})\s*[:：]\s*(.{1,160})$/);
+        if (pair) add(pair[1], pair[2], block);
+      });
+      return {
+        evidence: out,
+        baseScopeComplete: !!document.body && !!document.querySelector('header') && !!document.querySelector('nav,[role="navigation"]') && !!document.querySelector('footer,[role="contentinfo"]')
+      };
+    });
+    return { url, finalUrl: url, ok: true, observationMethod: 'playwright_scoped_light', operatorIdentityRole: 'top', operatorIdentityEvidence: evidence && evidence.evidence || [], baseScopeComplete: evidence && evidence.baseScopeComplete === true };
+  } catch (_) {
+    return null;
+  }
+}
+
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const lightBudget = opts && opts.lightBudget || null;
   const normalized = normalizeDiscoverTopUrl(topUrl);
