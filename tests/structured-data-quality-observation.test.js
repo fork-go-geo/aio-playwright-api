@@ -74,17 +74,21 @@ function hasReason(signals, family, field, reason) {
     assert.strictEqual(quality(complete, 'faq').missingAnswerTextCount, 0);
     assert.strictEqual(quality(complete, 'organization').observed, false);
     assert.strictEqual(quality(complete, 'website').observed, false);
+    assert.strictEqual(quality(complete, 'breadcrumb').observationComplete, true);
+    assert.strictEqual(quality(complete, 'organization').observationComplete, true);
+    assert.strictEqual(quality(complete, 'website').observationComplete, true);
     assert.strictEqual(complete.structuredData.hasBreadcrumbList, true);
     assert.strictEqual(complete.structuredData.hasFAQPage, true);
     assert.deepStrictEqual(complete.structuredDataQualityV1, complete.structuredData.structuredDataQualityV1);
     assert.deepStrictEqual(Object.keys(quality(complete, 'breadcrumb')).sort(), [
       'duplicatePositionCount', 'invalidPositionCount', 'itemCount', 'itemListElementCount',
       'listItemCount', 'missingItemCount', 'missingItemListElementCount', 'missingListItemCount',
-      'missingNameCount', 'missingPositionCount', 'nodeCount', 'observed', 'parseStatus', 'sourceFormat'
+      'missingNameCount', 'missingPositionCount', 'nodeCount', 'observationComplete', 'observationScope',
+      'observed', 'parseStatus', 'sourceFormat'
     ].sort());
     assert.deepStrictEqual(Object.keys(quality(complete, 'faq')).sort(), [
       'mainEntityCount', 'missingAcceptedAnswerCount', 'missingAnswerTextCount', 'missingMainEntityCount',
-      'missingQuestionCount', 'missingQuestionNameCount', 'nodeCount', 'observed', 'parseStatus',
+      'missingQuestionCount', 'missingQuestionNameCount', 'nodeCount', 'observationComplete', 'observationScope', 'observed', 'parseStatus',
       'questionCount', 'sourceFormat'
     ].sort());
 
@@ -143,12 +147,26 @@ function hasReason(signals, family, field, reason) {
     assert.strictEqual(absent.structuredData.hasBreadcrumbList, false);
     assert.strictEqual(absent.structuredData.hasFAQPage, false);
 
+    // Standard JSON.parse semantics must win: the final duplicate key is the
+    // only @type visible to the observer. Do not rescue earlier keys.
+    const duplicateTypeKeys = await observe(
+      '<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Ignored","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"/"}]}</script>',
+      'duplicate-type-keys'
+    );
+    assert.strictEqual(duplicateTypeKeys.structuredData.hasBreadcrumbList, true);
+    assert.strictEqual(duplicateTypeKeys.structuredData.hasOrganization, false);
+    assert.strictEqual(duplicateTypeKeys.structuredData.hasWebsite, false);
+    assert.strictEqual(quality(duplicateTypeKeys, 'breadcrumb').observed, true);
+    assert.strictEqual(quality(duplicateTypeKeys, 'organization').observed, false);
+    assert.strictEqual(quality(duplicateTypeKeys, 'organization').nodeCount, 0);
+    assert.strictEqual(quality(duplicateTypeKeys, 'organization').observationComplete, true);
+
     const org = (extra) => Object.assign({ '@type': 'Organization', '@id': 'https://example.test/#org', name: 'Example', url: '/company' }, extra || {});
     const site = (extra) => Object.assign({ '@type': 'WebSite', '@id': 'https://example.test/#website', name: 'Example', url: '/' }, extra || {});
     const orgComplete = await observe(jsonLd(org()), 'org-complete');
     assert.deepStrictEqual(Object.keys(quality(orgComplete, 'organization')).sort(), [
       'addressObservedCount', 'contactPointObservedCount', 'logoObservedCount', 'missingIdCount',
-      'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus', 'sameAsObservedCount',
+      'missingNameCount', 'missingUrlCount', 'nodeCount', 'observationComplete', 'observationScope', 'observed', 'parseStatus', 'sameAsObservedCount',
       'organizationNodesWithSameAsCount', 'organizationSameAsValueCount', 'emptySameAsValueCount',
       'sourceFormat', 'telephoneObservedCount', 'valueQualityV1'
     ].sort());
@@ -189,7 +207,7 @@ function hasReason(signals, family, field, reason) {
     assert.deepStrictEqual([quality(orgFamilySameAs, 'organization').nodeCount, quality(orgFamilySameAs, 'organization').organizationNodesWithSameAsCount, quality(orgFamilySameAs, 'organization').organizationSameAsValueCount], [2, 2, 3]);
     const websiteComplete = await observe(jsonLd(site()), 'website-complete');
     assert.deepStrictEqual(Object.keys(quality(websiteComplete, 'website')).sort(), [
-      'missingIdCount', 'missingNameCount', 'missingUrlCount', 'nodeCount', 'observed', 'parseStatus',
+      'missingIdCount', 'missingNameCount', 'missingUrlCount', 'nodeCount', 'observationComplete', 'observationScope', 'observed', 'parseStatus',
       'potentialActionObservedCount', 'publisherObservedCount', 'sourceFormat', 'valueQualityV1'
     ].sort());
     assert.strictEqual(quality(websiteComplete, 'website').nodeCount, 1);

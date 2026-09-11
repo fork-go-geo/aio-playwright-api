@@ -12995,6 +12995,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       });
       Object.keys(structuredDataQualityV1).forEach((key) => { const quality = structuredDataQualityV1[key];
         quality.parseStatus = parseableJsonLdCount > 0 ? 'parsed' : (rawJsonLd.length > 0 && parseErrorsCount > 0 ? 'parse_error' : 'parsed');
+        // `observed:false` + `nodeCount:0` is a completed absence only when
+        // this rendered JSON-LD scan completed.  Keep that distinct from an
+        // unavailable producer/failed scan; consumers must never infer it.
+        quality.observationComplete = true;
+        quality.observationScope = 'rendered_dom_jsonld';
       });
       const typeList = limit(nodeTypes, 50);
       const typeSet = new Set(typeList.map((t) => String(t || '').toLowerCase()));
@@ -17985,11 +17990,11 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           renderedDomParseErrorsCount: 0,
           renderedDomTypes: [],
           structuredDataQualityV1: {
-            breadcrumb: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
+            breadcrumb: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', observationComplete:false, observationScope:'rendered_dom_jsonld', nodeCount: 0, itemListElementCount: 0, itemCount: 0, listItemCount: 0, missingItemListElementCount: 0, missingListItemCount: 0, missingPositionCount: 0, invalidPositionCount: 0, duplicatePositionCount: 0, missingNameCount: 0, missingItemCount: 0 },
             faq: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, mainEntityCount: 0, questionCount: 0, missingMainEntityCount: 0, missingQuestionCount: 0, missingQuestionNameCount: 0, missingAcceptedAnswerCount: 0, missingAnswerTextCount: 0 },
-            organization: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0, valueQualityV1: null },
+            organization: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', observationComplete:false, observationScope:'rendered_dom_jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, logoObservedCount: 0, sameAsObservedCount: 0, organizationNodesWithSameAsCount: 0, organizationSameAsValueCount: 0, emptySameAsValueCount: 0, addressObservedCount: 0, telephoneObservedCount: 0, contactPointObservedCount: 0, valueQualityV1: null },
             contactPoint: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, valueQualityV1: null },
-            website: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0, valueQualityV1: null },
+            website: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', observationComplete:false, observationScope:'rendered_dom_jsonld', nodeCount: 0, missingIdCount: 0, missingNameCount: 0, missingUrlCount: 0, publisherObservedCount: 0, potentialActionObservedCount: 0, valueQualityV1: null },
             product: { observed: null, parseStatus: 'acquisition_failed', sourceFormat: 'jsonld', nodeCount: 0, missingNameCount: 0, missingDescriptionCount: 0, missingIdCount: 0, missingUrlCount: 0, imageObservedCount: 0, brandObservedCount: 0, offerObservedCount: 0, offerMissingPriceCount: 0, offerMissingCurrencyCount: 0 }
           },
           observed: false
@@ -18250,7 +18255,11 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             entityLinkSignals.hasServiceProviderLink = entityLinkPresence.serviceProviderLink === true;
           }
           const qualityParseStatus = parseableCount > 0 ? 'parsed' : (texts.length > 0 && parseErrorsCount > 0 ? 'parse_error' : 'parsed');
-          Object.keys(structuredDataQualityV1).forEach((key) => { structuredDataQualityV1[key].parseStatus = qualityParseStatus; });
+          Object.keys(structuredDataQualityV1).forEach((key) => {
+            structuredDataQualityV1[key].parseStatus = qualityParseStatus;
+            structuredDataQualityV1[key].observationComplete = true;
+            structuredDataQualityV1[key].observationScope = 'rendered_dom_jsonld';
+          });
           return {
             renderedDomRawCount: texts.length,
             renderedDomParseableCount: parseableCount,
