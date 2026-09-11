@@ -9826,7 +9826,27 @@ function normalizeOperatorIdentitySiteMode_(siteMode) {
   return 'unknown';
 }
 
-function operatorIdentityRoleForCandidate_(candidate) {
+function operatorIdentityRoleForCandidate_(candidate, opts = {}) {
+  const directTarget = opts && opts.directTarget === true;
+  const siteMode = normalizeOperatorIdentitySiteMode_(opts && opts.siteMode || candidate && candidate.siteMode);
+  const url = String(candidate && (candidate.url || candidate.path) || '');
+  const path = (() => {
+    try { return new URL(url).pathname.toLowerCase(); } catch (_) { return url.toLowerCase(); }
+  })();
+  if (directTarget) {
+    // Direct targets have no discovery-anchor metadata.  Keep their authority
+    // deliberately narrower than general candidates so article/help prose
+    // cannot become a semantic operator scope through a substring match.
+    const directPageText = [candidate && candidate.title, candidate && candidate.h1Texts, candidate && candidate.h1]
+      .flat().map(value => String(value || '').toLowerCase()).join(' ');
+    if (siteMode === 'ec' && /(?:^|\/)(?:tokushoho|tokushouhou|tradelaw|trade-law|commercial-law|specified-commercial(?:-transactions)?|legal-notice)(?:\/|$)/i.test(path)) return 'commercial_law';
+    if (siteMode === 'ec' && /(?:特定商取引法|特商法|販売(?:業者|事業者)|specified[-_ ]?commercial|commercial[-_ ]?law)/i.test(directPageText)) return 'commercial_law';
+    if (/(?:^|\/)(?:terms?|privacy|policy|agreement|legal|law)(?:\/|$)/i.test(path)) return 'legal';
+    if (/(?:^|\/)(?:about|company|corporate|profile|outline)(?:\/|$)/i.test(path)) return 'about';
+    if (/(?:利用規約|プライバシー|個人情報|法務|terms?|privacy|policy|agreement)/i.test(directPageText)) return 'legal';
+    if (/(?:会社概要|企業情報|corporate profile|about us)/i.test(directPageText)) return 'about';
+    return null;
+  }
   const text = [candidate && candidate.url, candidate && candidate.path, candidate && candidate.label, candidate && candidate.reason, candidate && candidate.title]
     .map(value => String(value || '').toLowerCase()).join(' ');
   if (/(?:tokushoho|tokushouhou|commercial[-_ ]?law|specified[-_ ]?commercial|legal[-_ ]?notice|特定商取引|特商法|販売(?:業者|事業者))/i.test(text)) return 'commercial_law';
@@ -9838,6 +9858,20 @@ function operatorIdentityRoleForCandidate_(candidate) {
   if (/(?:about|company|corporate|profile|outline|about-us|会社概要|企業情報|運営会社)/i.test(text)) return 'about';
   if (/(?:editorial|publisher|編集|発行者|運営者)/i.test(text)) return 'publisher';
   return null;
+}
+
+function buildOperatorIdentityDirectTargetCandidate_(input = {}) {
+  const url = String(input && input.url || '').trim();
+  if (!url) return null;
+  const h1Texts = Array.isArray(input && input.h1Texts) ? input.h1Texts : [];
+  return {
+    url,
+    path: (() => { try { return new URL(url).pathname || '/'; } catch (_) { return url; } })(),
+    title: String(input && input.title || '').slice(0, 240),
+    h1Texts: h1Texts.map(value => String(value || '').slice(0, 240)).filter(Boolean).slice(0, 5),
+    siteMode: normalizeOperatorIdentitySiteMode_(input && input.siteMode),
+    operatorIdentityDirectTarget: true
+  };
 }
 
 function getOperatorIdentityRequiredRoles_(siteMode) {
@@ -10086,9 +10120,19 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
   const siteMode = normalizeOperatorIdentitySiteMode_(input.siteMode);
   const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
   const cap = getOperatorIdentityAdditionalFetchCap_(siteMode);
-  const candidates = Array.isArray(input.operatorCandidatePlan && input.operatorCandidatePlan.candidates)
+  const sourceCandidates = Array.isArray(input.operatorCandidatePlan && input.operatorCandidatePlan.candidates)
     ? input.operatorCandidatePlan.candidates
     : (Array.isArray(input.candidates) ? input.candidates : []);
+  const directTargetCandidate = input.directTargetCandidate &&
+    operatorIdentityRoleForCandidate_(input.directTargetCandidate, { directTarget: true, siteMode })
+    ? input.directTargetCandidate
+    : null;
+  const directTargetKey = discoverSubpageCandidateKey(directTargetCandidate && directTargetCandidate.url || '');
+  // This is semantic metadata for the already-rendered top page. It does not
+  // enter discovery, reservation, or the network fetch plan.
+  const candidates = directTargetCandidate
+    ? [directTargetCandidate].concat(sourceCandidates.filter(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '') !== directTargetKey))
+    : sourceCandidates;
   const limitations = Array.isArray(input.limitations) ? input.limitations.slice() : [];
   const failures = [];
   const selectedByRole = new Map();
@@ -10106,10 +10150,13 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
     const selectedRoles = Array.from(selectedByRole.entries())
       .filter(([, candidate]) => key && key === discoverSubpageCandidateKey(candidate && candidate.url || ''))
       .map(([role]) => role);
+    const directTopScope = source.operatorIdentityRole === 'top'
+      ? operatorIdentityRoleForCandidate_(source, { directTarget: true, siteMode })
+      : null;
     const inheritedScope = source.operatorScopeRole ||
       (Array.isArray(source.operatorScopeRoles) && source.operatorScopeRoles[0]) ||
       (source.operatorIdentityRole !== 'top' ? source.operatorIdentityRole : '') ||
-      operatorIdentityRoleForCandidate_(source);
+      (source.operatorIdentityRole === 'top' ? directTopScope : operatorIdentityRoleForCandidate_(source));
     const operatorScopeRole = selectedRoles[0] || inheritedScope || 'operator';
     return Object.assign(source, {
       pageRole: operatorIdentityPageRole_(source),
@@ -10924,6 +10971,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       siteMode,
       candidates: discovered.candidates,
       operatorCandidatePlan: discovered.operatorCandidatePlan,
+      directTargetCandidate: buildOperatorIdentityDirectTargetCandidate_({
+        url: normalized.topUrl,
+        siteMode,
+        title: geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.title && geoSignalsV1.observed.title.value,
+        h1Texts: geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.headings && geoSignalsV1.observed.headings.h1
+      }),
       pages: topOperatorIdentityPage ? observed.pages.concat([topOperatorIdentityPage]) : observed.pages,
       context: opts && opts.context,
       lightBudget,
@@ -25590,6 +25643,8 @@ module.exports.__lightBudgetTestHooks = {
   buildLightCoverageObservationPlan_,
   buildOperatorIdentityObservationV1_,
   buildRuntimeOperatorIdentityObservationV1_,
+  buildOperatorIdentityDirectTargetCandidate_,
+  operatorIdentityRoleForCandidate_,
   collectTopOperatorIdentityRenderedEvidence_,
   extractOperatorIdentityEvidenceFromRenderedPage_,
   waitForScopedOperatorEvidenceDomReadiness_,

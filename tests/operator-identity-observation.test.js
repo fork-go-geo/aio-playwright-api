@@ -189,6 +189,7 @@ async function runRolePropagationFixtures() {
     candidateCapped: false, baseScopeComplete: true, limitations: [], failures: [],
     context: null, origin: 'https://example.test'
   }, input));
+  const directCandidate = (url, siteMode, metadata = {}) => hooks.buildOperatorIdentityDirectTargetCandidate_(Object.assign({ url, siteMode }, metadata));
   const duplicateEvidence = [
     { label: '運営会社', value: 'Example Media', sourceScope: 'content' },
     { label: '運営会社', value: 'Example\nMedia', sourceScope: 'content' }
@@ -329,6 +330,73 @@ async function runRolePropagationFixtures() {
     assert.equal(observed.evidence[0].role, 'commercial_law');
     assert.equal(observed.evidence[0].pageRole, pageRole);
     assert.equal(observed.evidence[0].evidenceRole, 'seller_name');
+  }
+
+  // A direct target has pageRole=top but now receives the same high-confidence
+  // semantic scope as the root candidate, without relying on evidence labels.
+  const directEcUrl = 'https://example.test/help/tradelaw';
+  observed = await runtime({
+    siteMode: 'ec', candidates: [], directTargetCandidate: directCandidate(directEcUrl, 'ec'),
+    pages: [renderedPage(directEcUrl, 'Example Seller', {
+      operatorIdentityRole: 'top', pageRole: 'top',
+      operatorIdentityEvidence: [{ label: '販売業者', value: 'Example Seller', sourceScope: 'content' }]
+    })]
+  });
+  assert.equal(observed.signalState, 'true');
+  assert.equal(observed.evidence[0].pageRole, 'top');
+  assert.equal(observed.evidence[0].role, 'commercial_law');
+  assert.equal(observed.evidence[0].evidenceRole, 'seller_name');
+  assert.equal(observed.conflict, false);
+
+  const rootEc = await runtime({
+    siteMode: 'ec', candidates: [{ url: directEcUrl, label: '特定商取引法に基づく表記' }],
+    pages: [renderedPage(directEcUrl, 'Example Seller', {
+      operatorIdentityRole: 'commercial_law', pageRole: 'commercial_law',
+      operatorIdentityEvidence: [{ label: '販売業者', value: 'Example Seller', sourceScope: 'content' }]
+    })]
+  });
+  assert.equal(rootEc.signalState, observed.signalState);
+  assert.equal(rootEc.evidence[0].role, observed.evidence[0].role);
+  assert.equal(rootEc.evidence[0].evidenceRole, observed.evidence[0].evidenceRole);
+  assert.equal(rootEc.conflict, observed.conflict);
+  assert.equal(rootEc.evidence[0].pageRole, 'commercial_law');
+
+  for (const path of ['/tokushoho', '/tokushouhou', '/tradelaw', '/trade-law', '/commercial-law', '/specified-commercial', '/legal-notice', '/help/tradelaw']) {
+    assert.equal(hooks.operatorIdentityRoleForCandidate_(directCandidate(`https://example.test${path}`, 'ec'), { directTarget: true, siteMode: 'ec' }), 'commercial_law');
+  }
+  assert.equal(hooks.operatorIdentityRoleForCandidate_(directCandidate('https://example.test/info/notice', 'ec', {
+    title: '特定商取引法に基づく表記', h1Texts: ['販売業者']
+  }), { directTarget: true, siteMode: 'ec' }), 'commercial_law');
+
+  for (const [siteMode, path, expectedRole] of [
+    ['media', '/company/', 'publisher'],
+    ['corp', '/company/', 'about'],
+    ['saas', '/terms/', 'legal']
+  ]) {
+    const url = `https://example.test${path}`;
+    observed = await runtime({
+      siteMode, candidates: [], directTargetCandidate: directCandidate(url, siteMode),
+      pages: [renderedPage(url, 'Example Operator', {
+        operatorIdentityRole: 'top', pageRole: 'top',
+        operatorIdentityEvidence: [{ label: '運営会社', value: 'Example Operator', sourceScope: 'content' }]
+      })]
+    });
+    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.evidence[0].pageRole, 'top');
+    assert.equal(observed.evidence[0].role, expectedRole);
+  }
+
+  for (const unsafePath of ['/news/company-history/', '/article/privacy-tech/', '/products/legal-pad/', '/help/company-feature/', '/info/123/']) {
+    const url = `https://example.test${unsafePath}`;
+    observed = await runtime({
+      siteMode: 'ec', candidates: [], directTargetCandidate: directCandidate(url, 'ec'),
+      pages: [renderedPage(url, 'Example Seller', {
+        operatorIdentityRole: 'top', pageRole: 'top',
+        operatorIdentityEvidence: [{ label: '販売業者', value: 'Example Seller', sourceScope: 'content' }]
+      })]
+    });
+    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.evidence[0].role, 'operator');
   }
 
   // Corporate and SaaS direct pages likewise keep top as source-only metadata.
