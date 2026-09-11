@@ -3240,6 +3240,25 @@ function isLegalOperatorCandidatePath_(value) {
   return /\/(?:policies\/legal-notice|legal-notice|legal|law|commercial-transactions|specified-commercial-transactions|tokushoho)(?:\/|$|-|_)/i.test(path);
 }
 
+// A company-profile probe is deliberately stricter than ordinary discovery.
+// The path is only a routing hint: a matching, human-facing company label and
+// corroboration from two discovery sources are required before we spend the
+// one additional request.
+function isHighConfidenceCompanyProfileCandidate_(candidate) {
+  const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
+  const label = normalizeSubpageJsonLdText(candidate && (candidate.label || candidate.text || candidate.ariaLabel || candidate.title) || '');
+  const path = (() => {
+    try { return new URL(url).pathname.toLowerCase(); } catch (_) { return url.toLowerCase(); }
+  })();
+  const sources = Array.isArray(candidate && candidate.sources)
+    ? candidate.sources.map(value => String(value || ''))
+    : (candidate && candidate.source ? [String(candidate.source)] : []);
+  const companyPath = /\/(?:about(?:us)?|company|corporate|profile|outline|company-info|overview)(?:\/|$|-|_)/i.test(path);
+  const companyLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介/.test(label);
+  const corroborated = sources.length >= 2 && sources.some(source => source === 'sitemap') && sources.some(source => source === 'nav' || source === 'footer' || source === 'htmlSitemap');
+  return companyPath && companyLabel && corroborated;
+}
+
 function inferLegalOperatorPageType_(url, title, h1Texts) {
   const hay = [
     url,
@@ -3263,13 +3282,18 @@ function inferSiteModeForRepresentativeObservation_(topUrl, explicitMode) {
 }
 
 function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
+  const sourceType = meta && meta.sourceType === 'company_profile' ? 'company_profile' : 'legal';
+  const requireCompanyName = sourceType === 'company_profile';
   const empty = {
     observed: false,
-    pageType: 'legal',
+    pageType: sourceType === 'legal' ? 'legal' : 'company_profile',
+    sourceType,
     sourceUrl: String(sourceUrl || ''),
+    companyName: '',
     operatorName: '',
     address: '',
     telephone: '',
+    hasCompanyName: false,
     hasOperatorName: false,
     hasAddress: false,
     hasTelephone: false,
@@ -3283,7 +3307,8 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     const title = normalizeSubpageJsonLdText((meta && meta.title) || $('title').first().text());
     const h1Texts = Array.isArray(meta && meta.h1Texts) ? meta.h1Texts : $('h1').map((_, el) => normalizeSubpageJsonLdText($(el).text())).get();
     const pageHay = [sourceUrl, title].concat(h1Texts).join(' ');
-    if (!isLegalOperatorCandidatePath_(sourceUrl) && !isLegalOperatorCandidateText_(pageHay)) return empty;
+    if (sourceType === 'legal' && !isLegalOperatorCandidatePath_(sourceUrl) && !isLegalOperatorCandidateText_(pageHay)) return empty;
+    if (sourceType === 'company_profile' && !(meta && meta.highConfidenceCompanyProfile === true)) return empty;
 
     const canonicalLabel = (value, kind = '') => {
       const text = normalizeSubpageJsonLdText(value);
@@ -3383,19 +3408,32 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       address: address.value ? extractJapaneseAddress(address.value) : '',
       telephone: telephone.value ? extractJapanesePhone(telephone.value) : ''
     });
+    out.companyName = out.operatorName;
     if (out.operatorName && operator.label) out.evidenceLabels.push(operator.label);
     if (out.address && address.label) out.evidenceLabels.push(address.label);
     if (out.telephone && telephone.label) out.evidenceLabels.push(telephone.label);
     out.hasOperatorName = !!out.operatorName;
+    out.hasCompanyName = !!out.companyName;
     out.hasAddress = !!out.address;
     out.hasTelephone = !!out.telephone;
-    out.hasOperatorInfo = out.hasAddress && out.hasTelephone;
+    // Legal notices retain their historical address + telephone contract.
+    // A general company profile additionally requires an explicit company name.
+    out.hasOperatorInfo = requireCompanyName
+      ? (out.hasCompanyName && out.hasAddress && out.hasTelephone)
+      : (out.hasAddress && out.hasTelephone);
     out.observed = out.hasOperatorName || out.hasOperatorInfo;
     out.evidenceLabels = Array.from(new Set(out.evidenceLabels.filter(Boolean))).slice(0, 10);
     return out;
   } catch (_) {
     return empty;
   }
+}
+
+function extractOperatorIdentityInfoFromHtml_(html, sourceUrl, meta = {}) {
+  return extractLegalOperatorInfoFromHtml_(html, sourceUrl, Object.assign({}, meta, {
+    sourceType: 'company_profile',
+    highConfidenceCompanyProfile: meta && meta.highConfidenceCompanyProfile === true
+  }));
 }
 
 function extractContactSignalsFromHtml_(html, sourceUrl) {
@@ -3794,7 +3832,7 @@ function detectBreadcrumbUiFromCheerio_($) {
     : { hasBreadcrumbUi: false, source: 'not_observed', element: null };
 }
 
-function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
+function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts = {}) {
   const $ = cheerio.load(String(html || ''));
   const title = normalizeSubpageJsonLdText($('title').first().text()).slice(0, 180);
   const canonicalRaw = normalizeSubpageJsonLdText($('link[rel~="canonical" i]').first().attr('href') || '');
@@ -3846,6 +3884,13 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   );
   const legalOperatorInfo = legalPageType === 'legal'
     ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
+    : null;
+  const operatorIdentityInfo = opts && opts.operatorIdentitySourceType === 'company_profile'
+    ? extractOperatorIdentityInfoFromHtml_(html, finalUrl || url, {
+        title,
+        h1Texts,
+        highConfidenceCompanyProfile: opts.highConfidenceCompanyProfile === true
+      })
     : null;
   const contactSignals = pageType === 'contact'
     ? extractContactSignalsFromHtml_(html, finalUrl || url)
@@ -3962,6 +4007,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     bodyTextLength,
     sampledText,
     legalOperatorInfo,
+    operatorIdentityInfo,
     contactSignals,
     formSignals,
     articleSignals,
@@ -4121,7 +4167,7 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
       }
     } catch (_) {}
     try {
-      return Object.assign(parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode), {
+      return Object.assign(parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode, opts), {
         observationSource: 'html-fetch-light',
         observationMethod: 'html_fetch_light',
         errorStage: null
@@ -5693,10 +5739,14 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
   const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
+  const operatorIdentityCandidates = allCandidates
+    .filter(isHighConfidenceCompanyProfileCandidate_)
+    .slice(0, 5);
   emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates);
   return {
     candidates: allCandidates.slice(0, normalizedLimit),
     roleRepresentativeCandidates,
+    operatorIdentityCandidates,
     totalCandidates: allCandidates.length,
     sourceSummary,
     errors
@@ -9291,6 +9341,46 @@ function pickBestLegalOperatorInfo_(pages) {
   };
 }
 
+function normalizeOperatorIdentityInfo_(info, sourceType) {
+  if (!info || typeof info !== 'object' || info.hasOperatorInfo !== true) return null;
+  const companyName = normalizeSubpageJsonLdText(info.companyName || info.operatorName).slice(0, 120);
+  const address = normalizeSubpageJsonLdText(info.address).slice(0, 160);
+  const telephone = normalizeSubpageJsonLdText(info.telephone).slice(0, 60);
+  const type = sourceType === 'company_profile' ? 'company_profile' : 'legal';
+  // Legal notices keep their historical acceptance contract. Company profiles
+  // must prove the named organization as well as its address and telephone.
+  const hasOperatorInfo = type === 'company_profile'
+    ? (!!companyName && !!address && !!telephone)
+    : (!!address && !!telephone);
+  return {
+    observed: info.observed === true,
+    observationComplete: true,
+    sourceType: type,
+    sourceUrl: String(info.sourceUrl || ''),
+    companyName,
+    address,
+    telephone,
+    hasCompanyName: !!companyName,
+    hasAddress: !!address,
+    hasTelephone: !!telephone,
+    hasOperatorInfo,
+    extractionMethod: String(info.extractionMethod || 'html_text'),
+    evidenceLabels: Array.isArray(info.evidenceLabels) ? info.evidenceLabels.slice(0, 10) : []
+  };
+}
+
+function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
+  // Start narrowly. Generic is included because legacy corporate sites can be
+  // classified conservatively, as asuzac-space.jp is; other modes stay out.
+  const mode = String(siteMode || '').toLowerCase();
+  if (mode !== 'corporate' && mode !== 'generic') return null;
+  return (Array.isArray(candidates) ? candidates : [])
+    .filter(isHighConfidenceCompanyProfileCandidate_)
+    .slice()
+    .sort((a, b) => Number(b && b.score || 0) - Number(a && a.score || 0))
+    [0] || null;
+}
+
 function pickBestContactSignals_(pages) {
   const candidates = (Array.isArray(pages) ? pages : [])
     .map(page => page && page.contactSignals)
@@ -10056,11 +10146,93 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidates: discovered.candidates
     }));
     const legalOperatorInfo = pickBestLegalOperatorInfo_(observations);
+    let operatorIdentityInfo = legalOperatorInfo && legalOperatorInfo.hasOperatorInfo === true
+      ? normalizeOperatorIdentityInfo_(legalOperatorInfo, 'legal')
+      : null;
+    let operatorIdentityProbe = {
+      attempted: false,
+      observationComplete: false,
+      sourceUrl: null,
+      sourceType: null,
+      reason: operatorIdentityInfo ? 'existing_legal_operator_identity' : 'no_high_confidence_company_profile_candidate'
+    };
+    // This probe is intentionally outside the normal representative-page plan:
+    // it never changes maxObserve=2 or displaces business/contact observation.
+    if (!operatorIdentityInfo) {
+      const operatorCandidate = selectOperatorIdentityProbeCandidate_(discovered.operatorIdentityCandidates, siteMode);
+      if (operatorCandidate) {
+        operatorIdentityProbe = {
+          attempted: true,
+          observationComplete: false,
+          sourceUrl: String(operatorCandidate.url || ''),
+          sourceType: 'company_profile',
+          reason: 'high_confidence_company_profile_candidate'
+        };
+        const operatorProbeResult = await fetchSubpageHtmlLightUrls_([operatorCandidate.url], {
+          siteMode,
+          lightBudget,
+          htmlFetchTimeoutMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS : 4000,
+          reserveMs: lightBudget ? LIGHT_RESPONSE_CLEANUP_RESERVE_MS : undefined,
+          minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
+          operatorIdentitySourceType: 'company_profile',
+          highConfidenceCompanyProfile: true
+        });
+        const operatorPage = operatorProbeResult && Array.isArray(operatorProbeResult.pages) ? operatorProbeResult.pages[0] : null;
+        operatorIdentityProbe.observationComplete = !!(operatorPage && operatorPage.ok === true);
+        operatorIdentityProbe.reason = operatorPage && operatorPage.ok === true
+          ? 'company_profile_fetched'
+          : String(operatorPage && operatorPage.error || 'company_profile_fetch_failed');
+      if (operatorPage && operatorPage.operatorIdentityInfo) {
+        const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(operatorPage.operatorIdentityInfo, 'company_profile');
+        if (normalizedOperatorIdentity) {
+          operatorIdentityInfo = normalizedOperatorIdentity;
+          operatorIdentityInfo.observationComplete = operatorIdentityProbe.observationComplete;
+        } else {
+          const rawOperatorIdentity = operatorPage.operatorIdentityInfo;
+          operatorIdentityInfo = {
+            observed: rawOperatorIdentity.observed === true,
+            observationComplete: operatorIdentityProbe.observationComplete,
+            sourceType: 'company_profile',
+            sourceUrl: operatorIdentityProbe.sourceUrl,
+            companyName: String(rawOperatorIdentity.companyName || rawOperatorIdentity.operatorName || ''),
+            address: String(rawOperatorIdentity.address || ''),
+            telephone: String(rawOperatorIdentity.telephone || ''),
+            hasCompanyName: rawOperatorIdentity.hasCompanyName === true,
+            hasAddress: rawOperatorIdentity.hasAddress === true,
+            hasTelephone: rawOperatorIdentity.hasTelephone === true,
+            hasOperatorInfo: false,
+            extractionMethod: String(rawOperatorIdentity.extractionMethod || 'html_text'),
+            evidenceLabels: Array.isArray(rawOperatorIdentity.evidenceLabels) ? rawOperatorIdentity.evidenceLabels.slice(0, 10) : [],
+            provenance: { reason: 'required_fields_missing' },
+          };
+        }
+      } else if (operatorPage) {
+          operatorIdentityInfo = {
+            observed: false,
+            observationComplete: operatorIdentityProbe.observationComplete,
+            sourceType: 'company_profile',
+            sourceUrl: String(operatorPage.finalUrl || operatorCandidate.url || ''),
+            companyName: '', address: '', telephone: '',
+            hasCompanyName: false, hasAddress: false, hasTelephone: false,
+            hasOperatorInfo: false,
+            extractionMethod: 'html_text',
+            evidenceLabels: []
+          };
+        }
+      }
+    }
     if (legalOperatorInfo) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
         ? geoSignalsV1.trustSignals
         : {};
       geoSignalsV1.trustSignals.legalOperatorInfo = legalOperatorInfo;
+    }
+    if (operatorIdentityInfo) {
+      geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
+        ? geoSignalsV1.trustSignals
+        : {};
+      geoSignalsV1.trustSignals.operatorIdentityInfo = operatorIdentityInfo;
+      geoSignalsV1.trustSignals.operatorIdentityProbe = operatorIdentityProbe;
     }
     const contactSignals = pickBestContactSignals_(observations);
     if (contactSignals) {
@@ -24455,6 +24627,11 @@ module.exports.__lightBudgetTestHooks = {
   buildFreshnessOperationSignalsFromArticleSignals_,
   extractArticleVisibleDateCandidatesFromCheerio_,
   parseSubpageJsonLdLightHtml,
+  extractOperatorIdentityInfoFromHtml_,
+  extractLegalOperatorInfoFromHtml_,
+  isHighConfidenceCompanyProfileCandidate_,
+  selectOperatorIdentityProbeCandidate_,
+  normalizeOperatorIdentityInfo_,
   compactSubpageJsonLdObservation_,
   normalizeArticleVisibleDate_,
   pickArticleVisibleDate_,
