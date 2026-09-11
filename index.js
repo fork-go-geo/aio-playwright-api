@@ -4380,6 +4380,33 @@ async function waitForScopedOperatorEvidenceDomReadiness_(page, opts = {}) {
   }
 }
 
+function normalizeOperatorIdentityEvidenceLabel_(label) {
+  let normalized = String(label == null ? '' : label);
+  try { normalized = normalized.normalize('NFKC'); } catch (_) {}
+  return normalized.replace(/[\s\u3000]+/g, ' ').trim().replace(/[：:]+$/g, '').trim().toLowerCase();
+}
+
+// Raw extraction may retain a small number of context-dependent candidates,
+// but only this helper admits an item as strong operator evidence. Keeping
+// that decision here prevents a label found in article/product prose from
+// becoming a positive observation merely because it was parseable.
+function isStrongOperatorIdentityLabel_(label, opts = {}) {
+  const text = String(label || '').toLowerCase();
+  const normalized = normalizeOperatorIdentityEvidenceLabel_(label);
+  const globalStrongLabel = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|company|corporate|operator|seller|merchant|publisher|editor)/i;
+  if (globalStrongLabel.test(text)) return true;
+  if (normalized !== '商号') return false;
+
+  const siteMode = normalizeOperatorIdentitySiteMode_(opts.siteMode);
+  const scope = String(opts.operatorScopeRole || '').trim();
+  const sourceShape = String(opts.sourceShape || '').trim();
+  const valueCellCount = Number(opts.valueCellCount);
+  const structuredLocalPair = ['table', 'dl', 'heading', 'inline'].includes(sourceShape) &&
+    (sourceShape !== 'table' || valueCellCount === 1);
+  return ['corp', 'saas', 'ec', 'media'].includes(siteMode) &&
+    scope === 'about' && structuredLocalPair;
+}
+
 async function extractOperatorIdentityEvidenceFromRenderedPage_(page) {
   if (!page || typeof page.evaluate !== 'function') return { evidence: [], baseScopeComplete: false };
   try {
@@ -4390,42 +4417,50 @@ async function extractOperatorIdentityEvidenceFromRenderedPage_(page) {
         const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
         return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
       };
-      const labelRx = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|company|corporate|operator|seller|merchant|publisher|editor)/i;
+      // 商号 is only a raw, structured-pair candidate here. Its strong
+      // admission is context-aware in isStrongOperatorIdentityLabel_.
+      const extractableLabelRx = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|商号|company|corporate|operator|seller|merchant|publisher|editor)/i;
       const isAggregateOperatorValueContainer = node => {
         if (!node || !node.querySelectorAll) return false;
         const headings = Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6')).filter(visible);
         const valueBlocks = Array.from(node.querySelectorAll('p,li,dt,dd')).filter(visible);
-        const operatorHeadings = headings.filter(heading => labelRx.test(clean(heading.textContent)));
+        const operatorHeadings = headings.filter(heading => extractableLabelRx.test(clean(heading.textContent)));
         return headings.length >= 2 || operatorHeadings.length >= 2 || (headings.length >= 1 && valueBlocks.length >= 3);
       };
       const out = [];
-      const add = (label, value, el) => {
+      const add = (label, value, el, sourceShape, valueCellCount) => {
         label = clean(label).slice(0, 80); value = clean(value).slice(0, 160);
-        if (!label || !value || !labelRx.test(label) || !visible(el) || out.length >= 6) return;
+        if (!label || !value || !extractableLabelRx.test(label) || !visible(el) || out.length >= 6) return;
         if (/^(?:こちら|詳細はこちら|お問い合わせ|https?:\/\/|\d[\d\-() ]{5,}|〒?\d{3}-?\d{4})$/i.test(value) || value === label) return;
-        if (!out.some(item => item.label === label && item.value === value)) out.push({ label, value, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
+        if (!out.some(item => item.label === label && item.value === value)) out.push({
+          label,
+          value,
+          sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content',
+          sourceShape: String(sourceShape || 'inline'),
+          valueCellCount: Number.isFinite(Number(valueCellCount)) ? Number(valueCellCount) : null
+        });
       };
       Array.from(document.querySelectorAll('table tr')).slice(0, 120).forEach(row => {
         const cells = Array.from(row.querySelectorAll('th,td'));
-        if (cells.length > 1) add(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row);
+        if (cells.length > 1) add(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row, 'table', cells.length - 1);
       });
       Array.from(document.querySelectorAll('dl dt')).slice(0, 80).forEach(dt => {
         const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName).toLowerCase() === 'dd' ? dt.nextElementSibling : null;
-        if (dd) add(dt.textContent, dd.textContent, dt);
+        if (dd) add(dt.textContent, dd.textContent, dt, 'dl', 1);
       });
       Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 80).forEach(heading => {
         const value = heading.nextElementSibling;
         if (!value || !/^(?:p|div|span|dd)$/i.test(String(value.tagName || '')) || isAggregateOperatorValueContainer(value)) return;
-        add(heading.textContent, value.textContent, value);
+        add(heading.textContent, value.textContent, value, 'heading', 1);
       });
       Array.from(document.querySelectorAll('p,div,li')).slice(0, 300).forEach(block => {
         if (!visible(block) || block.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,table,dl').length > 1) return;
         const strong = block.querySelector('strong,b');
-        if (strong) add(strong.textContent, clean(String(block.innerText || block.textContent || '').replace(String(strong.innerText || strong.textContent || ''), '')), block);
+        if (strong) add(strong.textContent, clean(String(block.innerText || block.textContent || '').replace(String(strong.innerText || strong.textContent || ''), '')), block, 'inline', 1);
         const lines = String(block.innerText || '').split(/\n+/).map(clean).filter(Boolean);
-        if (lines.length >= 2) add(lines[0], lines.slice(1).join(' '), block);
+        if (lines.length >= 2) add(lines[0], lines.slice(1).join(' '), block, 'inline', 1);
         const pair = clean(block.innerText || block.textContent).match(/^([^:：]{1,80})\s*[:：]\s*(.{1,160})$/);
-        if (pair) add(pair[1], pair[2], block);
+        if (pair) add(pair[1], pair[2], block, 'inline', 1);
       });
       return {
         evidence: out,
@@ -9998,7 +10033,8 @@ function operatorIdentityPageRole_(page) {
   return operatorIdentityRoleForCandidate_(page) || legacy || 'unknown';
 }
 
-function compactOperatorIdentityEvidence_(pages) {
+function compactOperatorIdentityEvidence_(pages, opts = {}) {
+  const siteMode = normalizeOperatorIdentitySiteMode_(opts.siteMode);
   const evidence = [];
   const identityTokensByEvidenceRole = new Map();
   const duplicateKeys = new Set();
@@ -10015,6 +10051,12 @@ function compactOperatorIdentityEvidence_(pages) {
         (page.operatorIdentityRole !== 'top' && page.operatorIdentityRole) ||
         operatorIdentityRoleForCandidate_(page) || 'operator');
       const label = String(item.label || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      if (!isStrongOperatorIdentityLabel_(label, {
+        siteMode,
+        operatorScopeRole: role,
+        sourceShape: item.sourceShape,
+        valueCellCount: item.valueCellCount
+      })) return;
       const evidenceRole = operatorIdentityEvidenceRole_(label, role);
       const identityToken = normalizeOperatorIdentityToken_(item.value, label);
       if (!identityToken) return;
@@ -10046,7 +10088,7 @@ function buildOperatorIdentityObservationV1_(input = {}) {
   const maxAdditionalFetch = getOperatorIdentityAdditionalFetchCap_(siteMode);
   const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
   const pages = Array.isArray(input.pages) ? input.pages : [];
-  const compacted = compactOperatorIdentityEvidence_(pages);
+  const compacted = compactOperatorIdentityEvidence_(pages, { siteMode });
   const limitations = Array.isArray(input.limitations) ? input.limitations.filter(Boolean).slice(0, 5) : [];
   const failures = Array.isArray(input.failures) ? input.failures.filter(Boolean).slice(0, 5) : [];
   const completedRoles = Array.isArray(input.completedRoles) ? input.completedRoles : [];
