@@ -3320,8 +3320,14 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       if (/所在地/.test(text)) return '所在地';
       if (/住所/.test(text)) return '住所';
       if (/お客様相談室/.test(text)) return 'お客様相談室';
-      if (/電話番号/.test(text)) return '電話番号';
-      if (/連絡先/.test(text)) return '連絡先';
+      // Telephone labels must be a complete table/dl field label.  In
+      // particular, do not turn prose such as "電話受付時間" or
+      // "電話番号変更のお知らせ" into a telephone field merely because it
+      // contains a telephone-related word.
+      if (/^電話番号(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(text)) return '電話番号';
+      if (/^電話$/i.test(text)) return '電話';
+      if (/^tel$/i.test(text)) return 'TEL';
+      if (/^連絡先$/i.test(text)) return '連絡先';
       if (kind === 'operator' && /会社名/.test(text)) return '会社名';
       return '';
     };

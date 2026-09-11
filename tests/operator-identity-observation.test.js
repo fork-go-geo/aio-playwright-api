@@ -18,7 +18,7 @@ const asuzacHtml = `
   <table>
     <tr><th>会社名</th><td>アスザック株式会社</td></tr>
     <tr><th>所在地</th><td>〒382-8508 長野県上高井郡高山村大字中山981</td></tr>
-    <tr><th>電話番号</th><td>026-245-1001</td></tr>
+    <tr><th>電話</th><td>026-245-1001</td></tr>
     <tr><th>FAX</th><td>026-248-4525</td></tr>
   </table>`;
 
@@ -30,6 +30,33 @@ assert.deepStrictEqual(
   [asuzacInfo.companyName, asuzacInfo.address, asuzacInfo.telephone, asuzacInfo.hasOperatorInfo],
   ['アスザック株式会社', '〒382-8508 長野県上高井郡高山村大字中山981', '026-245-1001', true]
 );
+assert.deepStrictEqual(asuzacInfo.evidenceLabels, ['会社名', '所在地', '電話']);
+
+// Telephone recognition is restricted to a structured field label, not prose
+// that happens to contain the word "電話".
+for (const [label, value] of [
+  ['電話番号', '03-1234-5678'],
+  ['TEL', '03-1234-5678'],
+]) {
+  const info = extractOperatorIdentityInfoFromHtml_(
+    `<table><tr><th>会社名</th><td>Example Co.</td></tr><tr><th>所在地</th><td>東京都千代田区1-1</td></tr><tr><th>${label}</th><td>${value}</td></tr></table>`,
+    'https://example.test/company/',
+    { highConfidenceCompanyProfile: true }
+  );
+  assert.strictEqual(info.telephone, value, label);
+  assert.strictEqual(info.hasOperatorInfo, true, label);
+}
+for (const label of ['電話受付時間', '電話対応時間', '電話番号変更のお知らせ']) {
+  const info = extractOperatorIdentityInfoFromHtml_(
+    `<table><tr><th>会社名</th><td>Example Co.</td></tr><tr><th>所在地</th><td>東京都千代田区1-1</td></tr><tr><th>${label}</th><td>03-1234-5678</td></tr></table>`,
+    'https://example.test/company/',
+    { highConfidenceCompanyProfile: true }
+  );
+  assert.strictEqual(info.telephone, '', label);
+  assert.strictEqual(info.hasOperatorInfo, false, label);
+}
+const proseOnly = extractOperatorIdentityInfoFromHtml_('<p>お問い合わせはお電話ください（03-1234-5678）。</p>', 'https://example.test/company/', { highConfidenceCompanyProfile: true });
+assert.strictEqual(proseOnly.telephone, '');
 const normalPlan = buildLightCoverageObservationPlan_([
   { url: 'https://asuzac-space.jp/business/index.htm', category: 'business', score: 100 },
   { url: 'https://asuzac-space.jp/contact/form.htm', category: 'contact', score: 100 },
