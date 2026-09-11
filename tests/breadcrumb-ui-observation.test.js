@@ -22,10 +22,27 @@ function breadcrumb(signals) {
 (async () => {
   globalThis.__breadcrumbUiBrowser = await chromium.launch({ headless: true });
   try {
-    // A. Explicit aria/class detection remains authoritative.
-    const explicit = await observe('<nav aria-label="breadcrumb"><ol><li>Home</li></ol></nav>', 'explicit');
+    // A. Explicit aria-current breadcrumb remains supported.
+    const explicit = await observe('<nav aria-label="breadcrumb"><ol><li><a href="/">Home</a></li><li aria-current="page">Current</li></ol></nav>', 'explicit');
     assert.strictEqual(breadcrumb(explicit).hasBreadcrumbUi, true);
     assert.strictEqual(breadcrumb(explicit).breadcrumbUiSource, 'explicit_selector');
+
+    // B. Koiwai-shaped visible breadcrumb: the final span has no aria/current
+    // marker, so the structural contract (not the class alone) is decisive.
+    const koiwaiCompany = await observe(`
+      <div class="l-bread"><ul class="l-bread__list">
+        <li><a href="/">ホーム</a></li><li><span>企業情報</span></li>
+      </ul></div>
+    `, 'koiwai-company');
+    assert.strictEqual(breadcrumb(koiwaiCompany).hasBreadcrumbUi, true);
+    assert.strictEqual(breadcrumb(koiwaiCompany).breadcrumbUiSource, 'structural_breadcrumb');
+
+    const koiwaiContact = await observe(`
+      <div class="l-bread"><ul class="l-bread__list">
+        <li><a href="/">ホーム</a></li><li><span>お客様相談室（お問い合わせ）</span></li>
+      </ul></div>
+    `, 'koiwai-contact');
+    assert.strictEqual(breadcrumb(koiwaiContact).hasBreadcrumbUi, true);
 
     // B. Majisemi-shaped structural list with a CSS-only separator.
     const structural = await observe(`
@@ -51,7 +68,7 @@ function breadcrumb(signals) {
     const globalNav = await observe('<nav><ul><li><a href="/">Home</a></li><li><a href="/about">About</a></li></ul></nav>', 'global-nav');
     assert.strictEqual(breadcrumb(globalNav).hasBreadcrumbUi, false);
 
-    // F. A two-item content list has neither current-page semantics nor microdata.
+    // F. A two-item content list has neither a breadcrumb container nor current-page semantics.
     const plainList = await observe('<main><ul><li><a href="/">Home</a></li><li>News</li></ul></main>', 'plain-list');
     assert.strictEqual(breadcrumb(plainList).hasBreadcrumbUi, false);
 
@@ -63,7 +80,7 @@ function breadcrumb(signals) {
     const currentOnly = await observe('<main><ul><li><a href="/section">Section</a></li><li class="current-item">Current</li></ul></main>', 'current-only');
     assert.strictEqual(breadcrumb(currentOnly).hasBreadcrumbUi, false);
 
-    // H. RDFa-like attributes alone are insufficient without a marked current item.
+    // H. RDFa-like attributes alone are insufficient without a breadcrumb container.
     const incompleteRdfa = await observe(`
       <main><ul>
         <li><span property="itemListElement" typeof="ListItem"><a property="item" href="/"><span property="name">Home</span></a><meta property="position" content="1"></span></li>
@@ -71,6 +88,19 @@ function breadcrumb(signals) {
       </ul></main>
     `, 'incomplete-rdfa');
     assert.strictEqual(breadcrumb(incompleteRdfa).hasBreadcrumbUi, false);
+
+    // I. Footer links, utility lists, and a lone Home item are not breadcrumbs.
+    const footer = await observe('<footer><div class="l-bread"><ul><li><a href="/">ホーム</a></li><li><span>企業情報</span></li></ul></div></footer>', 'footer');
+    assert.strictEqual(breadcrumb(footer).hasBreadcrumbUi, false);
+
+    const utility = await observe('<main><ul><li><a href="/">ホーム</a></li><li><span>現在ページ</span></li></ul></main>', 'utility');
+    assert.strictEqual(breadcrumb(utility).hasBreadcrumbUi, false);
+
+    const oneItem = await observe('<div class="l-bread"><ul><li><a href="/">ホーム</a></li></ul></div>', 'one-item');
+    assert.strictEqual(breadcrumb(oneItem).hasBreadcrumbUi, false);
+
+    const schemaOnly = await observe('<script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList"}</script>', 'schema-only');
+    assert.strictEqual(breadcrumb(schemaOnly).hasBreadcrumbUi, false);
 
     console.log('breadcrumb-ui-observation: ok');
   } finally {
