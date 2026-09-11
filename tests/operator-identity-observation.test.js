@@ -146,21 +146,24 @@ async function runRolePropagationFixtures() {
     { label: '運営会社', value: 'Example\nMedia', sourceScope: 'content' }
   ];
 
-  // Nested containers previously produced two differently-sized composite
-  // values from one heading/value field.  The top collector must keep only the
-  // smallest meaningful pair before semantic dedupe/conflict processing.
+  // Production-shaped aggregate: h1's immediate div contains several sections.
+  // Only the nested h2 -> p operator field is valid evidence.
   const browser = await chromium.launch({ headless: true });
-  let topPage;
+  let topPage, ecTopPage;
   try {
     const page = await browser.newPage();
-    await page.setContent('<header></header><nav></nav><div><div><h2>運営会社</h2><p>Example Media</p></div></div><footer></footer>');
+    await page.setContent('<header></header><nav></nav><section><h1>運営会社</h1><div class="aggregate"><h2>運営会社</h2><p>Example Media</p><h2>所在地</h2><p>Example Address</p><h2>お問い合わせ</h2><p>Example Contact</p></div></section><footer></footer>');
     topPage = await hooks.collectTopOperatorIdentityRenderedEvidence_(page, 'https://example.test/company/');
+    await page.setContent('<header></header><nav></nav><section><h1>特定商取引法に基づく表記</h1><div class="aggregate"><h2>販売業者</h2><p>Example Seller</p><h2>所在地</h2><p>Example Address</p><h2>お問い合わせ</h2><p>Example Contact</p></div></section><footer></footer>');
+    ecTopPage = await hooks.collectTopOperatorIdentityRenderedEvidence_(page, 'https://example.test/tokushoho/');
   } finally {
     await browser.close();
   }
   assert.equal(topPage.operatorIdentityRole, 'top');
   assert.equal(topPage.operatorIdentityEvidence.length, 1);
   assert.equal(topPage.operatorIdentityEvidence[0].label, '運営会社');
+  assert.equal(ecTopPage.operatorIdentityEvidence.length, 1);
+  assert.equal(ecTopPage.operatorIdentityEvidence[0].label, '販売業者');
 
   // Production-failure regression: direct /company/ is top as a page source,
   // yet publisher remains the selected semantic operator scope.
@@ -190,13 +193,16 @@ async function runRolePropagationFixtures() {
 
   // EC direct and root reuse preserve commercial_law without a duplicate fetch.
   for (const pageRole of ['top', 'about']) {
+    const page = pageRole === 'top'
+      ? ecTopPage
+      : renderedPage('https://example.test/tokushoho/', 'Example Seller', {
+          operatorIdentityRole: pageRole, pageRole,
+          operatorIdentityEvidence: [{ label: '販売業者', value: 'Example Seller', sourceScope: 'content' }]
+        });
     observed = await runtime({
       siteMode: 'ec',
       candidates: [{ url: 'https://example.test/tokushoho/', label: '販売業者' }],
-      pages: [renderedPage('https://example.test/tokushoho/', 'Example Seller', {
-        operatorIdentityRole: pageRole, pageRole,
-        operatorIdentityEvidence: [{ label: '販売業者', value: 'Example Seller', sourceScope: 'content' }]
-      })]
+      pages: [page]
     });
     assert.equal(observed.signalState, 'true');
     assert.equal(observed.evidence[0].role, 'commercial_law');
@@ -209,10 +215,7 @@ async function runRolePropagationFixtures() {
     observed = await runtime({
       siteMode,
       candidates: [{ url: 'https://example.test/company/', label: '会社概要' }],
-      pages: [renderedPage('https://example.test/company/', 'Example Corporation', {
-        operatorIdentityRole: 'top', pageRole: 'top',
-        operatorIdentityEvidence: [{ label: '会社名', value: 'Example Corporation', sourceScope: 'content' }]
-      })]
+      pages: [topPage]
     });
     assert.equal(observed.signalState, 'true');
     assert.equal(observed.evidence[0].role, 'about');

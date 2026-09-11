@@ -4549,6 +4549,14 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
       // payload below emits no operator name, address, telephone, or raw text.
       const operatorIdentityEvidence = [];
       const operatorLabel = /(?:会社名|法人名|事業者名|販売業者|運営(?:会社|者)|代表者|名称|商号|company|corporate|operator|seller|publisher|editor)/i;
+      const isAggregateOperatorValueContainer = node => {
+        if (!node || !node.querySelectorAll) return false;
+        const headings = Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6')).filter(isVisible);
+        const valueBlocks = Array.from(node.querySelectorAll('p,li,dt,dd')).filter(isVisible);
+        const operatorHeadings = headings.filter(heading => operatorLabel.test(clean(heading.textContent)));
+        return headings.length >= 2 || operatorHeadings.length >= 2 ||
+          (headings.length >= 1 && valueBlocks.length >= 3);
+      };
       const addOperatorEvidence = (label, value, el) => {
         const cleanLabel = clean(label).slice(0, 80);
         const cleanValue = clean(value).slice(0, 160);
@@ -4573,6 +4581,7 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
       Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 80).forEach(heading => {
         const value = heading.nextElementSibling;
         if (!value || !/^(?:p|div|span|dd)$/i.test(String(value.tagName || ''))) return;
+        if (isAggregateOperatorValueContainer(value)) return;
         addOperatorEvidence(heading.textContent, value.textContent, value);
       });
       Array.from(document.querySelectorAll('[data-operator], [class*="operator" i], [class*="company" i], [class*="corporate" i], [class*="seller" i], [class*="publisher" i]')).slice(0, 40).forEach(block => {
@@ -9636,6 +9645,14 @@ async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
         return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
       };
       const labelRx = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|company|corporate|operator|seller|merchant|publisher)/i;
+      const isAggregateOperatorValueContainer = node => {
+        if (!node || !node.querySelectorAll) return false;
+        const headings = Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6')).filter(visible);
+        const valueBlocks = Array.from(node.querySelectorAll('p,li,dt,dd')).filter(visible);
+        const operatorHeadings = headings.filter(heading => labelRx.test(clean(heading.textContent)));
+        return headings.length >= 2 || operatorHeadings.length >= 2 ||
+          (headings.length >= 1 && valueBlocks.length >= 3);
+      };
       const out = [];
       const add = (label, value, el) => {
         label = clean(label).slice(0, 80); value = clean(value).slice(0, 160);
@@ -9654,6 +9671,7 @@ async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
       Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 80).forEach(heading => {
         const value = heading.nextElementSibling;
         if (!value || !/^(?:p|div|span|dd)$/i.test(String(value.tagName || ''))) return;
+        if (isAggregateOperatorValueContainer(value)) return;
         add(heading.textContent, value.textContent, value);
       });
       Array.from(document.querySelectorAll('p,div,li')).slice(0, 300).forEach(block => {
