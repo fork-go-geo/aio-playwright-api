@@ -4352,6 +4352,91 @@ async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
   return { pages };
 }
 
+async function waitForScopedOperatorEvidenceDomReadiness_(page, opts = {}) {
+  if (!page || typeof page.waitForFunction !== 'function') return { ready: false, timedOut: false };
+  const requestedTimeoutMs = Number(opts.timeoutMs);
+  // A caller with less than the useful minimum remaining budget must not turn
+  // this recall-only wait into a hidden deadline overrun.
+  if (Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs < 100) {
+    return { ready: false, timedOut: false };
+  }
+  const timeoutMs = Math.max(100, Math.min(900, Number.isFinite(requestedTimeoutMs) ? requestedTimeoutMs : 900));
+  try {
+    await page.waitForFunction(() => {
+      const body = document.body;
+      if (!body || document.readyState === 'loading') return false;
+      const meaningfulChildren = Array.from(body.children || []).some(el => {
+        const tag = String(el && el.tagName || '').toLowerCase();
+        return !['script', 'style', 'noscript', 'template'].includes(tag);
+      });
+      const core = document.querySelector('main,article,[role="main"],h1,h2,h3,h4,h5,h6,table,dl,footer,[role="contentinfo"]');
+      return meaningfulChildren && !!core;
+    }, { timeout: timeoutMs, polling: 50 });
+    return { ready: true, timedOut: false };
+  } catch (_) {
+    // Readiness is recall-only. A timeout intentionally does not alter
+    // fetch/discovery completeness or create a new FALSE path.
+    return { ready: false, timedOut: true };
+  }
+}
+
+async function extractOperatorIdentityEvidenceFromRenderedPage_(page) {
+  if (!page || typeof page.evaluate !== 'function') return { evidence: [], baseScopeComplete: false };
+  try {
+    return await page.evaluate(() => {
+      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        if (!el || el.getAttribute('aria-hidden') === 'true' || el.closest('[aria-hidden="true"],script,style,noscript')) return false;
+        const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+      };
+      const labelRx = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|company|corporate|operator|seller|merchant|publisher|editor)/i;
+      const isAggregateOperatorValueContainer = node => {
+        if (!node || !node.querySelectorAll) return false;
+        const headings = Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6')).filter(visible);
+        const valueBlocks = Array.from(node.querySelectorAll('p,li,dt,dd')).filter(visible);
+        const operatorHeadings = headings.filter(heading => labelRx.test(clean(heading.textContent)));
+        return headings.length >= 2 || operatorHeadings.length >= 2 || (headings.length >= 1 && valueBlocks.length >= 3);
+      };
+      const out = [];
+      const add = (label, value, el) => {
+        label = clean(label).slice(0, 80); value = clean(value).slice(0, 160);
+        if (!label || !value || !labelRx.test(label) || !visible(el) || out.length >= 6) return;
+        if (/^(?:こちら|詳細はこちら|お問い合わせ|https?:\/\/|\d[\d\-() ]{5,}|〒?\d{3}-?\d{4})$/i.test(value) || value === label) return;
+        if (!out.some(item => item.label === label && item.value === value)) out.push({ label, value, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
+      };
+      Array.from(document.querySelectorAll('table tr')).slice(0, 120).forEach(row => {
+        const cells = Array.from(row.querySelectorAll('th,td'));
+        if (cells.length > 1) add(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row);
+      });
+      Array.from(document.querySelectorAll('dl dt')).slice(0, 80).forEach(dt => {
+        const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName).toLowerCase() === 'dd' ? dt.nextElementSibling : null;
+        if (dd) add(dt.textContent, dd.textContent, dt);
+      });
+      Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 80).forEach(heading => {
+        const value = heading.nextElementSibling;
+        if (!value || !/^(?:p|div|span|dd)$/i.test(String(value.tagName || '')) || isAggregateOperatorValueContainer(value)) return;
+        add(heading.textContent, value.textContent, value);
+      });
+      Array.from(document.querySelectorAll('p,div,li')).slice(0, 300).forEach(block => {
+        if (!visible(block) || block.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,table,dl').length > 1) return;
+        const strong = block.querySelector('strong,b');
+        if (strong) add(strong.textContent, clean(String(block.innerText || block.textContent || '').replace(String(strong.innerText || strong.textContent || ''), '')), block);
+        const lines = String(block.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+        if (lines.length >= 2) add(lines[0], lines.slice(1).join(' '), block);
+        const pair = clean(block.innerText || block.textContent).match(/^([^:：]{1,80})\s*[:：]\s*(.{1,160})$/);
+        if (pair) add(pair[1], pair[2], block);
+      });
+      return {
+        evidence: out,
+        baseScopeComplete: !!document.body && !!document.querySelector('header') && !!document.querySelector('nav,[role="navigation"]') && !!document.querySelector('footer,[role="contentinfo"]')
+      };
+    });
+  } catch (_) {
+    return { evidence: [], baseScopeComplete: false };
+  }
+}
+
 async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
   const context = opts && opts.context;
   const debugHeavySite = opts && opts.debugHeavySite === true;
@@ -4481,6 +4566,14 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
     }
     const status = response && typeof response.status === 'function' ? response.status() : null;
     const finalUrl = typeof page.url === 'function' ? page.url() || url : url;
+    // `commit` intentionally keeps navigation cheap, but a SPA can still have
+    // an empty body at that instant. Wait only for a small, meaningful DOM
+    // admission before extracting operator evidence from this same page.
+    await waitForScopedOperatorEvidenceDomReadiness_(page, {
+      timeoutMs: Number.isFinite(Number(opts.operatorEvidenceReadyTimeoutMs))
+        ? Number(opts.operatorEvidenceReadyTimeoutMs)
+        : 900
+    });
     const extractStartedAt = Date.now();
     emitScopedAudit('scoped_extract_start', { targetUrl: url, finalUrl, status });
     emitScopedExtractionAudit('extract_start', { finalUrl, status });
@@ -4849,7 +4942,7 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
         externalLinkCount,
         bodyTextLength: scopedText.length,
         sampledText: scopedText.slice(0, 500),
-        operatorIdentityEvidence,
+        operatorIdentityEvidence: [],
         scopedAudit: {
           domProbe: {
             titleLength: clean(document.title).length,
@@ -4945,6 +5038,7 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
       error: String(e && (e.message || e) || 'playwright_scoped_light_extract_failed').slice(0, 240),
       scopedAudit: null
     }));
+    const operatorEvidence = await extractOperatorIdentityEvidenceFromRenderedPage_(page);
     const scopedAudit = observed && observed.scopedAudit || {};
     emitScopedExtractionAudit('dom_probe', Object.assign({ finalUrl }, scopedAudit.domProbe || {}));
     emitScopedExtractionAudit('text_probe', Object.assign({ finalUrl }, scopedAudit.textProbe || {}));
@@ -5022,6 +5116,9 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
       externalLinkCount: Number(observed.externalLinkCount || 0),
       bodyTextLength: Number(observed.bodyTextLength || 0),
       sampledText: normalizeSubpageJsonLdText(observed.sampledText).slice(0, 500),
+      operatorIdentityEvidence: Array.isArray(operatorEvidence && operatorEvidence.evidence)
+        ? operatorEvidence.evidence.slice(0, 6)
+        : [],
       scopedExtractionSource: 'playwright_scoped_light',
       scopedTextSource: scopedAudit.textProbe && scopedAudit.textProbe.selectedTextSource || '',
       scopedHeadingSource: scopedAudit.headingProbe && scopedAudit.headingProbe.selectedHeadingSource || '',
@@ -10038,7 +10135,12 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
     const page = await fetchSubpagePlaywrightScopedLight(candidate.url, {
       context: input.context,
       siteMode,
-      timeout: 8000
+      timeout: 8000,
+      // The readiness wait is bounded separately from navigation and only
+      // consumes time that coverage still owns after its response reserve.
+      operatorEvidenceReadyTimeoutMs: input.lightBudget
+        ? Math.min(900, Math.max(0, getLightBudgetRemainingMs_(input.lightBudget, LIGHT_RESPONSE_CLEANUP_RESERVE_MS)))
+        : 900
     });
     additionalFetchCount += 1;
     const sameOrigin = (() => {
@@ -10088,66 +10190,8 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
 
 async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
   if (!page || typeof page.evaluate !== 'function') return null;
-  try {
-    const evidence = await page.evaluate(() => {
-      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-      const visible = el => {
-        if (!el || el.getAttribute('aria-hidden') === 'true' || el.closest('[aria-hidden="true"]')) return false;
-        const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
-      };
-      const labelRx = /(?:会社名|法人名|事業者名|販売業者|販売事業者|運営(?:会社|者)|サービス提供者|発行元|運営元|company|corporate|operator|seller|merchant|publisher)/i;
-      const isAggregateOperatorValueContainer = node => {
-        if (!node || !node.querySelectorAll) return false;
-        const headings = Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6')).filter(visible);
-        const valueBlocks = Array.from(node.querySelectorAll('p,li,dt,dd')).filter(visible);
-        const operatorHeadings = headings.filter(heading => labelRx.test(clean(heading.textContent)));
-        return headings.length >= 2 || operatorHeadings.length >= 2 ||
-          (headings.length >= 1 && valueBlocks.length >= 3);
-      };
-      const out = [];
-      const add = (label, value, el) => {
-        label = clean(label).slice(0, 80); value = clean(value).slice(0, 160);
-        if (!label || !value || !labelRx.test(label) || !visible(el) || out.length >= 6) return;
-        if (/^(?:こちら|詳細はこちら|お問い合わせ|https?:\/\/|\d[\d\-() ]{5,}|〒?\d{3}-?\d{4})$/i.test(value) || value === label) return;
-        if (!out.some(item => item.label === label && item.value === value)) out.push({ label, value, sourceScope: el.closest('footer,[role="contentinfo"]') ? 'footer' : 'content' });
-      };
-      Array.from(document.querySelectorAll('table tr')).slice(0, 100).forEach(row => {
-        const cells = Array.from(row.querySelectorAll('th,td'));
-        if (cells.length > 1) add(cells[0].textContent, cells.slice(1).map(cell => cell.textContent).join(' '), row);
-      });
-      Array.from(document.querySelectorAll('dl dt')).slice(0, 80).forEach(dt => {
-        const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName).toLowerCase() === 'dd' ? dt.nextElementSibling : null;
-        if (dd) add(dt.textContent, dd.textContent, dt);
-      });
-      Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 80).forEach(heading => {
-        const value = heading.nextElementSibling;
-        if (!value || !/^(?:p|div|span|dd)$/i.test(String(value.tagName || ''))) return;
-        if (isAggregateOperatorValueContainer(value)) return;
-        add(heading.textContent, value.textContent, value);
-      });
-      Array.from(document.querySelectorAll('p,div,li')).slice(0, 300).forEach(block => {
-        if (!visible(block)) return;
-        if (block.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,table,dl').length > 1) return;
-        const strong = block.querySelector('strong,b');
-        if (strong) {
-          const value = clean(String(block.innerText || block.textContent || '').replace(String(strong.innerText || strong.textContent || ''), ''));
-          add(strong.textContent, value, block);
-        }
-        const lines = String(block.innerText || '').split(/\n+/).map(clean).filter(Boolean);
-        if (lines.length >= 2) add(lines[0], lines.slice(1).join(' '), block);
-        const pair = clean(block.innerText || block.textContent).match(/^([^:：]{1,80})\s*[:：]\s*(.{1,160})$/);
-        if (pair) add(pair[1], pair[2], block);
-      });
-      return {
-        evidence: out,
-        baseScopeComplete: !!document.body && !!document.querySelector('header') && !!document.querySelector('nav,[role="navigation"]') && !!document.querySelector('footer,[role="contentinfo"]')
-      };
-    });
-    return { url, finalUrl: url, ok: true, observationMethod: 'playwright_scoped_light', operatorIdentityRole: 'top', operatorIdentityEvidence: evidence && evidence.evidence || [], baseScopeComplete: evidence && evidence.baseScopeComplete === true };
-  } catch (_) {
-    return null;
-  }
+  const extracted = await extractOperatorIdentityEvidenceFromRenderedPage_(page);
+  return { url, finalUrl: url, ok: true, observationMethod: 'playwright_scoped_light', operatorIdentityRole: 'top', operatorIdentityEvidence: extracted.evidence || [], baseScopeComplete: extracted.baseScopeComplete === true };
 }
 
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
@@ -10579,6 +10623,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           siteMode,
           timeout: scopedTimeoutMs,
           context: opts && opts.context,
+          operatorEvidenceReadyTimeoutMs: lightBudget
+            ? Math.min(900, Math.max(0, getLightBudgetRemainingMs_(lightBudget, LIGHT_RESPONSE_CLEANUP_RESERVE_MS)))
+            : 900,
           debugHeavySite: opts && opts.debugHeavySite === true
         }));
       }
@@ -10879,6 +10926,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       operatorCandidatePlan: discovered.operatorCandidatePlan,
       pages: topOperatorIdentityPage ? observed.pages.concat([topOperatorIdentityPage]) : observed.pages,
       context: opts && opts.context,
+      lightBudget,
       origin: normalized.origin,
       baseScopeComplete: !!(topOperatorIdentityPage && topOperatorIdentityPage.baseScopeComplete === true),
       // Sitemap absence is non-fatal when the normal nav/footer discovery
@@ -25540,15 +25588,18 @@ module.exports.__lightBudgetTestHooks = {
   LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
-   buildOperatorIdentityObservationV1_,
-   buildRuntimeOperatorIdentityObservationV1_,
-   collectTopOperatorIdentityRenderedEvidence_,
-   normalizeOperatorIdentitySiteMode_,
-   normalizeOperatorIdentityToken_,
-   operatorIdentityEvidenceRole_,
-   operatorIdentityRoleForCandidate_,
-   buildOperatorIdentityCandidatePlan_,
-   getOperatorIdentityAdditionalFetchCap_,
+  buildOperatorIdentityObservationV1_,
+  buildRuntimeOperatorIdentityObservationV1_,
+  collectTopOperatorIdentityRenderedEvidence_,
+  extractOperatorIdentityEvidenceFromRenderedPage_,
+  waitForScopedOperatorEvidenceDomReadiness_,
+  fetchSubpagePlaywrightScopedLight,
+  normalizeOperatorIdentitySiteMode_,
+  normalizeOperatorIdentityToken_,
+  operatorIdentityEvidenceRole_,
+  operatorIdentityRoleForCandidate_,
+  buildOperatorIdentityCandidatePlan_,
+  getOperatorIdentityAdditionalFetchCap_,
   isEcProductDetailCandidate_,
   extractSubpageProductPriceSignal_,
   extractSubpageProductDescriptionSignal_,
