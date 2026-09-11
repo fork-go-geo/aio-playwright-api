@@ -3255,7 +3255,12 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
     : (candidate && candidate.source ? [String(candidate.source)] : []);
   const companyPath = /\/(?:about(?:us)?|company|corporate|profile|outline|company-info|overview)(?:\/|$|-|_)/i.test(path);
   const companyLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介/.test(label);
-  const corroborated = sources.length >= 2 && sources.some(source => source === 'sitemap') && sources.some(source => source === 'nav' || source === 'footer' || source === 'htmlSitemap');
+  // XML and HTML sitemaps are both discovery corroboration.  An HTML
+  // sitemap alone is not enough: it must be independently linked from a
+  // human-facing navigation surface as well.
+  const hasSitemapCorroboration = sources.some(source => source === 'sitemap' || source === 'htmlSitemap');
+  const hasHumanNavigationCorroboration = sources.some(source => source === 'nav' || source === 'footer');
+  const corroborated = sources.length >= 2 && hasSitemapCorroboration && hasHumanNavigationCorroboration;
   return companyPath && companyLabel && corroborated;
 }
 
@@ -3316,7 +3321,9 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       if (/事業者名/.test(text)) return '事業者名';
       if (/販売業者/.test(text)) return '販売業者';
       if (/運営会社/.test(text)) return '運営会社';
+      if (/^商号$/i.test(text)) return '商号';
       if (/本社所在地/.test(text)) return '本社所在地';
+      if (/^本社事務所$/i.test(text)) return '本社事務所';
       if (/所在地/.test(text)) return '所在地';
       if (/住所/.test(text)) return '住所';
       if (/お客様相談室/.test(text)) return 'お客様相談室';
@@ -3332,15 +3339,15 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return '';
     };
     const operatorStopRe = /運営統括責任者|責任者|本社所在地|所在地|住所|連絡先|電話番号|お客様相談室|販売価格|商品代金|送料|支払方法/;
-    const addressStopRe = /連絡先|電話番号|お客様相談室|販売価格|商品代金|送料|支払方法|返品|交換|キャンセル|引渡|配送/;
+    const addressStopRe = /(?:[（(]\s*)?登記上(?:の)?住所|連絡先|電話番号|電話|TEL|お客様相談室|販売価格|商品代金|送料|支払方法|返品|交換|キャンセル|引渡|配送/;
     const genericStopRe = /事業者名|販売業者|運営会社|会社名|本社所在地|所在地|住所|連絡先|電話番号|お客様相談室|販売価格|商品代金|送料|支払方法/;
     const cutAt = (value, stopRe) => normalizeSubpageJsonLdText(value).split(stopRe)[0] || '';
     const stripLeadingLabel = (value, kind) => {
       const text = normalizeSubpageJsonLdText(value);
       const labelRe = kind === 'operator'
-        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名)\s*[：:：]?\s*/
+        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|商号)\s*[：:：]?\s*/
         : (kind === 'address'
-            ? /^(?:本社所在地|所在地|住所)\s*[：:：]?\s*/
+            ? /^(?:本社所在地|本社事務所|所在地|住所)\s*[：:：]?\s*/
             : /^(?:連絡先|電話番号|電話|TEL|Tel|お客様相談室)\s*[：:：]?\s*/);
       return normalizeSubpageJsonLdText(text.replace(labelRe, ''));
     };
@@ -3356,23 +3363,31 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return match ? match[0] : '';
     };
     const extractJapaneseAddress = value => {
-      const text = cutAt(stripLeadingLabel(value, 'address'), addressStopRe);
+      const text = cutAt(stripLeadingLabel(value, 'address'), addressStopRe).replace(/\s*\|\|\s*/g, ' ');
       const match = text.match(/〒?\s?\d{3}[-‐‑‒–—]?\d{4}\s*(?:北海道|東京都|(?:京都|大阪)府|..県).{0,80}/);
       return normalizeSubpageJsonLdText(match ? match[0] : text).slice(0, 160);
     };
     const cleanOperatorName = value => {
-      const text = cutAt(stripLeadingLabel(value, 'operator'), operatorStopRe);
+      const text = cutAt(stripLeadingLabel(value, 'operator'), operatorStopRe).split('||')[0] || '';
       return normalizeSubpageJsonLdText(text).slice(0, 80);
     };
 
     const rows = [];
+    const structuredCellText = cell => {
+      const clone = $(cell).clone();
+      // Preserve a structured-cell line boundary so a legal Japanese company
+      // name can be separated from a following English rendering.  The
+      // marker is normalized away before an address is returned.
+      clone.find('br').replaceWith(' || ');
+      return normalizeSubpageJsonLdText(clone.text());
+    };
     $('tr').each((_, el) => {
-      const cells = $(el).find('th,td').map((__, cell) => normalizeSubpageJsonLdText($(cell).text())).get().filter(Boolean);
+      const cells = $(el).find('th,td').map((__, cell) => structuredCellText(cell)).get().filter(Boolean);
       if (cells.length >= 2) rows.push({ label: cells[0], value: cells.slice(1).join(' ') });
     });
     $('dt').each((_, el) => {
-      const label = normalizeSubpageJsonLdText($(el).text());
-      const value = normalizeSubpageJsonLdText($(el).next('dd').text());
+      const label = structuredCellText(el);
+      const value = structuredCellText($(el).next('dd'));
       if (label && value) rows.push({ label, value });
     });
     const bodyClone = $('body').clone();
@@ -3405,9 +3420,26 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return { value: '', label: '' };
     };
 
-    const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名/i, 'operator');
-    const address = labelValueFromText(/所在地|住所|本社所在地/i, 'address');
-    const telephone = labelValueFromText(/電話番号|電話|TEL|Tel|連絡先|お客様相談室/i, 'telephone');
+    // A company profile occasionally keeps its explicitly-labelled phone in
+    // the value cell of an explicitly-labelled address row.  Treat that as a
+    // phone field only inside table/dl structure and only when the value has
+    // its own complete TEL/電話/電話番号 label; prose and bare number strings
+    // remain ineligible.
+    const telephoneFromStructuredAddressValue = () => {
+      for (const row of rows) {
+        const addressLabel = canonicalLabel(row.label, 'address');
+        if (!addressLabel || !/^(?:本社所在地|本社事務所|所在地|住所)$/.test(addressLabel)) continue;
+        const match = normalizeSubpageJsonLdText(row.value).match(/(?:^|\s)(TEL|電話番号|電話)\s*[：:：]\s*([^\s]+)/i);
+        const telephone = match ? extractJapanesePhone(match[2]) : '';
+        if (telephone) return { value: telephone, label: /^tel$/i.test(match[1]) ? 'TEL' : match[1] };
+      }
+      return { value: '', label: '' };
+    };
+
+    const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|商号/i, 'operator');
+    const address = labelValueFromText(/本社所在地|本社事務所|所在地|住所/i, 'address');
+    const directTelephone = labelValueFromText(/電話番号|電話|TEL|Tel|連絡先|お客様相談室/i, 'telephone');
+    const telephone = directTelephone.value ? directTelephone : telephoneFromStructuredAddressValue();
 
     const out = Object.assign({}, empty, {
       operatorName: operator.value ? cleanOperatorName(operator.value) : '',
@@ -9380,10 +9412,22 @@ function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
   // classified conservatively, as asuzac-space.jp is; other modes stay out.
   const mode = String(siteMode || '').toLowerCase();
   if (mode !== 'corporate' && mode !== 'generic') return null;
+  const profilePathSpecificity = candidate => {
+    const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
+    const path = (() => {
+      try { return new URL(url).pathname.toLowerCase(); } catch (_) { return url.toLowerCase(); }
+    })();
+    // Prefer a nested profile-like page to a top-level company landing page.
+    // Both still need the high-confidence predicate above; this is only a
+    // deterministic tie-breaker for the single permitted probe.
+    if (/\/(?:about(?:us)?|company|corporate)(?:\/(?:profile|overview|outline|summary|company-info))(?:\/|$|-|_)/i.test(path)) return 2;
+    if (/\/(?:profile|overview|outline|company-info)(?:\/|$|-|_)/i.test(path)) return 1;
+    return 0;
+  };
   return (Array.isArray(candidates) ? candidates : [])
     .filter(isHighConfidenceCompanyProfileCandidate_)
     .slice()
-    .sort((a, b) => Number(b && b.score || 0) - Number(a && a.score || 0))
+    .sort((a, b) => (profilePathSpecificity(b) - profilePathSpecificity(a)) || (Number(b && b.score || 0) - Number(a && a.score || 0)))
     [0] || null;
 }
 
