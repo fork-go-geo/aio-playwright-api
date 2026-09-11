@@ -5744,9 +5744,17 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
   const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
+  // Operator identity has a narrower, bounded observation budget than general
+  // coverage. Preserve its required role representatives before exposing the
+  // normal global candidate slice; the slice itself remains unchanged.
+  const operatorCandidatePlan = buildOperatorIdentityCandidatePlan_(allCandidates, {
+    siteMode: opts && opts.siteMode || 'generic',
+    generalCandidates: allCandidates.slice(0, normalizedLimit)
+  });
   emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates);
   return {
     candidates: allCandidates.slice(0, normalizedLimit),
+    operatorCandidatePlan,
     roleRepresentativeCandidates,
     totalCandidates: allCandidates.length,
     sourceSummary,
@@ -9371,6 +9379,9 @@ function operatorIdentityRoleForCandidate_(candidate) {
     .map(value => String(value || '').toLowerCase()).join(' ');
   if (/(?:tokushoho|tokushouhou|commercial[-_ ]?law|specified[-_ ]?commercial|legal[-_ ]?notice|特定商取引|特商法|販売(?:業者|事業者))/i.test(text)) return 'commercial_law';
   if (/(?:publisher|editorial|operator|運営(?:会社|元|者)|発行元|編集部|媒体運営)/i.test(text)) return 'publisher';
+  // Keep operator legal classification aligned with the established coverage
+  // taxonomy. These remain one legal scope, not additional fetch roles.
+  if (/(?:terms?|privacy|policy|agreement|利用規約|規約|プライバシー|個人情報|法務)/i.test(text)) return 'legal';
   if (isLegalOperatorCandidatePath_(text) || isLegalOperatorCandidateText_(text)) return 'legal';
   if (/(?:about|company|corporate|profile|outline|about-us|会社概要|企業情報|運営会社)/i.test(text)) return 'about';
   if (/(?:editorial|publisher|編集|発行者|運営者)/i.test(text)) return 'publisher';
@@ -9386,6 +9397,90 @@ function getOperatorIdentityRequiredRoles_(siteMode) {
 
 function getOperatorIdentityAdditionalFetchCap_(siteMode) {
   return ({ corp: 2, saas: 2, ec: 3, media: 2, shop_facility: 0 })[siteMode] || 0;
+}
+
+function getOperatorIdentityCandidateSourcePriority_(candidate) {
+  const source = String(candidate && candidate.source || '');
+  return ({ nav: 5, footer: 4, htmlSitemap: 3, ecGeneralLink: 2, sitemap: 1 })[source] || 0;
+}
+
+function getOperatorIdentityReservationRank_(candidate, requiredRole) {
+  const raw = [candidate && candidate.url, candidate && candidate.path, candidate && candidate.label, candidate && candidate.reason, candidate && candidate.title]
+    .map(value => String(value || '')).join(' ');
+  const lower = raw.toLowerCase();
+  const path = (() => {
+    try { return new URL(String(candidate && candidate.url || '')).pathname.toLowerCase(); } catch (_) { return lower; }
+  })();
+  let rank = 0;
+  if (requiredRole === 'commercial_law') {
+    if (operatorIdentityRoleForCandidate_(candidate) === 'commercial_law') rank += 1000;
+    if (/(?:tokushoho|tokushouhou|commercial[-_ ]?law|specified[-_ ]?commercial|特定商取引|特商法|販売(?:業者|事業者))/i.test(raw)) rank += 300;
+  } else if (requiredRole === 'legal') {
+    if (operatorIdentityRoleForCandidate_(candidate) === 'legal') rank += 800;
+    if (/(?:\/(?:legal|terms?|privacy|policy|law)(?:\/|$|-|_)|利用規約|規約|プライバシー|個人情報|法務)/i.test(raw)) rank += 250;
+    if (getOperatorIdentityCandidateSourcePriority_(candidate) >= 4) rank += 60;
+  } else if (requiredRole === 'about') {
+    if (/^\/(?:company|about|corporate)\/?$/i.test(path)) rank += 400;
+    else if (/(?:\/(?:company|about|corporate)\/(?:overview|profile)\/?$|会社概要|企業情報|corporate\s+profile)/i.test(raw)) rank += 300;
+    else if (operatorIdentityRoleForCandidate_(candidate) === 'about') rank += 100;
+  } else if (requiredRole === 'publisher') {
+    if (operatorIdentityRoleForCandidate_(candidate) === 'publisher') rank += 500;
+    else if (operatorIdentityRoleForCandidate_(candidate) === 'about') rank += 250;
+    if (/(?:運営(?:会社|元|者)|発行元|媒体概要|publisher|editorial|operator)/i.test(raw)) rank += 200;
+  }
+  // Existing candidate score stays a late tie-breaker; it cannot erase
+  // role-family relevance when many important paths saturate at score 100.
+  rank += Math.max(0, Math.min(100, Number(candidate && candidate.score || 0))) / 100;
+  rank += getOperatorIdentityCandidateSourcePriority_(candidate) / 1000;
+  rank -= Math.min(0.09, Math.max(0, path.split('/').filter(Boolean).length - 1) / 100);
+  return rank;
+}
+
+function operatorIdentityCandidateMatchesRequiredRole_(candidate, requiredRole) {
+  const role = operatorIdentityRoleForCandidate_(candidate);
+  if (role === requiredRole) return true;
+  if (requiredRole === 'legal' && role === 'commercial_law') return true;
+  if (requiredRole === 'publisher' && role === 'about') return true;
+  return false;
+}
+
+// Separate from roleRepresentativeCandidates, whose shape remains audit-only
+// coverage data. This classifies all candidates before the unchanged general
+// cap and reserves at most one URL per required operator scope.
+function buildOperatorIdentityCandidatePlan_(allCandidates, opts = {}) {
+  const siteMode = normalizeOperatorIdentitySiteMode_(opts && opts.siteMode);
+  const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
+  const maxFetch = getOperatorIdentityAdditionalFetchCap_(siteMode);
+  const all = Array.isArray(allCandidates) ? allCandidates.filter(item => item && item.url) : [];
+  const general = Array.isArray(opts && opts.generalCandidates) ? opts.generalCandidates.filter(item => item && item.url) : all;
+  const reservedByRole = {};
+  const reserved = [];
+  const reservedKeys = new Set();
+  requiredRoles.forEach(requiredRole => {
+    const best = all
+      .filter(candidate => operatorIdentityCandidateMatchesRequiredRole_(candidate, requiredRole))
+      .sort((a, b) => {
+        const rankDiff = getOperatorIdentityReservationRank_(b, requiredRole) - getOperatorIdentityReservationRank_(a, requiredRole);
+        if (rankDiff) return rankDiff;
+        return String(a.url || '').localeCompare(String(b.url || ''));
+      })[0];
+    if (!best) return;
+    reservedByRole[requiredRole] = best;
+    const key = discoverSubpageCandidateKey(best.url);
+    if (key && !reservedKeys.has(key) && reserved.length < maxFetch) {
+      reservedKeys.add(key);
+      reserved.push(best);
+    }
+  });
+  const candidates = reserved.slice();
+  const seen = new Set(reservedKeys);
+  general.forEach(candidate => {
+    const key = discoverSubpageCandidateKey(candidate.url);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push(candidate);
+  });
+  return { candidates, reservedCandidates: reserved, reservedByRole };
 }
 
 function normalizeOperatorIdentityToken_(value, label) {
@@ -9539,7 +9634,9 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
   const siteMode = normalizeOperatorIdentitySiteMode_(input.siteMode);
   const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
   const cap = getOperatorIdentityAdditionalFetchCap_(siteMode);
-  const candidates = Array.isArray(input.candidates) ? input.candidates : [];
+  const candidates = Array.isArray(input.operatorCandidatePlan && input.operatorCandidatePlan.candidates)
+    ? input.operatorCandidatePlan.candidates
+    : (Array.isArray(input.candidates) ? input.candidates : []);
   const limitations = Array.isArray(input.limitations) ? input.limitations.slice() : [];
   const failures = [];
   const selectedByRole = new Map();
@@ -10424,6 +10521,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     geoSignalsV1.operatorIdentityObservationV1 = await buildRuntimeOperatorIdentityObservationV1_({
       siteMode,
       candidates: discovered.candidates,
+      operatorCandidatePlan: discovered.operatorCandidatePlan,
       pages: topOperatorIdentityPage ? observed.pages.concat([topOperatorIdentityPage]) : observed.pages,
       context: opts && opts.context,
       origin: normalized.origin,
@@ -24488,6 +24586,7 @@ module.exports.__lightBudgetTestHooks = {
   normalizeOperatorIdentityToken_,
   operatorIdentityEvidenceRole_,
   operatorIdentityRoleForCandidate_,
+  buildOperatorIdentityCandidatePlan_,
   getOperatorIdentityAdditionalFetchCap_,
   isEcProductDetailCandidate_,
   extractSubpageProductPriceSignal_,
