@@ -3851,12 +3851,41 @@ function extractArticleVisibleDateCandidatesFromCheerio_($) {
 
 // Recognizes a conservative, visible breadcrumb list. This is deliberately not
 // a claim that the list exposes a standards-complete RDFa or Microdata
-// BreadcrumbList. A breadcrumb-like container, a root/home link, and a final
-// non-link text item are required together. aria-current/current-item and RDFa
-// remain reinforcing signals, but are not mandatory: established sites often
-// render the current page as a plain <span>. Header/footer/global-nav lists are
-// excluded to avoid treating ordinary navigation as a breadcrumb.
-function detectBreadcrumbUiFromCheerio_($) {
+// BreadcrumbList. A breadcrumb-like container and a root/home link are always
+// required. The terminal item must be either visible non-link text or a link
+// that resolves to the page currently being observed. aria-current/current-item
+// and RDFa remain reinforcing signals, but are not mandatory: established sites
+// use both plain <span> and self-linked terminal labels. Header/footer/global-nav
+// lists are excluded to avoid treating ordinary navigation as a breadcrumb.
+function normalizeBreadcrumbPageUrl_(rawUrl, baseUrl) {
+  try {
+    const url = new URL(String(rawUrl || ''), String(baseUrl || ''));
+    if (!/^https?:$/.test(url.protocol)) return '';
+    url.hash = '';
+    url.search = '';
+    let pathname = url.pathname || '/';
+    pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+    if (pathname.length > 1) pathname = pathname.replace(/\/+$/, '');
+    return `${url.protocol}//${url.host}${pathname || '/'}`;
+  } catch (_) {
+    return '';
+  }
+}
+
+function isBreadcrumbRootLink_(rawUrl, baseUrl) {
+  try {
+    const target = new URL(String(rawUrl || ''), String(baseUrl || ''));
+    const base = new URL(String(baseUrl || ''));
+    if (target.origin !== base.origin) return false;
+    let pathname = target.pathname || '/';
+    pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+    return pathname === '/';
+  } catch (_) {
+    return false;
+  }
+}
+
+function detectBreadcrumbUiFromCheerio_($, currentUrl) {
   const compact = value => normalizeSubpageJsonLdText(value || '');
   const breadcrumbLike = element => {
     const $element = $(element);
@@ -3890,9 +3919,14 @@ function detectBreadcrumbUiFromCheerio_($) {
     const items = $list.children('li').toArray();
     if (items.length < 2) return;
     const $last = $(items[items.length - 1]);
-    const finalIsNonLink = $last.find('a[href]').length === 0;
+    const finalLinks = $last.find('a[href]');
+    const finalIsNonLink = finalLinks.length === 0;
     const finalText = compact($last.text());
     const finalHasVisibleText = !!finalText;
+    const normalizedCurrentUrl = normalizeBreadcrumbPageUrl_(currentUrl, currentUrl);
+    const finalLinksToCurrentPage = !!normalizedCurrentUrl && finalLinks.toArray().some((link) =>
+      normalizeBreadcrumbPageUrl_($(link).attr('href'), currentUrl) === normalizedCurrentUrl
+    );
     const finalCurrent = $last.is('[aria-current="page"],.current,.current-item') ||
       $last.find('[aria-current="page"],.current,.current-item').length > 0;
     const microdataItems = $list.find('[property="itemListElement"][typeof~="ListItem"]').length;
@@ -3902,15 +3936,18 @@ function detectBreadcrumbUiFromCheerio_($) {
     const homeLink = first.find('a[href]').first();
     const homeCue = homeLink.length > 0 && (
       /(^|\s)(home|ホーム|トップ)(\s|$)/i.test(compact(homeLink.text())) ||
-      /(^|\s)home(\s|$)/i.test(String(homeLink.attr('class') || ''))
+      /(^|\s)home(\s|$)/i.test(String(homeLink.attr('class') || '')) ||
+      isBreadcrumbRootLink_(homeLink.attr('href'), currentUrl)
     );
     const $container = breadcrumbContainerFor($list);
     const hasBreadcrumbContainer = !!($container && $container.length);
     // Plain current-page text is safe only inside a breadcrumb-like container.
     // Legacy RDFa/current-marker shapes remain valid when that same container
     // is present, so Majisemi-style lists retain their existing detection.
-    const hasCurrentPageNode = finalIsNonLink && finalHasVisibleText &&
-      (finalCurrent || hasMicrodata || hasBreadcrumbContainer);
+    const hasCurrentPageNode = finalHasVisibleText && (
+      finalLinksToCurrentPage ||
+      (finalIsNonLink && (finalCurrent || hasMicrodata || hasBreadcrumbContainer))
+    );
     if (hasBreadcrumbContainer && homeCue && hasCurrentPageNode) {
       structural = $list;
     }
@@ -3954,7 +3991,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
   // Keep the subpage semantic-nav meaning aligned with the rendered top-page
   // detector. This reuses the HTML already fetched for light coverage.
   const hasNavElement = $('nav,[role="navigation"]').length > 0;
-  const breadcrumbDetection = detectBreadcrumbUiFromCheerio_($);
+  const breadcrumbDetection = detectBreadcrumbUiFromCheerio_($, finalUrl || url);
   const hasBreadcrumbUi = breadcrumbDetection.hasBreadcrumbUi;
   const bodyClone = $('body').first().clone();
   bodyClone.find('script,style,noscript,svg,nav,footer').remove();
@@ -4679,9 +4716,9 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
       // Keep this rendered Playwright observation aligned with the raw-HTML
       // and top-page DOM detectors. A breadcrumb-like container alone is not
       // enough: require an ordered/list hierarchy, a home/root first link,
-      // and a non-linked terminal current-page label. This supports compact
-      // BEM names such as `.l-bread` without treating ordinary navigation or
-      // footer lists as breadcrumbs.
+      // and a terminal current-page label (plain text or a self-link). This
+      // supports compact BEM names such as `.l-bread` without treating ordinary
+      // navigation or footer lists as breadcrumbs.
       const isBreadcrumbLike = (element) => {
         if (!element) return false;
         const tokens = clean([
@@ -4706,6 +4743,27 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
         const nav = list.closest('nav,[role="navigation"]');
         return !!nav && !isBreadcrumbLike(nav);
       };
+      const normalizedBreadcrumbUrl = (raw) => {
+        try {
+          const url = new URL(raw || '', document.baseURI || location.href);
+          if (!/^https?:$/.test(url.protocol)) return '';
+          url.hash = '';
+          url.search = '';
+          let pathname = url.pathname || '/';
+          pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+          if (pathname.length > 1) pathname = pathname.replace(/\/+$/, '');
+          return `${url.protocol}//${url.host}${pathname || '/'}`;
+        } catch (_) { return ''; }
+      };
+      const isBreadcrumbRootLink = (link) => {
+        try {
+          const base = new URL(document.baseURI || location.href);
+          const url = new URL(link.getAttribute('href') || '', base);
+          let pathname = url.pathname || '/';
+          pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+          return url.origin === base.origin && pathname === '/';
+        } catch (_) { return false; }
+      };
       let breadcrumbUiSource = 'not_observed';
       const hasBreadcrumbUi = Array.from(document.querySelectorAll('ol,ul')).some(list => {
         if (!isVisible(list) || isInExcludedBreadcrumbRegion(list)) return false;
@@ -4716,10 +4774,15 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
         const firstLink = items[0].querySelector('a[href]');
         const homeCue = !!firstLink && (
           /(^|\s)(home|ホーム|トップ)(\s|$)/i.test(clean(firstLink.innerText || firstLink.textContent || firstLink.getAttribute('aria-label') || firstLink.getAttribute('title'))) ||
-          /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || ''))
+          /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || '')) ||
+          isBreadcrumbRootLink(firstLink)
         );
         const last = items[items.length - 1];
-        const terminalCurrentPage = !last.querySelector('a[href]') && !!clean(last.innerText || last.textContent);
+        const finalLinks = Array.from(last.querySelectorAll('a[href]'));
+        const terminalCurrentPage = !!clean(last.innerText || last.textContent) && (
+          finalLinks.some(link => normalizedBreadcrumbUrl(link.getAttribute('href')) === normalizedBreadcrumbUrl(document.baseURI || location.href)) ||
+          (finalLinks.length === 0)
+        );
         if (!homeCue || !terminalCurrentPage) return false;
         breadcrumbUiSource = /breadcrumb|breadcrumbs|pankuzu|パンくず/.test(clean([container.className, container.id, container.getAttribute('aria-label')].join(' ')).toLowerCase())
           ? 'explicit_selector'
@@ -6264,6 +6327,27 @@ async function fetchSubpageJsonLdLightOnce_(url, opts = {}) {
         const nav = list.closest && list.closest('nav,[role="navigation"]');
         return !!nav && !isBreadcrumbLike(nav);
       };
+      const normalizedBreadcrumbUrl = (raw) => {
+        try {
+          const url = new URL(raw || '', document.baseURI || location.href);
+          if (!/^https?:$/.test(url.protocol)) return '';
+          url.hash = '';
+          url.search = '';
+          let pathname = url.pathname || '/';
+          pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+          if (pathname.length > 1) pathname = pathname.replace(/\/+$/, '');
+          return `${url.protocol}//${url.host}${pathname || '/'}`;
+        } catch (_) { return ''; }
+      };
+      const isBreadcrumbRootLink = (link) => {
+        try {
+          const base = new URL(document.baseURI || location.href);
+          const url = new URL(link.getAttribute('href') || '', base);
+          let pathname = url.pathname || '/';
+          pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+          return url.origin === base.origin && pathname === '/';
+        } catch (_) { return false; }
+      };
       let breadcrumbUiSource = 'not_observed';
       const hasBreadcrumbUi = queryAllDeep('ol,ul', { maxNodes: 200 }).some((list) => {
         if (isInExcludedBreadcrumbRegion(list)) return false;
@@ -6274,10 +6358,15 @@ async function fetchSubpageJsonLdLightOnce_(url, opts = {}) {
         const firstLink = items[0].querySelector && items[0].querySelector('a[href]');
         const homeCue = !!firstLink && (
           /(^|\s)(home|ホーム|トップ)(\s|$)/i.test(clean(firstLink.innerText || firstLink.textContent || firstLink.getAttribute('aria-label') || firstLink.getAttribute('title'))) ||
-          /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || ''))
+          /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || '')) ||
+          isBreadcrumbRootLink(firstLink)
         );
         const last = items[items.length - 1];
-        const terminalCurrentPage = !last.querySelector('a[href]') && !!clean(last.innerText || last.textContent);
+        const finalLinks = Array.from(last.querySelectorAll('a[href]'));
+        const terminalCurrentPage = !!clean(last.innerText || last.textContent) && (
+          finalLinks.some(link => normalizedBreadcrumbUrl(link.getAttribute('href')) === normalizedBreadcrumbUrl(document.baseURI || location.href)) ||
+          finalLinks.length === 0
+        );
         if (!homeCue || !terminalCurrentPage) return false;
         breadcrumbUiSource = /breadcrumb|breadcrumbs|pankuzu|パンくず/.test(clean([
           container.getAttribute && container.getAttribute('class'),
@@ -13667,6 +13756,27 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         const nav = list.closest('nav,[role="navigation"]');
         return !!nav && !isBreadcrumbLike(nav);
       };
+      const normalizedBreadcrumbUrl = (raw) => {
+        try {
+          const url = new URL(raw || '', document.baseURI || location.href);
+          if (!/^https?:$/.test(url.protocol)) return '';
+          url.hash = '';
+          url.search = '';
+          let pathname = url.pathname || '/';
+          pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+          if (pathname.length > 1) pathname = pathname.replace(/\/+$/, '');
+          return `${url.protocol}//${url.host}${pathname || '/'}`;
+        } catch (_) { return ''; }
+      };
+      const isBreadcrumbRootLink = (link) => {
+        try {
+          const base = new URL(document.baseURI || location.href);
+          const url = new URL(link.getAttribute('href') || '', base);
+          let pathname = url.pathname || '/';
+          pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+          return url.origin === base.origin && pathname === '/';
+        } catch (_) { return false; }
+      };
       const findStructuralBreadcrumbEl = () => {
         const lists = queryAllDeep('ol,ul', { maxNodes: 200 });
         for (const list of lists) {
@@ -13674,8 +13784,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           const items = Array.from(list.children || []).filter((el) => String(el.tagName || '').toLowerCase() === 'li');
           if (items.length < 2) continue;
           const last = items[items.length - 1];
-          const finalIsNonLink = !last.querySelector('a[href]');
+          const finalLinks = Array.from(last.querySelectorAll('a[href]'));
+          const finalIsNonLink = finalLinks.length === 0;
           const finalHasVisibleText = !!clean(last.innerText || last.textContent);
+          const finalLinksToCurrentPage = finalLinks.some((link) =>
+            normalizedBreadcrumbUrl(link.getAttribute('href')) === normalizedBreadcrumbUrl(document.baseURI || location.href)
+          );
           const finalCurrent = last.matches('[aria-current="page"],.current,.current-item') ||
             !!last.querySelector('[aria-current="page"],.current,.current-item');
           const microdataItems = list.querySelectorAll('[property="itemListElement"][typeof~="ListItem"]').length;
@@ -13684,11 +13798,14 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           const firstLink = items[0].querySelector('a[href]');
           const homeCue = !!firstLink && (
             /(^|\s)(home|ホーム|トップ)(\s|$)/i.test(clean(firstLink.innerText || firstLink.textContent || firstLink.getAttribute('aria-label') || firstLink.getAttribute('title'))) ||
-            /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || ''))
+            /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || '')) ||
+            isBreadcrumbRootLink(firstLink)
           );
           const hasBreadcrumbContainer = !!breadcrumbContainerFor(list);
-          const hasCurrentPageNode = finalIsNonLink && finalHasVisibleText &&
-            (finalCurrent || hasMicrodata || hasBreadcrumbContainer);
+          const hasCurrentPageNode = finalHasVisibleText && (
+            finalLinksToCurrentPage ||
+            (finalIsNonLink && (finalCurrent || hasMicrodata || hasBreadcrumbContainer))
+          );
           if (hasBreadcrumbContainer && homeCue && hasCurrentPageNode) return list;
         }
         return null;
@@ -18876,6 +18993,27 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           const nav = list.closest('nav,[role="navigation"]');
           return !!nav && !isBreadcrumbLike(nav);
         };
+        const normalizedBreadcrumbUrl = (raw) => {
+          try {
+            const url = new URL(raw || '', document.baseURI || location.href);
+            if (!/^https?:$/.test(url.protocol)) return '';
+            url.hash = '';
+            url.search = '';
+            let pathname = url.pathname || '/';
+            pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+            if (pathname.length > 1) pathname = pathname.replace(/\/+$/, '');
+            return `${url.protocol}//${url.host}${pathname || '/'}`;
+          } catch (_) { return ''; }
+        };
+        const isBreadcrumbRootLink = (link) => {
+          try {
+            const base = new URL(document.baseURI || location.href);
+            const url = new URL(link.getAttribute('href') || '', base);
+            let pathname = url.pathname || '/';
+            pathname = pathname.replace(/\/(?:index\.html?|default\.html?)$/i, '/');
+            return url.origin === base.origin && pathname === '/';
+          } catch (_) { return false; }
+        };
         const findStructuralBreadcrumbEl = () => {
           const lists = queryAllDeep('ol,ul', { maxNodes: 200 });
           for (const list of lists) {
@@ -18883,15 +19021,22 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             const items = Array.from(list.children || []).filter((el) => String(el.tagName || '').toLowerCase() === 'li');
             if (items.length < 2) continue;
             const last = items[items.length - 1];
-            const finalIsNonLink = !last.querySelector('a[href]');
+            const finalLinks = Array.from(last.querySelectorAll('a[href]'));
+            const finalIsNonLink = finalLinks.length === 0;
             const finalHasVisibleText = !!clean(last.innerText || last.textContent);
+            const finalLinksToCurrentPage = finalLinks.some((link) =>
+              normalizedBreadcrumbUrl(link.getAttribute('href')) === normalizedBreadcrumbUrl(document.baseURI || location.href)
+            );
             const finalCurrent = last.matches('[aria-current="page"],.current,.current-item') || !!last.querySelector('[aria-current="page"],.current,.current-item');
             const microdataItems = list.querySelectorAll('[property="itemListElement"][typeof~="ListItem"]').length;
             const hasMicrodata = microdataItems >= 2 && !!list.querySelector('[property="item"],[property="name"],meta[property="position"]');
             const firstLink = items[0].querySelector('a[href]');
-            const homeCue = !!firstLink && (/(^|\s)(home|ホーム|トップ)(\s|$)/i.test(clean(firstLink.innerText || firstLink.textContent || firstLink.getAttribute('aria-label') || firstLink.getAttribute('title'))) || /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || '')));
+            const homeCue = !!firstLink && (/(^|\s)(home|ホーム|トップ)(\s|$)/i.test(clean(firstLink.innerText || firstLink.textContent || firstLink.getAttribute('aria-label') || firstLink.getAttribute('title'))) || /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || '')) || isBreadcrumbRootLink(firstLink));
             const hasBreadcrumbContainer = !!breadcrumbContainerFor(list);
-            const hasCurrentPageNode = finalIsNonLink && finalHasVisibleText && (finalCurrent || hasMicrodata || hasBreadcrumbContainer);
+            const hasCurrentPageNode = finalHasVisibleText && (
+              finalLinksToCurrentPage ||
+              (finalIsNonLink && (finalCurrent || hasMicrodata || hasBreadcrumbContainer))
+            );
             if (hasBreadcrumbContainer && homeCue && hasCurrentPageNode) return list;
           }
           return null;

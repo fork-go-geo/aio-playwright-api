@@ -1,12 +1,13 @@
 const assert = require('assert');
 const { chromium } = require('playwright');
-const { buildGeoSignalsV1 } = require('../index.js').__lightBudgetTestHooks;
+const { buildGeoSignalsV1, parseSubpageJsonLdLightHtml } = require('../index.js').__lightBudgetTestHooks;
 
-async function observe(html, name) {
+async function observe(html, name, pathname = '/') {
   const page = await globalThis.__breadcrumbUiBrowser.newPage();
   try {
-    await page.setContent(html, { waitUntil: 'domcontentloaded' });
-    return await buildGeoSignalsV1(page, `https://${name}.example.test/`, {
+    const url = `https://${name}.example.test${pathname}`;
+    await page.setContent(`<base href="${url}">${html}`, { waitUntil: 'domcontentloaded' });
+    return await buildGeoSignalsV1(page, url, {
       balancedMode: false,
       shortFastMode: false
     });
@@ -44,6 +45,23 @@ function breadcrumb(signals) {
     `, 'koiwai-contact');
     assert.strictEqual(breadcrumb(koiwaiContact).hasBreadcrumbUi, true);
 
+    // C. A final anchor is a current-page label only when its resolved URL is
+    // the observed document itself. This reflects breadcrumb implementations
+    // that keep every item linked, including the last item.
+    const asuzacHtml = `
+      <ul class="breadcrumb"><li><a href="/">アスザック アルミ事業部</a></li>
+        <li><a href="summary.htm">事業部紹介</a></li>
+        <li><a href="summary.htm"><span>事業部概要</span></a></li></ul>
+    `;
+    const asuzac = await observe(asuzacHtml, 'asuzac-space', '/aboutus/summary.htm');
+    assert.strictEqual(breadcrumb(asuzac).hasBreadcrumbUi, true);
+    assert.strictEqual(breadcrumb(asuzac).breadcrumbUiSource, 'explicit_selector');
+    const asuzacRaw = parseSubpageJsonLdLightHtml(
+      'https://asuzac-space.example.test/aboutus/summary.htm',
+      'https://asuzac-space.example.test/aboutus/summary.htm', 200, asuzacHtml, 'corporate'
+    );
+    assert.strictEqual(asuzacRaw.hasBreadcrumbUi, true);
+
     // B. Majisemi-shaped structural list with a CSS-only separator.
     const structural = await observe(`
       <style>.bread li + li::before { content: '>'; }</style>
@@ -75,6 +93,12 @@ function breadcrumb(signals) {
     // F. Home plus ordinary links has no non-link marked current item.
     const homeLinks = await observe('<main><ul><li><a href="/" class="home">Home</a></li><li><a href="/news">News</a></li><li><a href="/about">About</a></li></ul></main>', 'home-links');
     assert.strictEqual(breadcrumb(homeLinks).hasBreadcrumbUi, false);
+
+    const wrongTerminalLink = await observe(
+      '<main><div class="breadcrumb"><ul><li><a href="/">Home</a></li><li><a href="/parent/">Parent</a></li></ul></div></main>',
+      'wrong-terminal', '/child/'
+    );
+    assert.strictEqual(breadcrumb(wrongTerminalLink).hasBreadcrumbUi, false);
 
     // G. A current-item class alone is insufficient without a separate cue.
     const currentOnly = await observe('<main><ul><li><a href="/section">Section</a></li><li class="current-item">Current</li></ul></main>', 'current-only');
