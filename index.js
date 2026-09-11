@@ -3324,6 +3324,10 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       if (/^商号$/i.test(text)) return '商号';
       if (/本社所在地/.test(text)) return '本社所在地';
       if (/^本社事務所$/i.test(text)) return '本社事務所';
+      // "本社" is a valid address field only as a complete table/dl label
+      // (with an optional, equally-specific parenthetical note).  Do not
+      // accept prose such as "本社へのアクセス" or "本社移転のお知らせ".
+      if (/^本社(?:\s*[（(](?:所在地|事務所)[）)])?$/i.test(text)) return '本社';
       if (/所在地/.test(text)) return '所在地';
       if (/住所/.test(text)) return '住所';
       if (/お客様相談室/.test(text)) return 'お客様相談室';
@@ -3333,7 +3337,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       // contains a telephone-related word.
       if (/^電話番号(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(text)) return '電話番号';
       if (/^電話$/i.test(text)) return '電話';
-      if (/^tel$/i.test(text)) return 'TEL';
+      if (/^tel(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(text)) return text;
       if (/^連絡先$/i.test(text)) return '連絡先';
       if (kind === 'operator' && /会社名/.test(text)) return '会社名';
       return '';
@@ -3347,7 +3351,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       const labelRe = kind === 'operator'
         ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|商号)\s*[：:：]?\s*/
         : (kind === 'address'
-            ? /^(?:本社所在地|本社事務所|所在地|住所)\s*[：:：]?\s*/
+            ? /^(?:本社所在地|本社事務所|本社|所在地|住所)\s*[：:：]?\s*/
             : /^(?:連絡先|電話番号|電話|TEL|Tel|お客様相談室)\s*[：:：]?\s*/);
       return normalizeSubpageJsonLdText(text.replace(labelRe, ''));
     };
@@ -3428,26 +3432,47 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     const telephoneFromStructuredAddressValue = () => {
       for (const row of rows) {
         const addressLabel = canonicalLabel(row.label, 'address');
-        if (!addressLabel || !/^(?:本社所在地|本社事務所|所在地|住所)$/.test(addressLabel)) continue;
-        const match = normalizeSubpageJsonLdText(row.value).match(/(?:^|\s)(TEL|電話番号|電話)\s*[：:：]\s*([^\s]+)/i);
+        if (!addressLabel || !/^(?:本社所在地|本社事務所|本社|所在地|住所)$/.test(addressLabel)) continue;
+        const match = normalizeSubpageJsonLdText(row.value).match(/(?:^|\s)((?:TEL\s*(?:[（(](?:代表|お問い合わせ|連絡先)[）)])?)|電話番号|電話)\s*[：:：]\s*([^\s]+)/i);
         const telephone = match ? extractJapanesePhone(match[2]) : '';
-        if (telephone) return { value: telephone, label: /^tel$/i.test(match[1]) ? 'TEL' : match[1] };
+        if (telephone) return { value: telephone, label: normalizeSubpageJsonLdText(match[1]) };
       }
       return { value: '', label: '' };
     };
 
     const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|商号/i, 'operator');
-    const address = labelValueFromText(/本社所在地|本社事務所|所在地|住所/i, 'address');
-    const directTelephone = labelValueFromText(/電話番号|電話|TEL|Tel|連絡先|お客様相談室/i, 'telephone');
+    const address = labelValueFromText(/本社所在地|本社事務所|本社|所在地|住所/i, 'address');
+    const directTelephone = labelValueFromText(/電話番号|電話|TEL(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?|Tel|連絡先|お客様相談室/i, 'telephone');
     const telephone = directTelephone.value ? directTelephone : telephoneFromStructuredAddressValue();
 
+    // "名前" is deliberately not a general company-name label. Some
+    // conventional Japanese company-profile tables use it for the legal
+    // entity, though, so permit it only after the same structured profile has
+    // independently yielded address and an explicitly-labelled phone.
+    const companyNameFromStructuredName = () => {
+      if (sourceType !== 'company_profile' || !address.value || !telephone.value) return { value: '', label: '' };
+      const companyProfilePageContext = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要/.test(pageHay);
+      if (!companyProfilePageContext || !/^(?:本社|本社所在地|本社事務所)$/.test(address.label || '')) return { value: '', label: '' };
+      for (const row of rows) {
+        if (normalizeSubpageJsonLdText(row.label) !== '名前' || !row.value) continue;
+        const value = cleanOperatorName(row.value);
+        // Keep the narrow fallback tied to recognizable legal-entity forms;
+        // personal names, product names and shop names must not qualify.
+        if (!/(?:株式会社|有限会社|合同会社|合資会社|合名会社|一般社団法人|一般財団法人|公益社団法人|公益財団法人|医療法人|学校法人|特定非営利活動法人|\b(?:inc\.?|corp\.?|corporation|co\.?\s*,?\s*ltd\.?|ltd\.?|llc)\b)/i.test(value)) continue;
+        return { value, label: '名前' };
+      }
+      return { value: '', label: '' };
+    };
+    const structuredName = operator.value ? { value: '', label: '' } : companyNameFromStructuredName();
+
     const out = Object.assign({}, empty, {
-      operatorName: operator.value ? cleanOperatorName(operator.value) : '',
+      operatorName: operator.value ? cleanOperatorName(operator.value) : structuredName.value,
       address: address.value ? extractJapaneseAddress(address.value) : '',
       telephone: telephone.value ? extractJapanesePhone(telephone.value) : ''
     });
     out.companyName = out.operatorName;
     if (out.operatorName && operator.label) out.evidenceLabels.push(operator.label);
+    if (out.operatorName && structuredName.label) out.evidenceLabels.push(structuredName.label);
     if (out.address && address.label) out.evidenceLabels.push(address.label);
     if (out.telephone && telephone.label) out.evidenceLabels.push(telephone.label);
     out.hasOperatorName = !!out.operatorName;
@@ -9420,8 +9445,12 @@ function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
     // Prefer a nested profile-like page to a top-level company landing page.
     // Both still need the high-confidence predicate above; this is only a
     // deterministic tie-breaker for the single permitted probe.
-    if (/\/(?:about(?:us)?|company|corporate)(?:\/(?:profile|overview|outline|summary|company-info))(?:\/|$|-|_)/i.test(path)) return 2;
-    if (/\/(?:profile|overview|outline|company-info)(?:\/|$|-|_)/i.test(path)) return 1;
+    // A detail token may be a directory segment or the basename of a static
+    // HTML page (for example /company/outline.html). This remains a
+    // tie-breaker among already high-confidence candidates only.
+    const detailSuffix = '(?:\\/|$|-|_|\\.(?:html?|htm))';
+    if (new RegExp('\\/(?:about(?:us)?|company|corporate)(?:\\/(?:profile|overview|outline|summary|company-info))' + detailSuffix, 'i').test(path)) return 2;
+    if (new RegExp('\\/(?:profile|overview|outline|company-info)' + detailSuffix, 'i').test(path)) return 1;
     return 0;
   };
   return (Array.isArray(candidates) ? candidates : [])
