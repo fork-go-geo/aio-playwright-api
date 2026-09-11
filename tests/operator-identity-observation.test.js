@@ -1,13 +1,14 @@
 const assert = require('assert');
+const { chromium } = require('playwright');
 const hooks = require('../index.js').__lightBudgetTestHooks;
 
-const renderedPage = (url, value = 'Example Corporation') => ({
+const renderedPage = (url, value = 'Example Corporation', overrides = {}) => Object.assign({
   url,
   finalUrl: url,
   ok: true,
   observationMethod: 'playwright_scoped_light',
   operatorIdentityEvidence: value ? [{ label: 'Company', value, sourceScope: 'footer' }] : []
-});
+}, overrides);
 
 function build(overrides = {}) {
   return hooks.buildOperatorIdentityObservationV1_(Object.assign({
@@ -89,15 +90,40 @@ assert.equal(hooks.normalizeOperatorIdentitySiteMode_('shop_facility'), 'shop_fa
 result = build({ candidateCapped: true, completedRoles: ['about'], pages: [renderedPage('https://example.test/about', 'Example Corporation')] });
 assert.equal(result.signalState, 'true');
 
-// Reused /company/ pages keep the selection authority of publisher rather than
-// being downgraded to URL-inferred about; strong visible evidence stays TRUE.
+// Semantic evidence is deduped within its role, while distinct identities in
+// that same semantic role remain a genuine conflict.
 result = hooks.buildOperatorIdentityObservationV1_({
   siteMode: 'media', inputObserved: true, observationLimited: false,
-  discoveryComplete: true, candidateCapped: true, baseScopeComplete: false,
-  completedRoles: ['publisher'], pages: [Object.assign(renderedPage('https://example.test/company/', 'Example Media'), { operatorIdentityRole: 'publisher', operatorIdentityEvidence: [{ label: '運営会社', value: 'Example Media', sourceScope: 'content' }] })], limitations: [], failures: []
+  discoveryComplete: true, candidateCapped: false, baseScopeComplete: true,
+  completedRoles: ['publisher', 'legal'], pages: [renderedPage('https://example.test/company/', 'Example Media', {
+    pageRole: 'top', operatorScopeRole: 'publisher',
+    operatorIdentityEvidence: [
+      { label: '運営会社', value: 'Example Media', sourceScope: 'content' },
+      { label: '運営会社', value: ' Example\nMedia ', sourceScope: 'content' }
+    ]
+  })], limitations: [], failures: []
 });
 assert.equal(result.signalState, 'true');
+assert.equal(result.conflict, false);
+assert.equal(result.strongEvidenceCount, 1);
 assert.equal(result.evidence[0].role, 'publisher');
+assert.equal(result.evidence[0].pageRole, 'top');
+assert.equal(result.evidence[0].evidenceRole, 'operator_name');
+
+result = hooks.buildOperatorIdentityObservationV1_({
+  siteMode: 'media', inputObserved: true, observationLimited: false,
+  discoveryComplete: true, candidateCapped: false, baseScopeComplete: true,
+  completedRoles: ['publisher', 'legal'], pages: [renderedPage('https://example.test/company/', 'Example Media A', {
+    pageRole: 'top', operatorScopeRole: 'publisher',
+    operatorIdentityEvidence: [
+      { label: '運営会社', value: 'Example Media A', sourceScope: 'content' },
+      { label: '運営会社', value: 'Example Media B', sourceScope: 'content' }
+    ]
+  })], limitations: [], failures: []
+});
+assert.equal(result.signalState, 'unknown');
+assert.equal(result.conflict, true);
+assert.equal(result.reasonCodes[0], 'operator_identity_conflict');
 
 // Compactness and serialization contract.
 result = build({
@@ -107,6 +133,93 @@ result = build({
 assert.ok(result.evidence.length <= 3);
 assert.ok(result.failureReasons.length <= 5);
 assert.deepEqual(Object.keys(result.discovery).sort(), ['candidateCount', 'capped', 'complete', 'selectedCount']);
-assert.ok(result.evidence.every(item => item.type && item.role && item.sourcePath && item.extractionMethod && item.label));
+assert.ok(result.evidence.every(item => item.type && item.role && item.pageRole && item.evidenceRole && item.sourcePath && item.extractionMethod && item.label));
 
-console.log('operator identity observation fixtures: PASS');
+async function runRolePropagationFixtures() {
+  const runtime = input => hooks.buildRuntimeOperatorIdentityObservationV1_(Object.assign({
+    inputObserved: true, observationLimited: false, discoveryComplete: true,
+    candidateCapped: false, baseScopeComplete: true, limitations: [], failures: [],
+    context: null, origin: 'https://example.test'
+  }, input));
+  const duplicateEvidence = [
+    { label: '運営会社', value: 'Example Media', sourceScope: 'content' },
+    { label: '運営会社', value: 'Example\nMedia', sourceScope: 'content' }
+  ];
+
+  // Nested containers previously produced two differently-sized composite
+  // values from one heading/value field.  The top collector must keep only the
+  // smallest meaningful pair before semantic dedupe/conflict processing.
+  const browser = await chromium.launch({ headless: true });
+  let topPage;
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<header></header><nav></nav><div><div><h2>運営会社</h2><p>Example Media</p></div></div><footer></footer>');
+    topPage = await hooks.collectTopOperatorIdentityRenderedEvidence_(page, 'https://example.test/company/');
+  } finally {
+    await browser.close();
+  }
+  assert.equal(topPage.operatorIdentityRole, 'top');
+  assert.equal(topPage.operatorIdentityEvidence.length, 1);
+  assert.equal(topPage.operatorIdentityEvidence[0].label, '運営会社');
+
+  // Production-failure regression: direct /company/ is top as a page source,
+  // yet publisher remains the selected semantic operator scope.
+  let observed = await runtime({
+    siteMode: 'media',
+    candidates: [{ url: 'https://example.test/company/', label: '運営会社' }],
+    pages: [topPage]
+  });
+  assert.equal(observed.signalState, 'true');
+  assert.equal(observed.conflict, false);
+  assert.equal(observed.strongEvidenceCount, 1);
+  assert.equal(observed.evidence[0].role, 'publisher');
+  assert.equal(observed.evidence[0].pageRole, 'top');
+  assert.equal(observed.evidence[0].evidenceRole, 'operator_name');
+
+  // Normal root -> reused company page has the same semantic result.
+  observed = await runtime({
+    siteMode: 'media',
+    candidates: [{ url: 'https://example.test/company/', label: '運営会社' }],
+    pages: [renderedPage('https://example.test/company/', 'Example Media', {
+      operatorIdentityRole: 'about', pageRole: 'about', operatorIdentityEvidence: duplicateEvidence
+    })]
+  });
+  assert.equal(observed.signalState, 'true');
+  assert.equal(observed.evidence[0].role, 'publisher');
+  assert.equal(observed.evidence[0].pageRole, 'about');
+
+  // EC direct and root reuse preserve commercial_law without a duplicate fetch.
+  for (const pageRole of ['top', 'about']) {
+    observed = await runtime({
+      siteMode: 'ec',
+      candidates: [{ url: 'https://example.test/tokushoho/', label: '販売業者' }],
+      pages: [renderedPage('https://example.test/tokushoho/', 'Example Seller', {
+        operatorIdentityRole: pageRole, pageRole,
+        operatorIdentityEvidence: [{ label: '販売業者', value: 'Example Seller', sourceScope: 'content' }]
+      })]
+    });
+    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.evidence[0].role, 'commercial_law');
+    assert.equal(observed.evidence[0].pageRole, pageRole);
+    assert.equal(observed.evidence[0].evidenceRole, 'seller_name');
+  }
+
+  // Corporate and SaaS direct pages likewise keep top as source-only metadata.
+  for (const siteMode of ['corp', 'saas']) {
+    observed = await runtime({
+      siteMode,
+      candidates: [{ url: 'https://example.test/company/', label: '会社概要' }],
+      pages: [renderedPage('https://example.test/company/', 'Example Corporation', {
+        operatorIdentityRole: 'top', pageRole: 'top',
+        operatorIdentityEvidence: [{ label: '会社名', value: 'Example Corporation', sourceScope: 'content' }]
+      })]
+    });
+    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.evidence[0].role, 'about');
+    assert.equal(observed.evidence[0].pageRole, 'top');
+  }
+}
+
+runRolePropagationFixtures()
+  .then(() => console.log('operator identity observation fixtures: PASS'))
+  .catch(error => { console.error(error); process.exitCode = 1; });

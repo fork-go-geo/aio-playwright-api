@@ -4811,6 +4811,14 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
           if (dd) addOperatorEvidence(dt.textContent, dd.textContent, dt);
         });
       });
+      // Company/profile pages often express a visible operator field as a
+      // heading immediately followed by a paragraph instead of a table or dl.
+      // Keep this to the adjacent value node; never join a broad parent block.
+      Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 80).forEach(heading => {
+        const value = heading.nextElementSibling;
+        if (!value || !/^(?:p|div|span|dd)$/i.test(String(value.tagName || ''))) return;
+        addOperatorEvidence(heading.textContent, value.textContent, value);
+      });
       Array.from(document.querySelectorAll('[data-operator], [class*="operator" i], [class*="company" i], [class*="corporate" i], [class*="seller" i], [class*="publisher" i]')).slice(0, 40).forEach(block => {
         const text = clean(block.innerText || block.textContent);
         const match = text.match(/([^:：\n]{1,40}(?:会社名|法人名|事業者名|販売業者|運営(?:会社|者)|代表者|名称|商号|company|corporate|operator|seller|publisher|editor)[^:：\n]{0,20})\s*[:：]\s*([^\n]{1,160})/i);
@@ -9726,9 +9734,39 @@ function getOperatorIdentityAdditionalFetchCap_(siteMode) {
   return ({ corp: 2, saas: 2, ec: 3, media: 2, shop_facility: 0 })[siteMode] || 0;
 }
 
+function normalizeOperatorIdentityToken_(value, label) {
+  let token = String(value == null ? '' : value);
+  try { token = token.normalize('NFKC'); } catch (_) {}
+  token = token.replace(/[\s\u3000]+/g, ' ').trim().toLowerCase();
+  const normalizedLabel = String(label == null ? '' : label)
+    .replace(/[\s\u3000]+/g, ' ').trim().toLowerCase();
+  if (normalizedLabel) {
+    const escaped = normalizedLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    token = token.replace(new RegExp('^' + escaped + '\\s*[:：-]?\\s*'), '');
+  }
+  return token.replace(/(?:[\s、。．，,:：;；\-－]+)$/g, '').trim();
+}
+
+function operatorIdentityEvidenceRole_(label, operatorScopeRole) {
+  const text = String(label || '').toLowerCase();
+  if (/(?:販売(?:業者|事業者)|seller|merchant)/i.test(text)) return 'seller_name';
+  if (/(?:発行元|編集部|publisher|editorial)/i.test(text)) return 'publisher_name';
+  if (/(?:サービス提供者|provider)/i.test(text)) return 'provider_name';
+  return 'operator_name';
+}
+
+function operatorIdentityPageRole_(page) {
+  const explicit = String(page && page.pageRole || '').trim();
+  if (explicit) return explicit;
+  const legacy = String(page && page.operatorIdentityRole || '').trim();
+  if (legacy === 'top') return 'top';
+  return operatorIdentityRoleForCandidate_(page) || legacy || 'unknown';
+}
+
 function compactOperatorIdentityEvidence_(pages) {
   const evidence = [];
-  const identityTokensByRole = new Map();
+  const identityTokensByEvidenceRole = new Map();
+  const duplicateKeys = new Set();
   (Array.isArray(pages) ? pages : []).forEach(page => {
     if (!page || page.ok !== true || page.observationMethod !== 'playwright_scoped_light') return;
     const sourceUrl = String(page.finalUrl || page.url || '');
@@ -9736,20 +9774,33 @@ function compactOperatorIdentityEvidence_(pages) {
     try { sourcePath = new URL(sourceUrl).pathname || '/'; } catch (_) { sourcePath = sourceUrl.slice(0, 160); }
     (Array.isArray(page.operatorIdentityEvidence) ? page.operatorIdentityEvidence : []).forEach(item => {
       if (!item || !String(item.value || '').trim()) return;
-      const role = page.operatorIdentityRole || operatorIdentityRoleForCandidate_(page) || 'top';
-      if (!identityTokensByRole.has(role)) identityTokensByRole.set(role, new Set());
-      identityTokensByRole.get(role).add(String(item.value).replace(/\s+/g, ' ').trim().toLowerCase());
+      const pageRole = operatorIdentityPageRole_(page);
+      const role = String(page.operatorScopeRole ||
+        (Array.isArray(page.operatorScopeRoles) && page.operatorScopeRoles[0]) ||
+        (page.operatorIdentityRole !== 'top' && page.operatorIdentityRole) ||
+        operatorIdentityRoleForCandidate_(page) || 'operator');
+      const label = String(item.label || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      const evidenceRole = operatorIdentityEvidenceRole_(label, role);
+      const identityToken = normalizeOperatorIdentityToken_(item.value, label);
+      if (!identityToken) return;
+      const duplicateKey = [String(sourcePath || '/').toLowerCase(), evidenceRole, label.toLowerCase(), identityToken].join('\n');
+      if (duplicateKeys.has(duplicateKey)) return;
+      duplicateKeys.add(duplicateKey);
+      if (!identityTokensByEvidenceRole.has(evidenceRole)) identityTokensByEvidenceRole.set(evidenceRole, new Set());
+      identityTokensByEvidenceRole.get(evidenceRole).add(identityToken);
       if (evidence.length < 3) evidence.push({
         type: 'visible_label_value',
         role,
+        pageRole,
+        evidenceRole,
         sourcePath: String(sourcePath || '/').slice(0, 160),
         sourceScope: item.sourceScope === 'footer' ? 'footer' : 'content',
         extractionMethod: 'rendered_visible_label_value',
-        label: String(item.label || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+        label
       });
     });
   });
-  return { evidence, conflict: Array.from(identityTokensByRole.values()).some(tokens => tokens.size > 1) };
+  return { evidence, conflict: Array.from(identityTokensByEvidenceRole.values()).some(tokens => tokens.size > 1) };
 }
 
 // Pure finalizer: false is intentionally impossible unless every completion
@@ -9835,12 +9886,6 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
   const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
   const cap = getOperatorIdentityAdditionalFetchCap_(siteMode);
   const candidates = Array.isArray(input.candidates) ? input.candidates : [];
-  // A role explicitly assigned by the operator selection plan survives reuse.
-  // URL inference is only a fallback: /company/ can legitimately be both an
-  // about page and a media publisher/operator source.
-  const pages = (Array.isArray(input.pages) ? input.pages : []).map(page => Object.assign({}, page || {}, {
-    operatorIdentityRole: page && page.operatorIdentityRole || operatorIdentityRoleForCandidate_(page)
-  }));
   const limitations = Array.isArray(input.limitations) ? input.limitations.slice() : [];
   const failures = [];
   const selectedByRole = new Map();
@@ -9849,6 +9894,25 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
       (role === 'legal' ? candidates.find(item => operatorIdentityRoleForCandidate_(item) === 'commercial_law') : null) ||
       (role === 'publisher' ? candidates.find(item => operatorIdentityRoleForCandidate_(item) === 'about') : null);
     if (candidate) selectedByRole.set(role, candidate);
+  });
+  // pageRole records the fetch/source scope; selected operator scope is the
+  // semantic authority and can safely coexist with pageRole=top on direct URLs.
+  const pages = (Array.isArray(input.pages) ? input.pages : []).map(page => {
+    const source = Object.assign({}, page || {});
+    const key = discoverSubpageCandidateKey(source.finalUrl || source.url || '');
+    const selectedRoles = Array.from(selectedByRole.entries())
+      .filter(([, candidate]) => key && key === discoverSubpageCandidateKey(candidate && candidate.url || ''))
+      .map(([role]) => role);
+    const inheritedScope = source.operatorScopeRole ||
+      (Array.isArray(source.operatorScopeRoles) && source.operatorScopeRoles[0]) ||
+      (source.operatorIdentityRole !== 'top' ? source.operatorIdentityRole : '') ||
+      operatorIdentityRoleForCandidate_(source);
+    const operatorScopeRole = selectedRoles[0] || inheritedScope || 'operator';
+    return Object.assign(source, {
+      pageRole: operatorIdentityPageRole_(source),
+      operatorScopeRole,
+      operatorScopeRoles: selectedRoles.length ? selectedRoles : (source.operatorScopeRoles || [operatorScopeRole])
+    });
   });
   let additionalFetchCount = 0;
   for (const [role, candidate] of selectedByRole.entries()) {
@@ -9875,7 +9939,11 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
       try { return new URL(page && (page.finalUrl || page.url) || '').origin === String(input.origin || ''); } catch (_) { return false; }
     })();
     if (page && page.ok === true && sameOrigin) {
-      pages.push(Object.assign({}, page, { operatorIdentityRole: role }));
+      pages.push(Object.assign({}, page, {
+        pageRole: operatorIdentityPageRole_(page),
+        operatorScopeRole: role,
+        operatorScopeRoles: [role]
+      }));
     } else {
       failures.push(sameOrigin ? `required_${role}_fetch_failed` : 'redirect_outside_origin');
     }
@@ -9938,8 +10006,14 @@ async function collectTopOperatorIdentityRenderedEvidence_(page, url) {
         const dd = dt.nextElementSibling && String(dt.nextElementSibling.tagName).toLowerCase() === 'dd' ? dt.nextElementSibling : null;
         if (dd) add(dt.textContent, dd.textContent, dt);
       });
+      Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 80).forEach(heading => {
+        const value = heading.nextElementSibling;
+        if (!value || !/^(?:p|div|span|dd)$/i.test(String(value.tagName || ''))) return;
+        add(heading.textContent, value.textContent, value);
+      });
       Array.from(document.querySelectorAll('p,div,li')).slice(0, 300).forEach(block => {
         if (!visible(block)) return;
+        if (block.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,table,dl').length > 1) return;
         const strong = block.querySelector('strong,b');
         if (strong) {
           const value = clean(String(block.innerText || block.textContent || '').replace(String(strong.innerText || strong.textContent || ''), ''));
@@ -25323,6 +25397,14 @@ module.exports.__lightBudgetTestHooks = {
   LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
+   buildOperatorIdentityObservationV1_,
+   buildRuntimeOperatorIdentityObservationV1_,
+   collectTopOperatorIdentityRenderedEvidence_,
+   normalizeOperatorIdentitySiteMode_,
+   normalizeOperatorIdentityToken_,
+   operatorIdentityEvidenceRole_,
+   operatorIdentityRoleForCandidate_,
+   getOperatorIdentityAdditionalFetchCap_,
   isEcProductDetailCandidate_,
   extractSubpageProductPriceSignal_,
   extractSubpageProductDescriptionSignal_,
