@@ -10,6 +10,10 @@ const renderedPage = (url, value = 'Example Corporation', overrides = {}) => Obj
   operatorIdentityEvidence: value ? [{ label: 'Company', value, sourceScope: 'footer' }] : []
 }, overrides);
 
+const shogoEvidence = (value, overrides = {}) => Object.assign({
+  label: '商号', value, sourceScope: 'content', sourceShape: 'table', valueCellCount: 1
+}, overrides);
+
 function build(overrides = {}) {
   return hooks.buildOperatorIdentityObservationV1_(Object.assign({
     siteMode: 'corp',
@@ -38,6 +42,54 @@ assert.equal(JSON.stringify(result).includes('operatorIdentityEvidence'), false)
 result = build({ pages: [renderedPage('https://example.test/company', '')] });
 assert.equal(result.signalState, 'false');
 assert.deepEqual(result.reasonCodes, ['all_required_rendered_scopes_completed_without_identity_evidence']);
+
+// Production FALSE_POSITIVE regression: 商号 is only strong when it is a
+// structured, local about-scope identity pair.
+result = build({ pages: [renderedPage('https://example.test/corporate/', '', {
+  pageRole: 'about', operatorScopeRole: 'about',
+  operatorIdentityEvidence: [shogoEvidence('Meaningful Company Name')]
+})] });
+assert.equal(result.signalState, 'true');
+assert.equal(result.strongEvidenceCount, 1);
+assert.equal(result.evidence[0].evidenceRole, 'operator_name');
+assert.equal(result.conflict, false);
+
+// Exact 商号 outside an about scope, and a table row with multiple values,
+// must not become operator identity evidence.
+['article', 'operator', 'legal'].forEach(operatorScopeRole => {
+  const negative = build({ pages: [renderedPage('https://example.test/article/', '', {
+    pageRole: 'article', operatorScopeRole,
+    operatorIdentityEvidence: [shogoEvidence('Example Article Company', { sourceShape: 'inline' })]
+  })] });
+  assert.equal(negative.signalState, 'false');
+  assert.equal(negative.strongEvidenceCount, 0);
+});
+result = build({ pages: [renderedPage('https://example.test/partners/', '', {
+  pageRole: 'about', operatorScopeRole: 'about',
+  operatorIdentityEvidence: [shogoEvidence('Company A Company B', { valueCellCount: 2 })]
+})] });
+assert.equal(result.signalState, 'false');
+assert.equal(result.strongEvidenceCount, 0);
+
+result = build({ pages: [renderedPage('https://example.test/corporate/', '', {
+  pageRole: 'about', operatorScopeRole: 'about',
+  operatorIdentityEvidence: [
+    shogoEvidence('Example Operator'),
+    { label: '運営会社', value: ' Example\nOperator ', sourceScope: 'content' }
+  ]
+})] });
+assert.equal(result.signalState, 'true');
+assert.equal(result.conflict, false);
+
+result = build({ pages: [renderedPage('https://example.test/corporate/', '', {
+  pageRole: 'about', operatorScopeRole: 'about',
+  operatorIdentityEvidence: [
+    shogoEvidence('Example Operator A'),
+    { label: '運営会社', value: 'Example Operator B', sourceScope: 'content' }
+  ]
+})] });
+assert.equal(result.signalState, 'unknown');
+assert.equal(result.conflict, true);
 
 [
   { discoveryComplete: false, expected: 'discovery_incomplete' },
@@ -222,6 +274,26 @@ async function runRolePropagationFixtures() {
   assert.deepEqual(shapeValues, ['Example Table', 'Example DL', 'Example Heading', 'Example Strong', 'Example Newline', 'Example Colon']);
   assert.ok(!shapeValues.includes('Aggregate Value'));
   assert.ok(!shapeValues.includes('Hidden'));
+
+  // The production table shape is captured as a raw structured candidate;
+  // the final helper, not this DOM scan, decides whether its scope is strong.
+  const shogoPage = await browser.newPage();
+  await shogoPage.setContent('<header></header><nav></nav><section><h2>会社概要</h2><table><tr><th>商号</th><td>Meaningful Company Name</td></tr></table></section><footer></footer>');
+  const shogoExtracted = await hooks.extractOperatorIdentityEvidenceFromRenderedPage_(shogoPage);
+  assert.equal(shogoExtracted.evidence.length, 1);
+  assert.equal(shogoExtracted.evidence[0].label, '商号');
+  assert.equal(shogoExtracted.evidence[0].sourceShape, 'table');
+  assert.equal(shogoExtracted.evidence[0].valueCellCount, 1);
+  await shogoPage.setContent('<header></header><nav></nav><p>商号: Example Article Company</p><footer></footer>');
+  const articleShogo = await hooks.extractOperatorIdentityEvidenceFromRenderedPage_(shogoPage);
+  assert.equal(articleShogo.evidence.length, 1);
+  await shogoPage.setContent('<header></header><nav></nav><table><tr><th>商号</th><td>Company A</td><td>Company B</td></tr></table><footer></footer>');
+  const listShogo = await hooks.extractOperatorIdentityEvidenceFromRenderedPage_(shogoPage);
+  assert.equal(listShogo.evidence[0].valueCellCount, 2);
+  await shogoPage.setContent('<header></header><nav></nav><table><tr><th>商号</th><td></td></tr><tr><th>商号</th><td>こちら</td></tr></table><footer></footer>');
+  const invalidShogo = await hooks.extractOperatorIdentityEvidenceFromRenderedPage_(shogoPage);
+  assert.equal(invalidShogo.evidence.length, 0);
+  await shogoPage.close();
 
   // Scoped subpages navigate with waitUntil=commit.  The fixture deliberately
   // hydrates after commit, proving bounded readiness plus the shared extractor
@@ -409,6 +481,46 @@ async function runRolePropagationFixtures() {
     assert.equal(observed.signalState, 'true', `${siteMode}: ${JSON.stringify(observed)}`);
     assert.equal(observed.evidence[0].role, 'about');
     assert.equal(observed.evidence[0].pageRole, 'top');
+  }
+
+  // 商号 has root/direct equivalence for company-profile scopes.  The direct
+  // source remains pageRole=top while its semantic scope is about.
+  const shogoRoot = await runtime({
+    siteMode: 'corp', candidates: [{ url: 'https://example.test/corporate/', label: '企業情報' }],
+    pages: [renderedPage('https://example.test/corporate/', '', {
+      operatorIdentityRole: 'about', pageRole: 'about', operatorIdentityEvidence: shogoExtracted.evidence
+    })]
+  });
+  const shogoDirect = await runtime({
+    siteMode: 'corp', candidates: [],
+    directTargetCandidate: directCandidate('https://example.test/corporate/', 'corp'),
+    pages: [renderedPage('https://example.test/corporate/', '', {
+      operatorIdentityRole: 'top', pageRole: 'top', operatorIdentityEvidence: shogoExtracted.evidence
+    })]
+  });
+  for (const observedShogo of [shogoRoot, shogoDirect]) {
+    assert.equal(observedShogo.signalState, 'true');
+    assert.equal(observedShogo.strongEvidenceCount, 1);
+    assert.equal(observedShogo.evidence[0].role, 'about');
+    assert.equal(observedShogo.evidence[0].evidenceRole, 'operator_name');
+    assert.equal(observedShogo.conflict, false);
+  }
+  assert.equal(shogoRoot.evidence[0].pageRole, 'about');
+  assert.equal(shogoDirect.evidence[0].pageRole, 'top');
+
+  // SaaS and EC about scopes preserve generic operator_name. Commercial-law
+  // seller evidence and media publisher semantics remain unchanged.
+  for (const siteMode of ['saas', 'ec']) {
+    const roles = siteMode === 'saas' ? ['about', 'legal'] : ['commercial_law', 'legal', 'about'];
+    observed = hooks.buildOperatorIdentityObservationV1_({
+      siteMode, inputObserved: true, observationLimited: false, discoveryComplete: true,
+      candidateCapped: false, baseScopeComplete: true, completedRoles: roles, limitations: [], failures: [],
+      pages: [renderedPage('https://example.test/company/', '', {
+        pageRole: 'about', operatorScopeRole: 'about', operatorIdentityEvidence: shogoExtracted.evidence
+      })]
+    });
+    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.evidence[0].evidenceRole, 'operator_name');
   }
 
   // Pre-cap reservations are execution input, not merely audit data.  A
