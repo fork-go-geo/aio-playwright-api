@@ -84,7 +84,55 @@ assert.equal(hooks.getOperatorIdentityAdditionalFetchCap_('media'), 2);
 assert.equal(hooks.getOperatorIdentityAdditionalFetchCap_('shop_facility'), 0);
 assert.equal(hooks.operatorIdentityRoleForCandidate_({ path: '/guide/legal/', label: '特定商取引法に基づく表記' }), 'commercial_law');
 assert.equal(hooks.operatorIdentityRoleForCandidate_({ path: '/info/', label: '運営元' }), 'publisher');
+assert.equal(hooks.operatorIdentityRoleForCandidate_({ path: '/jp/terms', label: '利用規約' }), 'legal');
+assert.equal(hooks.operatorIdentityRoleForCandidate_({ path: '/privacy', label: '個人情報保護方針' }), 'legal');
 assert.equal(hooks.normalizeOperatorIdentitySiteMode_('shop_facility'), 'shop_facility');
+
+function candidate(path, label = '', source = 'sitemap', score = 0) {
+  return { url: `https://example.test${path}`, label, source, sources: [source], score };
+}
+
+function assertReservedPlan(siteMode, candidates, expectedPaths) {
+  const plan = hooks.buildOperatorIdentityCandidatePlan_(candidates, {
+    siteMode,
+    generalCandidates: candidates.slice(0, 20)
+  });
+  assert.deepEqual(plan.reservedCandidates.map(item => new URL(item.url).pathname).sort(), expectedPaths.slice().sort());
+  assert.ok(plan.reservedCandidates.length <= hooks.getOperatorIdentityAdditionalFetchCap_(siteMode));
+  return plan;
+}
+
+// Reservation happens before the unchanged general cap. These role candidates
+// are intentionally outside the first 20 score-sorted items.
+const corporateCapCandidates = Array.from({ length: 42 }, (_, i) => candidate(`/company/news-${i}`, '会社情報', 'nav', 100));
+corporateCapCandidates.unshift(candidate('/company', '会社情報', 'nav', 100));
+corporateCapCandidates.push(candidate('/legal-notice', '法務情報', 'footer', 73));
+assertReservedPlan('corp', corporateCapCandidates, ['/company', '/legal-notice']);
+
+const saasCapCandidates = Array.from({ length: 23 }, (_, i) => candidate(`/product/${i}`, '製品', 'nav', 100));
+saasCapCandidates[3] = candidate('/company', '会社概要', 'footer', 70);
+saasCapCandidates[10] = candidate('/jp/terms', '利用規約', 'footer', 63);
+assertReservedPlan('saas', saasCapCandidates, ['/company', '/jp/terms']);
+
+const ecCapCandidates = Array.from({ length: 31 }, (_, i) => candidate(`/products/${i}`, '商品', 'nav', 100));
+ecCapCandidates.push(candidate('/help/about', '会社概要', 'ecGeneralLink', 88));
+ecCapCandidates.push(candidate('/help/privacy', 'プライバシーポリシー', 'ecGeneralLink', 88));
+ecCapCandidates.push(candidate('/help/tradelaw', '特定商取引法に基づく表記', 'ecGeneralLink', 53));
+assertReservedPlan('ec', ecCapCandidates, ['/help/about', '/help/privacy', '/help/tradelaw']);
+
+const mediaCapCandidates = Array.from({ length: 30 }, (_, i) => candidate(`/post/${i}`, '記事', 'nav', 100));
+mediaCapCandidates.push(candidate('/company', '運営会社', 'footer', 73));
+mediaCapCandidates.push(candidate('/terms', '利用規約', 'footer', 73));
+assertReservedPlan('media', mediaCapCandidates, ['/company', '/terms']);
+
+// Reservation never relaxes false safety: capped evidence-free input remains
+// unknown even when all nominal scopes are complete.
+result = build({
+  candidateCapped: true,
+  pages: [renderedPage('https://example.test/company', '')],
+  completedRoles: ['about', 'legal']
+});
+assert.equal(result.signalState, 'unknown');
 
 // Positive evidence remains positive even when an unrelated scope is incomplete.
 result = build({ candidateCapped: true, completedRoles: ['about'], pages: [renderedPage('https://example.test/about', 'Example Corporation')] });
@@ -217,9 +265,44 @@ async function runRolePropagationFixtures() {
       candidates: [{ url: 'https://example.test/company/', label: '会社概要' }],
       pages: [topPage]
     });
-    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.signalState, 'true', `${siteMode}: ${JSON.stringify(observed)}`);
     assert.equal(observed.evidence[0].role, 'about');
     assert.equal(observed.evidence[0].pageRole, 'top');
+  }
+
+  // Pre-cap reservations are execution input, not merely audit data.  A
+  // scoped page for each reserved URL is reused, so the fixed fetch budget is
+  // not consumed again and capped evidence can still establish TRUE.
+  const reservationCases = [
+    ['corp', corporateCapCandidates, 'Company'],
+    ['saas', saasCapCandidates, 'SaaS'],
+    ['ec', ecCapCandidates, 'Seller'],
+    ['media', mediaCapCandidates, 'Publisher']
+  ];
+  for (const [siteMode, allCandidates, value] of reservationCases) {
+    const plan = hooks.buildOperatorIdentityCandidatePlan_(allCandidates, {
+      siteMode,
+      generalCandidates: allCandidates.slice(0, 20)
+    });
+    const pages = plan.reservedCandidates.map(item => renderedPage(item.url, `Example ${value}`));
+    observed = await runtime({
+      siteMode,
+      candidates: allCandidates.slice(0, 20),
+      operatorCandidatePlan: plan,
+      candidateCapped: true,
+      pages
+    });
+    assert.equal(observed.signalState, 'true', `${siteMode}: ${JSON.stringify(observed)}`);
+    assert.equal(observed.additionalFetchCount, 0);
+
+    const evidenceFree = await runtime({
+      siteMode,
+      candidates: allCandidates.slice(0, 20),
+      operatorCandidatePlan: plan,
+      candidateCapped: true,
+      pages: plan.reservedCandidates.map(item => renderedPage(item.url, ''))
+    });
+    assert.equal(evidenceFree.signalState, 'unknown');
   }
 }
 
