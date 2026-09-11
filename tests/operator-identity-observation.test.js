@@ -193,6 +193,7 @@ async function runRolePropagationFixtures() {
     { label: '運営会社', value: 'Example Media', sourceScope: 'content' },
     { label: '運営会社', value: 'Example\nMedia', sourceScope: 'content' }
   ];
+  let observed;
 
   // Production-shaped aggregate: h1's immediate div contains several sections.
   // Only the nested h2 -> p operator field is valid evidence.
@@ -204,18 +205,90 @@ async function runRolePropagationFixtures() {
     topPage = await hooks.collectTopOperatorIdentityRenderedEvidence_(page, 'https://example.test/company/');
     await page.setContent('<header></header><nav></nav><section><h1>特定商取引法に基づく表記</h1><div class="aggregate"><h2>販売業者</h2><p>Example Seller</p><h2>所在地</h2><p>Example Address</p><h2>お問い合わせ</h2><p>Example Contact</p></div></section><footer></footer>');
     ecTopPage = await hooks.collectTopOperatorIdentityRenderedEvidence_(page, 'https://example.test/tokushoho/');
-  } finally {
-    await browser.close();
-  }
   assert.equal(topPage.operatorIdentityRole, 'top');
   assert.equal(topPage.operatorIdentityEvidence.length, 1);
   assert.equal(topPage.operatorIdentityEvidence[0].label, '運営会社');
   assert.equal(ecTopPage.operatorIdentityEvidence.length, 1);
   assert.equal(ecTopPage.operatorIdentityEvidence[0].label, '販売業者');
 
+  // The shared extractor accepts every supported operator label/value shape,
+  // while ignoring hidden and aggregate-only lookalikes.
+  const shapePage = await browser.newPage();
+  await shapePage.setContent('<header></header><nav></nav><table><tr><th>会社名</th><td>Example Table</td></tr></table><dl><dt>販売業者</dt><dd>Example DL</dd></dl><section><h2>運営会社</h2><div>Example Heading</div></section><p><strong>発行元</strong> Example Strong</p><div>法人名<br>Example Newline</div><div>事業者名：Example Colon</div><h1>運営会社</h1><div class="aggregate"><h2>会社情報</h2><p>Aggregate Value</p><h2>所在地</h2><p>Address</p></div><p style="display:none">会社名：Hidden</p><footer></footer>');
+  const shapeEvidence = await hooks.extractOperatorIdentityEvidenceFromRenderedPage_(shapePage);
+  await shapePage.close();
+  const shapeValues = shapeEvidence.evidence.map(item => item.value);
+  assert.deepEqual(shapeValues, ['Example Table', 'Example DL', 'Example Heading', 'Example Strong', 'Example Newline', 'Example Colon']);
+  assert.ok(!shapeValues.includes('Aggregate Value'));
+  assert.ok(!shapeValues.includes('Hidden'));
+
+  // Scoped subpages navigate with waitUntil=commit.  The fixture deliberately
+  // hydrates after commit, proving bounded readiness plus the shared extractor
+  // yields the same semantic evidence as a direct top-page collection.
+  const scopedContext = await browser.newContext();
+  try {
+    await scopedContext.route('https://example.test/**', route => {
+      const path = new URL(route.request().url()).pathname;
+      const body = path.includes('tradelaw')
+        ? '<script>setTimeout(()=>document.body.innerHTML=\'<header></header><nav></nav><dl><dt>販売業者</dt><dd>Example Seller</dd></dl><footer></footer>\',80)</script>'
+        : '<script>setTimeout(()=>document.body.innerHTML=\'<header></header><nav></nav><section><h1>運営会社</h1><div class="aggregate"><h2>運営会社</h2><p>Example Media</p><h2>所在地</h2><p>Example Address</p><h2>お問い合わせ</h2><p>Example Contact</p></div></section><footer></footer>\',80)</script>';
+      return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body });
+    });
+    const scopedMedia = await hooks.fetchSubpagePlaywrightScopedLight('https://example.test/company/', {
+      context: scopedContext, siteMode: 'media', timeout: 8000, operatorEvidenceReadyTimeoutMs: 500
+    });
+    const scopedEc = await hooks.fetchSubpagePlaywrightScopedLight('https://example.test/help/tradelaw', {
+      context: scopedContext, siteMode: 'ec', timeout: 8000, operatorEvidenceReadyTimeoutMs: 500
+    });
+    assert.equal(scopedMedia.operatorIdentityEvidence.length, topPage.operatorIdentityEvidence.length);
+    assert.equal(scopedEc.operatorIdentityEvidence.length, ecTopPage.operatorIdentityEvidence.length);
+
+    observed = await runtime({
+      siteMode: 'media', candidates: [{ url: 'https://example.test/company/', label: '運営会社' }], pages: [scopedMedia]
+    });
+    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.evidence[0].role, 'publisher');
+    assert.equal(observed.evidence[0].evidenceRole, 'operator_name');
+    assert.equal(observed.conflict, false);
+
+    observed = await runtime({
+      siteMode: 'ec', candidates: [{ url: 'https://example.test/help/tradelaw', label: '特定商取引法に基づく表記' }], pages: [scopedEc]
+    });
+    assert.equal(observed.signalState, 'true');
+    assert.equal(observed.evidence[0].role, 'commercial_law');
+    assert.equal(observed.evidence[0].evidenceRole, 'seller_name');
+    assert.equal(observed.conflict, false);
+
+    const timeoutPage = await scopedContext.newPage();
+    await timeoutPage.setContent('<script>document.body.innerHTML=""</script>');
+    const readiness = await hooks.waitForScopedOperatorEvidenceDomReadiness_(timeoutPage, { timeoutMs: 100 });
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.timedOut, true);
+    await timeoutPage.close();
+
+    // Readiness requires both a non-loading document and meaningful DOM. The
+    // variants fix loading→interactive plus interactive/complete initial state
+    // without treating readyState alone as operator evidence.
+    const readyStatePage = await scopedContext.newPage();
+    await readyStatePage.setContent('<header></header><h2>運営会社</h2><p>Example</p><footer></footer>');
+    await readyStatePage.evaluate(() => {
+      let state = 'loading';
+      Object.defineProperty(document, 'readyState', { configurable: true, get: () => state });
+      setTimeout(() => { state = 'interactive'; }, 50);
+    });
+    assert.equal((await hooks.waitForScopedOperatorEvidenceDomReadiness_(readyStatePage, { timeoutMs: 200 })).ready, true);
+    for (const state of ['interactive', 'complete']) {
+      await readyStatePage.evaluate(nextState => Object.defineProperty(document, 'readyState', { configurable: true, get: () => nextState }), state);
+      assert.equal((await hooks.waitForScopedOperatorEvidenceDomReadiness_(readyStatePage, { timeoutMs: 100 })).ready, true);
+    }
+    await readyStatePage.close();
+  } finally {
+    await scopedContext.close();
+  }
+
   // Production-failure regression: direct /company/ is top as a page source,
   // yet publisher remains the selected semantic operator scope.
-  let observed = await runtime({
+  observed = await runtime({
     siteMode: 'media',
     candidates: [{ url: 'https://example.test/company/', label: '運営会社' }],
     pages: [topPage]
@@ -303,6 +376,9 @@ async function runRolePropagationFixtures() {
       pages: plan.reservedCandidates.map(item => renderedPage(item.url, ''))
     });
     assert.equal(evidenceFree.signalState, 'unknown');
+  }
+  } finally {
+    await browser.close();
   }
 }
 
