@@ -9480,8 +9480,11 @@ async function buildRuntimeOperatorIdentityObservationV1_(input = {}) {
   const requiredRoles = getOperatorIdentityRequiredRoles_(siteMode);
   const cap = getOperatorIdentityAdditionalFetchCap_(siteMode);
   const candidates = Array.isArray(input.candidates) ? input.candidates : [];
+  // A role explicitly assigned by the operator selection plan survives reuse.
+  // URL inference is only a fallback: /company/ can legitimately be both an
+  // about page and a media publisher/operator source.
   const pages = (Array.isArray(input.pages) ? input.pages : []).map(page => Object.assign({}, page || {}, {
-    operatorIdentityRole: operatorIdentityRoleForCandidate_(page)
+    operatorIdentityRole: page && page.operatorIdentityRole || operatorIdentityRoleForCandidate_(page)
   }));
   const limitations = Array.isArray(input.limitations) ? input.limitations.slice() : [];
   const failures = [];

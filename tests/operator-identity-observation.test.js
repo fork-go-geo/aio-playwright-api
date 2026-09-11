@@ -89,6 +89,16 @@ assert.equal(hooks.normalizeOperatorIdentitySiteMode_('shop_facility'), 'shop_fa
 result = build({ candidateCapped: true, completedRoles: ['about'], pages: [renderedPage('https://example.test/about', 'Example Corporation')] });
 assert.equal(result.signalState, 'true');
 
+// Reused /company/ pages keep the selection authority of publisher rather than
+// being downgraded to URL-inferred about; strong visible evidence stays TRUE.
+result = hooks.buildOperatorIdentityObservationV1_({
+  siteMode: 'media', inputObserved: true, observationLimited: false,
+  discoveryComplete: true, candidateCapped: true, baseScopeComplete: false,
+  completedRoles: ['publisher'], pages: [Object.assign(renderedPage('https://example.test/company/', 'Example Media'), { operatorIdentityRole: 'publisher', operatorIdentityEvidence: [{ label: '運営会社', value: 'Example Media', sourceScope: 'content' }] })], limitations: [], failures: []
+});
+assert.equal(result.signalState, 'true');
+assert.equal(result.evidence[0].role, 'publisher');
+
 // Compactness and serialization contract.
 result = build({
   pages: Array.from({ length: 8 }, (_, i) => renderedPage(`https://example.test/about/${i}`, `Same Corporation`)),
