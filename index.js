@@ -13104,6 +13104,130 @@ function attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, signal) {
   geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
 }
 
+// Cloud Run is also the authority for the conventional human-visible HTML
+// sitemap endpoints.  This deliberately remains a coverage signal: unlike
+// XML sitemap discovery it is not inferred from a URL string alone.
+const HTML_SITEMAP_STANDARD_PATHS_V1_ = [
+  '/sitemap/', '/sitemap.html', '/site-map/', '/site-map.html',
+  '/site_map/', '/site_map.html', '/site_map.htm', '/sitemap'
+];
+
+function normalizeHtmlSitemapUrlV1_(origin, value) {
+  try {
+    const base = new URL(String(origin || ''));
+    const url = new URL(String(value || ''), base);
+    if (url.origin !== base.origin) return null;
+    url.hash = '';
+    return url.toString();
+  } catch (_) { return null; }
+}
+
+function validateHumanVisibleHtmlSitemapV1_(html, contentType = '') {
+  const source = String(html || '');
+  const isHtml = /text\/html|application\/xhtml\+xml/i.test(String(contentType || '')) ||
+    /^\s*(?:<!doctype\s+html|<html\b|<head\b|<body\b)/i.test(source);
+  if (!isHtml) return { valid:false, reason:'not_html', linkCount:0, hasSitemapIdentity:false };
+  const withoutNonVisible = source.replace(/<script\b[\s\S]*?<\/script>/ig, ' ').replace(/<style\b[\s\S]*?<\/style>/ig, ' ');
+  const title = ((withoutNonVisible.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '').replace(/<[^>]+>/g, ' ');
+  const h1 = ((withoutNonVisible.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] || '').replace(/<[^>]+>/g, ' ');
+  const headings = Array.from(withoutNonVisible.matchAll(/<h[2-6]\b[^>]*>([\s\S]*?)<\/h[2-6]>/ig)).map(match => String(match[1] || '').replace(/<[^>]+>/g, ' ')).join(' ');
+  const hasSitemapIdentity = /(?:サイト\s*マップ|sitemap|site\s*map)/i.test(`${title} ${h1} ${headings}`);
+  const linkCount = (withoutNonVisible.match(/<a\b[^>]*href\s*=/ig) || []).length;
+  const hasList = /<(?:ul|ol|dl)\b/i.test(withoutNonVisible);
+  return {
+    valid: hasSitemapIdentity && linkCount >= 5 && hasList,
+    reason: hasSitemapIdentity ? (linkCount >= 5 && hasList ? 'valid_human_visible_sitemap' : 'insufficient_sitemap_structure') : 'missing_sitemap_identity',
+    linkCount,
+    hasSitemapIdentity
+  };
+}
+
+function buildHtmlSitemapCoverageSignalV1_(origin, observations = [], options = {}) {
+  const base = String(origin || '').replace(/\/+$/, '');
+  const candidates = Array.isArray(observations) ? observations : [];
+  const normalized = candidates.map((input) => {
+    const item = input && typeof input === 'object' ? input : {};
+    const url = normalizeHtmlSitemapUrlV1_(base, item.url || item.path) || null;
+    const httpStatus = typeof item.status === 'number' ? item.status : null;
+    const fetchError = item.errorMessage ? String(item.errorMessage).slice(0, 180) : null;
+    const timeout = item.timeout === true || /abort|timeout|timed?\s*out/i.test(fetchError || '') || httpStatus === 408 || httpStatus === 504;
+    const serverError = typeof httpStatus === 'number' && httpStatus >= 500 && httpStatus <= 599;
+    const validation = httpStatus >= 200 && httpStatus < 300
+      ? validateHumanVisibleHtmlSitemapV1_(item.text, item.contentType)
+      : { valid:false, reason:null, linkCount:0, hasSitemapIdentity:false };
+    const status = validation.valid ? 'found'
+      : ((httpStatus === 404 || httpStatus === 410) ? 'not_found'
+        : ((httpStatus === 401 || httpStatus === 403) ? 'access_denied'
+          : (timeout ? 'timeout'
+            : (serverError ? `http_${httpStatus}`
+              : (fetchError ? 'fetch_error'
+                : (httpStatus >= 200 && httpStatus < 300 ? 'invalid_content' : (httpStatus == null ? 'fetch_error' : `http_${httpStatus}`)))))));
+    return { url, path:url ? new URL(url).pathname : null, checked:true, httpStatus, status,
+      found:validation.valid, valid:validation.valid, validationReason:validation.reason,
+      linkCount:validation.linkCount, fetchError, timeout, serverError };
+  });
+  const found = normalized.find(item => item.found === true) || null;
+  const allCompleted = normalized.length > 0 && normalized.every(item => item.checked === true && !item.timeout && !item.serverError && item.status !== 'access_denied' && item.status !== 'fetch_error');
+  const result = found ? 'found' : (allCompleted ? 'missing' : 'limited');
+  return {
+    version:'geo_coverage_html_sitemap_v1',
+    authority:'cloud_run_geoSignalsV1_coverageSignals_htmlSitemap_v1',
+    sourceUrl:base || null,
+    observationComplete: !!found || allCompleted,
+    candidates:normalized,
+    checkedCount:normalized.filter(item => item.checked === true).length,
+    candidateCount:normalized.length,
+    hasHtmlSitemap:found ? true : (allCompleted ? false : null),
+    result,
+    fetchFailed:normalized.some(item => !!item.fetchError),
+    timeout:normalized.some(item => item.timeout === true),
+    serverError:normalized.some(item => item.serverError === true),
+    matchedUrl:found && found.url || null,
+    matchedPath:found && found.path || null,
+    pageLinkCandidateCount:Number(options.pageLinkCandidateCount || 0)
+  };
+}
+
+async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 1500) {
+  let origin = '';
+  try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
+  if (!origin || typeof fetch !== 'function') return buildHtmlSitemapCoverageSignalV1_('', []);
+  let linked = [];
+  try {
+    linked = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).map(a => ({ href:a.href, text:a.textContent || '', aria:a.getAttribute('aria-label') || '' }))
+      .filter(item => /(?:サイト\s*マップ|sitemap|site[-\s]?map)/i.test(`${item.href} ${item.text} ${item.aria}`)).slice(0, 5));
+  } catch (_) {}
+  const standard = HTML_SITEMAP_STANDARD_PATHS_V1_.map(path => `${origin}${path}`);
+  const linkedUrls = linked.map(item => normalizeHtmlSitemapUrlV1_(origin, item.href)).filter(Boolean);
+  const urls = Array.from(new Set(standard.concat(linkedUrls)));
+  const fetchOne = async (url) => {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      const response = await fetch(url, { method:'GET', redirect:'follow', signal:controller ? controller.signal : undefined, headers:{ Accept:'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', 'User-Agent':'geo-unified-observer-html-sitemap/1.0' } });
+      const status = response && typeof response.status === 'number' ? response.status : null;
+      const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
+      const text = response && response.ok ? String(await response.text() || '').slice(0, 500000) : '';
+      return { url, status, text, contentType };
+    } catch (error) {
+      return { url, status:null, text:'', contentType:'', errorMessage:String(error && (error.message || error) || '').slice(0, 180) };
+    } finally { if (timer) clearTimeout(timer); }
+  };
+  const observations = await Promise.all(urls.map(fetchOne));
+  return buildHtmlSitemapCoverageSignalV1_(origin, observations, { pageLinkCandidateCount:linkedUrls.length });
+}
+
+function attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, signal) {
+  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object' || !signal || typeof signal !== 'object') return;
+  geoSignalsV1.coverageSignals = geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object' ? geoSignalsV1.coverageSignals : {};
+  geoSignalsV1.coverageSignals.htmlSitemap = signal;
+  geoSignalsV1.coverage = geoSignalsV1.coverage && typeof geoSignalsV1.coverage === 'object' ? geoSignalsV1.coverage : {};
+  geoSignalsV1.coverage.htmlSitemapObservationV1 = signal;
+  geoSignalsV1.observed = geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object' ? geoSignalsV1.observed : {};
+  geoSignalsV1.observed.coverage = geoSignalsV1.observed.coverage && typeof geoSignalsV1.observed.coverage === 'object' ? geoSignalsV1.observed.coverage : {};
+  geoSignalsV1.observed.coverage.htmlSitemapObservationV1 = signal;
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
@@ -21562,6 +21686,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         retrySucceeded: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1
       });
       attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch));
+      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page));
       if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'build_geo_signals_end');
       if (signalsFirstLight) {
         const observedCore = geoSignalsV1 && geoSignalsV1.observed || {};
@@ -22138,6 +22263,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       logSfMemory('signals_only_early_before_geo_signals');
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
       attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch));
+      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page));
       logSf('SIGNALS_ONLY_EARLY_AFTER_GEO_SIGNALS', {
         hasGeoSignals: !!geoSignalsV1,
         error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -24444,6 +24570,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   logSfMemory('before_geo_signals');
   const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch, { siteMode });
   attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(urlToFetch));
+  attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(urlToFetch, page));
   logSf('AFTER_GEO_SIGNALS', {
     hasGeoSignals: !!geoSignalsV1,
     error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -25110,6 +25237,9 @@ if (require.main === module) {
 
 module.exports.__lightBudgetTestHooks = {
   buildAiPolicyTrustSignalV1_,
+  buildHtmlSitemapCoverageSignalV1_,
+  validateHumanVisibleHtmlSitemapV1_,
+  HTML_SITEMAP_STANDARD_PATHS_V1_,
   detectBreadcrumbUiFromCheerio_,
   buildGeoSignalsV1,
   attachContactDestination_,
