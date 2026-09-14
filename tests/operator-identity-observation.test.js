@@ -51,6 +51,18 @@ const tullysHtml = `
     <tr><th>名前</th><td>タリーズコーヒージャパン株式会社</td></tr>
     <tr><th>本社</th><td>〒162-0833 東京都新宿区箪笥町22番地<br>TEL(代表):03-3268-8282</td></tr>
   </table>`;
+const thinksystemUrl = 'https://thinksystem-jp.com/company/';
+const thinksystemCandidate = {
+  url: thinksystemUrl,
+  label: 'COMPANY',
+  sources: ['sitemap', 'nav', 'footer'],
+  score: 100,
+};
+const thinksystemHtml = `
+  <dl><dt>社名</dt><dd>シンクシステム株式会社</dd></dl>
+  <dl><dt>所在地</dt><dd>本社<br>〒113-0001 東京都文京区白山1-19-6 シンク白山ビル6-8階</dd></dl>
+  <dl><dt>連絡先</dt><dd>TEL 03-5615-9266 FAX 03-5615-9267</dd></dl>
+  <dl><dt>代表者</dt><dd>中山 千恵</dd></dl>`;
 
 // Case 1: the company-profile probe is independent of the normal two-page plan.
 assert.strictEqual(isHighConfidenceCompanyProfileCandidate_(asuzacCandidate), true);
@@ -112,6 +124,21 @@ assert.deepStrictEqual(
   ['タリーズコーヒージャパン株式会社', '〒162-0833 東京都新宿区箪笥町22番地', '03-3268-8282', true]
 );
 assert.deepStrictEqual(tullysInfo.evidenceLabels, ['名前', '本社', 'TEL(代表)']);
+
+// A localized company page may be linked as "COMPANY" in global navigation.
+// With XML sitemap + human-navigation corroboration, this is sufficient to
+// fetch the candidate; the visible structured fields decide positivity.
+assert.strictEqual(isHighConfidenceCompanyProfileCandidate_(thinksystemCandidate), true);
+const thinksystemInfo = extractOperatorIdentityInfoFromHtml_(thinksystemHtml, thinksystemUrl, {
+  highConfidenceCompanyProfile: true,
+  title: 'COMPANY | シンクシステム株式会社',
+  h1Texts: ['COMPANY 会社概要'],
+});
+assert.deepStrictEqual(
+  [thinksystemInfo.companyName, thinksystemInfo.address, thinksystemInfo.telephone, thinksystemInfo.hasOperatorInfo],
+  ['シンクシステム株式会社', '〒113-0001 東京都文京区白山1-19-6 シンク白山ビル6-8階', '03-5615-9266', true]
+);
+assert.deepStrictEqual(thinksystemInfo.evidenceLabels, ['社名', '所在地', '連絡先']);
 
 // Telephone recognition is restricted to a structured field label, not prose
 // that happens to contain the word "電話".

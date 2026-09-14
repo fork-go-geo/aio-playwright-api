@@ -3254,7 +3254,11 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
     ? candidate.sources.map(value => String(value || ''))
     : (candidate && candidate.source ? [String(candidate.source)] : []);
   const companyPath = /\/(?:about(?:us)?|company|corporate|profile|outline|company-info|overview)(?:\/|$|-|_)/i.test(path);
-  const companyLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介/.test(label);
+  // Corporate sites commonly use an English global-navigation label even
+  // when the destination page itself contains a Japanese company profile.
+  // A label is still only a discovery hint: the sitemap + human-navigation
+  // corroboration below remains mandatory before the extra probe is made.
+  const companyLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i.test(label);
   // XML and HTML sitemaps are both discovery corroboration.  An HTML
   // sitemap alone is not enough: it must be independently linked from a
   // human-facing navigation surface as well.
@@ -3339,7 +3343,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       if (/^電話$/i.test(text)) return '電話';
       if (/^tel(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(text)) return text;
       if (/^連絡先$/i.test(text)) return '連絡先';
-      if (kind === 'operator' && /会社名/.test(text)) return '会社名';
+      if (kind === 'operator' && /^(?:会社名|社名)$/.test(text)) return text;
       return '';
     };
     const operatorStopRe = /運営統括責任者|責任者|本社所在地|所在地|住所|連絡先|電話番号|お客様相談室|販売価格|商品代金|送料|支払方法/;
@@ -3349,7 +3353,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     const stripLeadingLabel = (value, kind) => {
       const text = normalizeSubpageJsonLdText(value);
       const labelRe = kind === 'operator'
-        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|商号)\s*[：:：]?\s*/
+        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|社名|商号)\s*[：:：]?\s*/
         : (kind === 'address'
             ? /^(?:本社所在地|本社事務所|本社|所在地|住所)\s*[：:：]?\s*/
             : /^(?:連絡先|電話番号|電話|TEL|Tel|お客様相談室)\s*[：:：]?\s*/);
@@ -3361,7 +3365,12 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       .replace(/[（）]/g, m => (m === '（' ? '(' : ')'))
       .replace(/\s+/g, '');
     const extractJapanesePhone = value => {
-      const text = normalizePhone(value);
+      // This helper is called only after an explicit structured telephone
+      // label has been accepted.  Strip a conventional value-cell prefix
+      // such as "TEL 03-..." without allowing arbitrary prose to qualify.
+      const text = normalizePhone(value)
+        .replace(/^(?:tel|電話番号|電話)[:：]?/i, '')
+        .split(/(?:fax|ファックス)[:：]?/i)[0];
       if (/[A-Za-z]/.test(text)) return '';
       const match = text.match(/(?:0120-\d{2,4}-\d{3,4}|0\d{1,4}-\d{1,4}-\d{3,4}|0\d{9,10})/);
       return match ? match[0] : '';
@@ -3440,7 +3449,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return { value: '', label: '' };
     };
 
-    const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|商号/i, 'operator');
+    const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|社名|商号/i, 'operator');
     const address = labelValueFromText(/本社所在地|本社事務所|本社|所在地|住所/i, 'address');
     const directTelephone = labelValueFromText(/電話番号|電話|TEL(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?|Tel|連絡先|お客様相談室/i, 'telephone');
     const telephone = directTelephone.value ? directTelephone : telephoneFromStructuredAddressValue();
