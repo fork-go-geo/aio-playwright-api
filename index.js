@@ -3293,6 +3293,88 @@ function isExplicitHumanNavigationCompanyProfileCandidate_(candidate) {
   return companyPath && explicitCompanyProfileLabel && sources.includes('nav') && sources.includes('footer') && !hasSitemapCorroboration;
 }
 
+// A shop/facility site is not itself a corporate site merely because it links
+// to a corporate sibling.  It may, however, establish an operator relation
+// when two independently rendered facts are present on the audited top page:
+// (1) an explicit statement that the named company operates the facility/site,
+// and (2) a same-origin, human-visible corporate-information route in both
+// navigation and footer.  This deliberately returns compact provenance only;
+// company name/address still have to come from the separately fetched profile.
+function buildShopFacilityOperatorRelationEvidence_(geoSignalsV1, roleRepresentativeCandidates) {
+  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const observed = geo.observed && typeof geo.observed === 'object' ? geo.observed : {};
+  const valueOf = item => item && typeof item === 'object' ? String(item.value || '') : '';
+  const title = normalizeSubpageJsonLdText(valueOf(observed.title));
+  const metaDescription = normalizeSubpageJsonLdText(valueOf(observed.metaDescription));
+  const rootObservationComplete = observed.title && observed.title.observed === true &&
+    observed.metaDescription && observed.metaDescription.observed === true;
+  const relationText = `${title} ${metaDescription}`;
+  // A title may name only the group while the description names the actual
+  // operating company. Prefer the most specific explicit declaration rather
+  // than accepting the first substring match.
+  const declaredOperatorMatches = Array.from(relationText.matchAll(/([一-龠々ぁ-んァ-ンA-Za-z0-9＆&・ー－]{3,80})が運営(?:する|の)/g));
+  const declaredOperator = declaredOperatorMatches
+    .map(match => normalizeSubpageJsonLdText(match[1]))
+    .sort((a, b) => b.length - a.length)[0] || '';
+  const aboutCandidates = Array.isArray(roleRepresentativeCandidates && roleRepresentativeCandidates.about)
+    ? roleRepresentativeCandidates.about
+    : [];
+  const corporateRoute = aboutCandidates.find(candidate => {
+    const url = String(candidate && candidate.url || '');
+    const sources = Array.isArray(candidate && candidate.sources) ? candidate.sources.map(String) : [];
+    const path = (() => { try { return new URL(url).pathname.toLowerCase(); } catch (_) { return url.toLowerCase(); } })();
+    // The merged discovery record can legitimately retain an unlabeled XML
+    // sitemap entry.  The exact /corporate hub, corroborated by both human
+    // navigation surfaces, is still an official relation route; the second
+    // hop below must independently carry the explicit company-profile label.
+    return /^\/corporate\/?$/i.test(path) &&
+      sources.includes('nav') && sources.includes('footer');
+  });
+  return {
+    observed: rootObservationComplete,
+    complete: rootObservationComplete,
+    relationConfirmed: rootObservationComplete && !!declaredOperator && !!corporateRoute,
+    sourceUrl: corporateRoute ? String(corporateRoute.url || '') : null,
+    declaredOperator,
+    evidenceLabels: declaredOperator && corporateRoute ? ['運営関係の明示', '企業情報への恒常導線'] : []
+  };
+}
+
+function findShopFacilityCompanyProfileFromHub_(hubPage, relation) {
+  if (!relation || relation.relationConfirmed !== true || !hubPage || hubPage.ok !== true) return null;
+  const links = Array.isArray(hubPage.internalLinks) ? hubPage.internalLinks : [];
+  const merged = new Map();
+  links.forEach(link => {
+    const url = String(link && link.href || '');
+    if (!url) return;
+    const prior = merged.get(url) || { url, label: '', sources: [] };
+    const label = normalizeSubpageJsonLdText(link && link.text || '');
+    if (label && !prior.label) prior.label = label;
+    (Array.isArray(link && link.sources) ? link.sources : []).map(String).forEach(source => {
+      if (source && !prior.sources.includes(source)) prior.sources.push(source);
+    });
+    merged.set(url, prior);
+  });
+  return Array.from(merged.values()).find(link => {
+    const url = String(link.url || '');
+    const label = normalizeSubpageJsonLdText(link.label || '');
+    const sources = link.sources;
+    const path = (() => { try { return new URL(url).pathname.toLowerCase(); } catch (_) { return url.toLowerCase(); } })();
+    // The root→corporate hub route already has independent nav+footer
+    // corroboration.  Inside that fetched first-party hub, require a labeled
+    // company-detail destination; do not infer one from its URL alone.
+    return /\/corporate\/company\/?$/i.test(path) &&
+      /会社概要|企業情報|運営会社|会社情報|会社案内|company|corporate|profile/i.test(label);
+  }) || null;
+}
+
+function isShopFacilityOperatorRelationConfirmed_(relation, operatorIdentityInfo) {
+  if (!relation || relation.relationConfirmed !== true || relation.complete !== true) return false;
+  const declared = normalizeSubpageJsonLdText(relation.declaredOperator || '').replace(/(?:株式会社|有限会社|合同会社|Inc\.?|Ltd\.?)$/i, '').trim();
+  const company = normalizeSubpageJsonLdText(operatorIdentityInfo && (operatorIdentityInfo.companyName || operatorIdentityInfo.operatorName) || '').replace(/(?:株式会社|有限会社|合同会社|Inc\.?|Ltd\.?)$/i, '').trim();
+  return declared.length >= 4 && company.length >= 4 && (company.includes(declared) || declared.includes(company));
+}
+
 function inferLegalOperatorPageType_(url, title, h1Texts) {
   const hay = [
     url,
@@ -4125,13 +4207,21 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
   const articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), finalUrl || url, extractArticleVisibleDateCandidatesFromCheerio_($));
   let internalLinkCount = 0;
   let externalLinkCount = 0;
+  const internalLinks = [];
   $('a[href]').slice(0, 1200).each((_, el) => {
     try {
       const href = $(el).attr('href') || '';
       if (!href || /^(?:mailto:|tel:|javascript:|#)/i.test(href)) return;
       const linkUrl = new URL(href, finalUrl || url);
       const baseUrl = new URL(finalUrl || url);
-      if (linkUrl.origin === baseUrl.origin) internalLinkCount += 1;
+      if (linkUrl.origin === baseUrl.origin) {
+        internalLinkCount += 1;
+        const sources = [];
+        if ($(el).closest('nav,[role="navigation"],header,[class*="nav" i],[class*="header" i]').length) sources.push('nav');
+        if ($(el).closest('footer,[role="contentinfo"],[class*="footer" i]').length) sources.push('footer');
+        const text = normalizeSubpageJsonLdText($(el).text() || $(el).attr('aria-label') || $(el).attr('title') || '');
+        if (text && internalLinks.length < 400) internalLinks.push({ href: linkUrl.toString(), text: text.slice(0, 160), sources });
+      }
       else externalLinkCount += 1;
     } catch (_) {}
   });
@@ -4168,6 +4258,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     hasMain: $('main,[role="main"]').length > 0,
     hasMainLandmark: $('main,[role="main"]').length > 0,
     internalLinkCount,
+    internalLinks,
     externalLinkCount,
     bodyTextLength,
     sampledText,
@@ -9670,8 +9761,12 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
 // a usable formal operatorIdentityInfo.
 function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdentityProbe, discovered, siteMode) {
   const mode = String(siteMode || '').toLowerCase();
-  if (mode !== 'corporate' && mode !== 'generic') return null;
+  // shop_facility is emitted only after the dedicated official-relation gate
+  // above has produced a completed profile.  Consumers still keep this mode
+  // out of Phase-D score/card applicability.
+  if (mode !== 'corporate' && mode !== 'generic' && mode !== 'shop_facility') return null;
   if (!operatorIdentityInfo || operatorIdentityInfo.hasOperatorInfo !== true) return null;
+  if (mode === 'shop_facility' && operatorIdentityInfo.sourceType !== 'shop_facility_operator_relation') return null;
   if (!operatorIdentityProbe || operatorIdentityProbe.observationComplete !== true || operatorIdentityProbe.sourceType !== 'company_profile') return null;
   let sourcePath = '';
   try { sourcePath = new URL(String(operatorIdentityInfo.sourceUrl || operatorIdentityProbe.sourceUrl || '')).pathname || ''; } catch (_) {}
@@ -9694,11 +9789,13 @@ function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdent
   };
 }
 
-function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
+function selectOperatorIdentityProbeCandidate_(candidates, siteMode, opts = {}) {
   // Start narrowly. Generic is included because legacy corporate sites can be
   // classified conservatively, as asuzac-space.jp is; other modes stay out.
   const mode = String(siteMode || '').toLowerCase();
-  if (mode !== 'corporate' && mode !== 'generic') return null;
+  const shopRelation = opts && opts.shopFacilityOperatorRelation;
+  if (mode !== 'corporate' && mode !== 'generic' && mode !== 'shop_facility') return null;
+  if (mode === 'shop_facility' && !(shopRelation && shopRelation.relationConfirmed === true && shopRelation.complete === true)) return null;
   const profilePathSpecificity = candidate => {
     const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
     const path = (() => {
@@ -9722,6 +9819,7 @@ function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
       // mode retains the established sitemap-plus-navigation probe contract,
       // so a shop/facility root cannot become an operator probe merely because
       // it links to a corporate sibling.
+      if (mode === 'shop_facility') return true;
       return mode === 'corporate' || !isExplicitHumanNavigationCompanyProfileCandidate_(candidate);
     })
     .slice()
@@ -10434,7 +10532,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateCount: discovered.totalCandidates,
       observeCount: selectedCandidates.length
     });
-    const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+    // Keep the fetched objects private to this function.  The public compact
+    // observation intentionally drops link arrays, but a shop/facility
+    // operator-relation probe may consume one explicitly-labelled detail link
+    // from its already fetched official corporate landing.
+    const rawObservations = observed.pages;
+    const observations = rawObservations.map(page => compactSubpageJsonLdObservation_(page));
     attachContactDestination_(geoSignalsV1, await resolveContactDestinationLight_(normalized.origin, observations, hasContactCandidate, {
       siteMode,
       context: opts && opts.context
@@ -10493,7 +10596,15 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
       candidates: discovered.candidates
     }));
+    const shopFacilityOperatorRelation = siteMode === 'shop_facility'
+      ? buildShopFacilityOperatorRelationEvidence_(geoSignalsV1, discovered.roleRepresentativeCandidates)
+      : null;
     const legalOperatorInfo = pickBestLegalOperatorInfo_(observations);
+    if (shopFacilityOperatorRelation) {
+      geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
+        ? geoSignalsV1.trustSignals : {};
+      geoSignalsV1.trustSignals.shopFacilityOperatorRelation = shopFacilityOperatorRelation;
+    }
     let operatorIdentityInfo = legalOperatorInfo && legalOperatorInfo.hasOperatorInfo === true
       ? normalizeOperatorIdentityInfo_(legalOperatorInfo, 'legal')
       : null;
@@ -10507,7 +10618,20 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     // This probe is intentionally outside the normal representative-page plan:
     // it never changes maxObserve=2 or displaces business/contact observation.
     if (!operatorIdentityInfo) {
-      const operatorCandidate = selectOperatorIdentityProbeCandidate_(discovered.operatorIdentityCandidates, siteMode);
+      const relationHubPage = siteMode === 'shop_facility' && shopFacilityOperatorRelation && shopFacilityOperatorRelation.sourceUrl
+        ? rawObservations.find(page => {
+            const value = String(page && (page.finalUrl || page.url) || '');
+            try { return new URL(value).pathname.replace(/\/$/, '') === new URL(shopFacilityOperatorRelation.sourceUrl).pathname.replace(/\/$/, ''); } catch (_) { return false; }
+          })
+        : null;
+      const shopProfileCandidate = siteMode === 'shop_facility'
+        ? findShopFacilityCompanyProfileFromHub_(relationHubPage, shopFacilityOperatorRelation)
+        : null;
+      const operatorCandidate = siteMode === 'shop_facility'
+        ? shopProfileCandidate
+        : selectOperatorIdentityProbeCandidate_(discovered.operatorIdentityCandidates, siteMode, {
+            shopFacilityOperatorRelation
+          });
       if (operatorCandidate) {
         operatorIdentityProbe = {
           attempted: true,
@@ -10536,6 +10660,21 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         if (normalizedOperatorIdentity) {
           operatorIdentityInfo = normalizedOperatorIdentity;
           operatorIdentityInfo.observationComplete = operatorIdentityProbe.observationComplete;
+          if (siteMode === 'shop_facility') {
+            if (isShopFacilityOperatorRelationConfirmed_(shopFacilityOperatorRelation, operatorIdentityInfo)) {
+              operatorIdentityInfo.sourceType = 'shop_facility_operator_relation';
+              operatorIdentityInfo.operatorRelation = {
+                type: 'shop_facility_official_operator_relation',
+                observed: true,
+                observationComplete: true,
+                sourceUrl: shopFacilityOperatorRelation.sourceUrl,
+                evidenceLabels: shopFacilityOperatorRelation.evidenceLabels.slice(0, 4)
+              };
+            } else {
+              operatorIdentityInfo.hasOperatorInfo = false;
+              operatorIdentityInfo.provenance = { reason: 'shop_facility_operator_relation_unconfirmed' };
+            }
+          }
         } else {
           const rawOperatorIdentity = operatorPage.operatorIdentityInfo;
           operatorIdentityInfo = {
@@ -25334,6 +25473,9 @@ module.exports.__lightBudgetTestHooks = {
   extractLegalOperatorInfoFromHtml_,
   isHighConfidenceCompanyProfileCandidate_,
   isExplicitHumanNavigationCompanyProfileCandidate_,
+  buildShopFacilityOperatorRelationEvidence_,
+  findShopFacilityCompanyProfileFromHub_,
+  isShopFacilityOperatorRelationConfirmed_,
   selectOperatorIdentityProbeCandidate_,
   normalizeOperatorIdentityInfo_,
   buildOperatorIdentityObservationV1_,
