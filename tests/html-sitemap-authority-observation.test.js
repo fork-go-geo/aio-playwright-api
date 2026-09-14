@@ -3,7 +3,7 @@
 
 const assert = require('assert');
 const hooks = require('../index.js').__lightBudgetTestHooks;
-const { buildHtmlSitemapCoverageSignalV1_, HTML_SITEMAP_STANDARD_PATHS_V1_ } = hooks;
+const { buildHtmlSitemapCoverageSignalV1_, attachHtmlSitemapCoverageSignalToGeoSignalsV1_, HTML_SITEMAP_STANDARD_PATHS_V1_ } = hooks;
 
 const origin = 'https://fixture.example';
 const urls = HTML_SITEMAP_STANDARD_PATHS_V1_.map(path => `${origin}${path}`);
@@ -68,5 +68,12 @@ assert.strictEqual(all404.result, 'missing');
 assert.strictEqual(all404.hasHtmlSitemap, false);
 assert.strictEqual(legacyGas501.result, 'limited');
 assert.strictEqual(legacyGas501.httpStatus, 501);
+
+// I: the light coverage aggregate may be frozen; attaching Cloud authority
+// must retain its existing fields and expose the signal in coverageSignals.
+const frozenGeo = { coverageSignals: Object.freeze({ checked: true, observedSubpageCount: 2 }) };
+attachHtmlSitemapCoverageSignalToGeoSignalsV1_(frozenGeo, all404);
+assert.strictEqual(frozenGeo.coverageSignals.checked, true);
+assert.strictEqual(frozenGeo.coverageSignals.htmlSitemap, all404);
 
 console.log('html-sitemap-authority-observation: PASS');

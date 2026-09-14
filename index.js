@@ -13219,8 +13219,9 @@ async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 15
 
 function attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, signal) {
   if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object' || !signal || typeof signal !== 'object') return;
-  geoSignalsV1.coverageSignals = geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object' ? geoSignalsV1.coverageSignals : {};
-  geoSignalsV1.coverageSignals.htmlSitemap = signal;
+  // buildGeoSignalsCoverageSignals_ can return a frozen aggregate. Replace it
+  // instead of mutating it so the authority signal remains in short responses.
+  geoSignalsV1.coverageSignals = Object.assign({}, geoSignalsV1.coverageSignals || {}, { htmlSitemap: signal });
   geoSignalsV1.coverage = geoSignalsV1.coverage && typeof geoSignalsV1.coverage === 'object' ? geoSignalsV1.coverage : {};
   geoSignalsV1.coverage.htmlSitemapObservationV1 = signal;
   geoSignalsV1.observed = geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object' ? geoSignalsV1.observed : {};
@@ -25243,6 +25244,7 @@ if (require.main === module) {
 module.exports.__lightBudgetTestHooks = {
   buildAiPolicyTrustSignalV1_,
   buildHtmlSitemapCoverageSignalV1_,
+  attachHtmlSitemapCoverageSignalToGeoSignalsV1_,
   validateHumanVisibleHtmlSitemapV1_,
   HTML_SITEMAP_STANDARD_PATHS_V1_,
   detectBreadcrumbUiFromCheerio_,
