@@ -3259,13 +3259,38 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
   // A label is still only a discovery hint: the sitemap + human-navigation
   // corroboration below remains mandatory before the extra probe is made.
   const companyLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i.test(label);
+  // A company profile label is stronger than a broad “about” label. It is
+  // used only for the nav+footer fallback below; sitemap corroboration keeps
+  // accepting the established, broader localized labels.
+  const explicitCompanyProfileLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|\b(?:company(?:\s+(?:profile|overview|information))?|corporate\s+profile|company\s+information|profile|overview)\b/i.test(label);
   // XML and HTML sitemaps are both discovery corroboration.  An HTML
   // sitemap alone is not enough: it must be independently linked from a
   // human-facing navigation surface as well.
   const hasSitemapCorroboration = sources.some(source => source === 'sitemap' || source === 'htmlSitemap');
   const hasHumanNavigationCorroboration = sources.some(source => source === 'nav' || source === 'footer');
-  const corroborated = sources.length >= 2 && hasSitemapCorroboration && hasHumanNavigationCorroboration;
+  const hasNavFooterCorroboration = sources.includes('nav') && sources.includes('footer');
+  const sitemapAndHumanNavigation = sources.length >= 2 && hasSitemapCorroboration && hasHumanNavigationCorroboration;
+  // An explicitly named company profile in both global navigation and footer
+  // navigation is independently human-facing corroboration. It still needs a
+  // company-profile path and label, so it does not admit message, access,
+  // contact, or recruit pages merely because of their URL.
+  const corroborated = sitemapAndHumanNavigation || (hasNavFooterCorroboration && explicitCompanyProfileLabel);
   return companyPath && companyLabel && corroborated;
+}
+
+function isExplicitHumanNavigationCompanyProfileCandidate_(candidate) {
+  const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
+  const label = normalizeSubpageJsonLdText(candidate && (candidate.label || candidate.text || candidate.ariaLabel || candidate.title) || '');
+  const path = (() => {
+    try { return new URL(url).pathname.toLowerCase(); } catch (_) { return url.toLowerCase(); }
+  })();
+  const sources = Array.isArray(candidate && candidate.sources)
+    ? candidate.sources.map(value => String(value || ''))
+    : (candidate && candidate.source ? [String(candidate.source)] : []);
+  const companyPath = /\/(?:about(?:us)?|company|corporate|profile|outline|company-info|overview)(?:\/|$|-|_)/i.test(path);
+  const explicitCompanyProfileLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|\b(?:company(?:\s+(?:profile|overview|information))?|corporate\s+profile|company\s+information|profile|overview)\b/i.test(label);
+  const hasSitemapCorroboration = sources.some(source => source === 'sitemap' || source === 'htmlSitemap');
+  return companyPath && explicitCompanyProfileLabel && sources.includes('nav') && sources.includes('footer') && !hasSitemapCorroboration;
 }
 
 function inferLegalOperatorPageType_(url, title, h1Texts) {
@@ -3286,6 +3311,9 @@ function inferSiteModeForRepresentativeObservation_(topUrl, explicitMode) {
     const path = parsed.pathname.toLowerCase();
     if (/^(store|shop)\./.test(host) || /\.(store|shop)\./.test(host)) return 'ec';
     if (/\/(?:products?|collections?|cart|checkout|item|items)(?:\/|$|-|_)/i.test(path)) return 'ec';
+    // This is only a scoped-mode inference. Candidate positivity still needs
+    // the separate explicit profile label and corroborated navigation checks.
+    if (/\/(?:corporate)(?:\/|$|-|_)/i.test(path)) return 'corporate';
   } catch (_) {}
   return mode || 'generic';
 }
@@ -3489,9 +3517,11 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     out.hasAddress = !!out.address;
     out.hasTelephone = !!out.telephone;
     // Legal notices retain their historical address + telephone contract.
-    // A general company profile additionally requires an explicit company name.
+    // A corroborated company profile normally requires name, address, and
+    // telephone. The narrowly-authorized nav+footer profile route may accept
+    // a name and address when the page does not publish a phone number.
     out.hasOperatorInfo = requireCompanyName
-      ? (out.hasCompanyName && out.hasAddress && out.hasTelephone)
+      ? (out.hasCompanyName && out.hasAddress && (out.hasTelephone || meta.allowMissingTelephone === true))
       : (out.hasAddress && out.hasTelephone);
     out.observed = out.hasOperatorName || out.hasOperatorInfo;
     out.evidenceLabels = Array.from(new Set(out.evidenceLabels.filter(Boolean))).slice(0, 10);
@@ -4023,7 +4053,8 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     ? extractOperatorIdentityInfoFromHtml_(html, finalUrl || url, {
         title,
         h1Texts,
-        highConfidenceCompanyProfile: opts.highConfidenceCompanyProfile === true
+        highConfidenceCompanyProfile: opts.highConfidenceCompanyProfile === true,
+        allowMissingTelephone: opts.allowMissingTelephone === true
       })
     : null;
   const contactSignals = pageType === 'contact'
@@ -9611,10 +9642,11 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
   const address = normalizeSubpageJsonLdText(info.address).slice(0, 160);
   const telephone = normalizeSubpageJsonLdText(info.telephone).slice(0, 60);
   const type = sourceType === 'company_profile' ? 'company_profile' : 'legal';
-  // Legal notices keep their historical acceptance contract. Company profiles
-  // must prove the named organization as well as its address and telephone.
+  // Legal notices keep their historical acceptance contract. A corroborated
+  // company profile must prove the named organization and its address. A phone
+  // number remains optional and must never be inferred from unrelated prose.
   const hasOperatorInfo = type === 'company_profile'
-    ? (!!companyName && !!address && !!telephone)
+    ? (!!companyName && !!address)
     : (!!address && !!telephone);
   return {
     observed: info.observed === true,
@@ -9630,6 +9662,35 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
     hasOperatorInfo,
     extractionMethod: String(info.extractionMethod || 'html_text'),
     evidenceLabels: Array.isArray(info.evidenceLabels) ? info.evidenceLabels.slice(0, 10) : []
+  };
+}
+
+// Cover-only producer for the Apps Script Phase D transport. Emit a completed
+// positive record only when the same successful company-profile probe produced
+// a usable formal operatorIdentityInfo.
+function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdentityProbe, discovered, siteMode) {
+  const mode = String(siteMode || '').toLowerCase();
+  if (mode !== 'corporate' && mode !== 'generic') return null;
+  if (!operatorIdentityInfo || operatorIdentityInfo.hasOperatorInfo !== true) return null;
+  if (!operatorIdentityProbe || operatorIdentityProbe.observationComplete !== true || operatorIdentityProbe.sourceType !== 'company_profile') return null;
+  let sourcePath = '';
+  try { sourcePath = new URL(String(operatorIdentityInfo.sourceUrl || operatorIdentityProbe.sourceUrl || '')).pathname || ''; } catch (_) {}
+  if (!sourcePath) return null;
+  const labels = Array.isArray(operatorIdentityInfo.evidenceLabels) ? operatorIdentityInfo.evidenceLabels : [];
+  const profileLabel = labels.find(label => /商号|社名|会社|企業|company|corporate|profile|overview/i.test(String(label || ''))) || 'company_profile';
+  const addressLabel = labels.find(label => /所在地|住所|本社|address/i.test(String(label || ''))) || 'address';
+  const candidateCount = Math.max(0, Number(discovered && discovered.totalCandidates || 0) || 0);
+  return {
+    authority: 'geoSignalsV1_operator_identity_v1', version: 1, applicability: 'applicable', signalState: 'true',
+    inputObserved: true, observationLimited: false,
+    discovery: { complete: true, candidateCount, selectedCount: 1, capped: false },
+    scopes: { required: ['company_profile'], observed: ['company_profile'], failed: [] },
+    scopeComplete: true, strongEvidenceCount: 2,
+    evidence: [
+      { type: 'label_value', role: 'company_profile', pageRole: 'about', evidenceRole: 'company_name', sourcePath, extractionMethod: 'html_text', label: String(profileLabel).slice(0, 120) },
+      { type: 'label_value', role: 'company_profile', pageRole: 'about', evidenceRole: 'address', sourcePath, extractionMethod: 'html_text', label: String(addressLabel).slice(0, 120) }
+    ],
+    conflict: false, failureReasons: [], reasonCodes: []
   };
 }
 
@@ -9655,7 +9716,14 @@ function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
     return 0;
   };
   return (Array.isArray(candidates) ? candidates : [])
-    .filter(isHighConfidenceCompanyProfileCandidate_)
+    .filter(candidate => {
+      if (!isHighConfidenceCompanyProfileCandidate_(candidate)) return false;
+      // The nav+footer-only route is a corporate-profile exception. Generic
+      // mode retains the established sitemap-plus-navigation probe contract,
+      // so a shop/facility root cannot become an operator probe merely because
+      // it links to a corporate sibling.
+      return mode === 'corporate' || !isExplicitHumanNavigationCompanyProfileCandidate_(candidate);
+    })
     .slice()
     .sort((a, b) => (profilePathSpecificity(b) - profilePathSpecificity(a)) || (Number(b && b.score || 0) - Number(a && a.score || 0)))
     [0] || null;
@@ -10455,7 +10523,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           reserveMs: lightBudget ? LIGHT_RESPONSE_CLEANUP_RESERVE_MS : undefined,
           minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
           operatorIdentitySourceType: 'company_profile',
-          highConfidenceCompanyProfile: true
+          highConfidenceCompanyProfile: true,
+          allowMissingTelephone: isExplicitHumanNavigationCompanyProfileCandidate_(operatorCandidate)
         });
         const operatorPage = operatorProbeResult && Array.isArray(operatorProbeResult.pages) ? operatorProbeResult.pages[0] : null;
         operatorIdentityProbe.observationComplete = !!(operatorPage && operatorPage.ok === true);
@@ -10514,6 +10583,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       geoSignalsV1.trustSignals.operatorIdentityInfo = operatorIdentityInfo;
       geoSignalsV1.trustSignals.operatorIdentityProbe = operatorIdentityProbe;
     }
+    const operatorIdentityObservationV1 = buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdentityProbe, discovered, siteMode);
+    if (operatorIdentityObservationV1) geoSignalsV1.operatorIdentityObservationV1 = operatorIdentityObservationV1;
     const contactSignals = pickBestContactSignals_(observations);
     if (contactSignals) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
@@ -25262,8 +25333,10 @@ module.exports.__lightBudgetTestHooks = {
   extractOperatorIdentityInfoFromHtml_,
   extractLegalOperatorInfoFromHtml_,
   isHighConfidenceCompanyProfileCandidate_,
+  isExplicitHumanNavigationCompanyProfileCandidate_,
   selectOperatorIdentityProbeCandidate_,
   normalizeOperatorIdentityInfo_,
+  buildOperatorIdentityObservationV1_,
   compactSubpageJsonLdObservation_,
   normalizeArticleVisibleDate_,
   pickArticleVisibleDate_,
