@@ -12998,6 +12998,112 @@ function buildHeadObservations_(input = {}, options = {}) {
   };
 }
 
+// Cloud Run is the observation authority for AI policy resources.  Keep this
+// contract under trustSignals rather than exposing an alternate aioCheck root.
+function buildAiPolicyTrustSignalV1_(origin, observations = {}) {
+  const base = String(origin || '').replace(/\/+$/, '');
+  const classify = (kind, url, response) => {
+    const r = response && typeof response === 'object' ? response : {};
+    const httpStatus = typeof r.status === 'number' ? r.status : null;
+    const fetchError = r.errorMessage ? String(r.errorMessage).slice(0, 180) : null;
+    const timeout = !!(fetchError && /abort|timeout|timed?\s*out/i.test(fetchError)) || httpStatus === 408 || httpStatus === 504;
+    const serverError = typeof httpStatus === 'number' && httpStatus >= 500 && httpStatus <= 599;
+    const text = String(r.text || '');
+    const isHtml = /text\/html/i.test(String(r.contentType || '')) || /^\s*(?:<!doctype\s+html|<html\b|<head\b|<body\b)/i.test(text);
+    const hasValidContent = kind === 'robots'
+      ? r.ok === true
+      : (r.ok === true && !isHtml && text.replace(/\s+/g, ' ').trim().length >= 80 && /(?:\bllms\b|\bai\b|人工知能|会社|company|service|^#{1,3}\s+\S+)/im.test(text));
+    const status = hasValidContent ? 'ok'
+      : (httpStatus === 404 || httpStatus === 410 ? 'not_found'
+        : (httpStatus === 401 || httpStatus === 403 ? 'access_denied'
+          : (timeout ? 'timeout'
+            : (serverError ? `http_${httpStatus}`
+              : (fetchError ? 'fetch_error'
+                : (r.ok === true ? 'invalid_content' : (httpStatus == null ? 'fetch_error' : `http_${httpStatus}`)))))));
+    return {
+      checked: true,
+      httpStatus,
+      status,
+      hasValidContent,
+      fetchError,
+      timeout,
+      serverError,
+      sourceUrl: url || null
+    };
+  };
+  const robots = classify('robots', base ? `${base}/robots.txt` : null, observations.robots);
+  const llmsTxt = classify('llmsTxt', base ? `${base}/llms.txt` : null, observations.llmsTxt);
+  const llmsFullTxt = classify('llmsFullTxt', base ? `${base}/llms-full.txt` : null, observations.llmsFullTxt);
+  const all = [robots, llmsTxt, llmsFullTxt];
+  const observationComplete = all.every((item) => item.checked === true && !item.fetchError && item.timeout !== true);
+  const robotsText = robots.hasValidContent && observations.robots ? String(observations.robots.text || '') : '';
+  const botTokens = ['GPTBot', 'Google-Extended', 'CCBot', 'ClaudeBot', 'PerplexityBot', 'Applebot-Extended'];
+  const robotsAiBotHintTokens = botTokens.filter((token) => new RegExp(`(^|[^A-Za-z0-9_-])${token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^A-Za-z0-9_-]|$)`, 'i').test(robotsText));
+  const robotsAiBotHints = robots.hasValidContent ? robotsAiBotHintTokens.length > 0 : null;
+  const evidenceLabels = [];
+  if (robots.hasValidContent) evidenceLabels.push('robots_txt');
+  if (llmsTxt.hasValidContent) evidenceLabels.push('llms_txt');
+  if (llmsFullTxt.hasValidContent) evidenceLabels.push('llms_full_txt');
+  return {
+    version: 'geo_trust_ai_policy_v1',
+    authority: 'cloud_run_geoSignalsV1_trustSignals_aiPolicy_v1',
+    observationComplete,
+    fetchFailed: all.some((item) => !!item.fetchError),
+    timeout: all.some((item) => item.timeout === true),
+    serverError: all.some((item) => item.serverError === true),
+    robots,
+    llmsTxt,
+    llmsFullTxt,
+    robotsAiBotHints,
+    robotsAiBotHintTokens,
+    hasAiPolicyDeclaration: llmsTxt.hasValidContent || llmsFullTxt.hasValidContent || robotsAiBotHints === true,
+    evidenceLabels,
+    sourceUrl: base || null
+  };
+}
+
+async function collectAiPolicyTrustSignalV1_(pageUrl, timeoutMs = 1500) {
+  let origin = '';
+  try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
+  if (!origin || typeof fetch !== 'function') {
+    return buildAiPolicyTrustSignalV1_('', {});
+  }
+  const fetchText = async (url) => {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        redirect: 'follow',
+        signal: controller ? controller.signal : undefined,
+        headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
+      });
+      const status = response && typeof response.status === 'number' ? response.status : null;
+      const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
+      const text = response && response.ok ? String(await response.text() || '').slice(0, 120000) : '';
+      return { ok: !!(response && response.ok), status, text, contentType };
+    } catch (e) {
+      return { ok: false, status: null, text: '', contentType: '', errorMessage: String(e && (e.message || e) || '').slice(0, 180) };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const [robots, llmsTxt, llmsFullTxt] = await Promise.all([
+    fetchText(`${origin}/robots.txt`),
+    fetchText(`${origin}/llms.txt`),
+    fetchText(`${origin}/llms-full.txt`)
+  ]);
+  return buildAiPolicyTrustSignalV1_(origin, { robots, llmsTxt, llmsFullTxt });
+}
+
+function attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, signal) {
+  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object' || !signal || typeof signal !== 'object') return;
+  geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object' ? geoSignalsV1.trustSignals : {};
+  geoSignalsV1.trustSignals.aiPolicy = signal;
+  geoSignalsV1.observed = geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object' ? geoSignalsV1.observed : {};
+  geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
@@ -18156,6 +18262,11 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           fetchText(llmsTxtUrl, 1500),
           fetchText(llmsFullTxtUrl, 1500)
         ]);
+        const aiPolicy = buildAiPolicyTrustSignalV1_(origin, {
+          robots,
+          llmsTxt: llms,
+          llmsFullTxt: llmsFull
+        });
         const robotsEvaluated = robots && robots.ok;
         const robotsText = robotsEvaluated ? String(robots.text || '') : '';
         const hintTokens = robotsEvaluated
@@ -18188,7 +18299,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           llmsFullTxtUrl,
           checkedLlmsTxtUrls: [llmsTxtUrl],
           checkedLlmsFullTxtUrls: [llmsFullTxtUrl],
-          aiPolicyEvidenceSource: evidence.length ? evidence.join('_and_') : 'not_observed'
+          aiPolicyEvidenceSource: evidence.length ? evidence.join('_and_') : 'not_observed',
+          aiPolicy
         };
       };
       await runPhase('goto', async () => {
@@ -19827,6 +19939,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           hasContactPoint: structuredTrustSummary.hasContactPoint,
           contactPointMissingFields: structuredTrustSummary.contactPointMissingFields,
           contactPointSource: structuredTrustSummary.contactPointSource,
+          aiPolicy: aioCheck && aioCheck.aiPolicy && typeof aioCheck.aiPolicy === 'object' ? aioCheck.aiPolicy : null,
           source: 'shortfast_phase_builder'
         },
         clarity: {
@@ -21448,6 +21561,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         retryAttempted: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1,
         retrySucceeded: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1
       });
+      attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch));
       if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'build_geo_signals_end');
       if (signalsFirstLight) {
         const observedCore = geoSignalsV1 && geoSignalsV1.observed || {};
@@ -22023,6 +22137,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       logSf('SIGNALS_ONLY_EARLY_BEFORE_GEO_SIGNALS');
       logSfMemory('signals_only_early_before_geo_signals');
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
+      attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch));
       logSf('SIGNALS_ONLY_EARLY_AFTER_GEO_SIGNALS', {
         hasGeoSignals: !!geoSignalsV1,
         error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -24328,6 +24443,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   logSf('BEFORE_GEO_SIGNALS');
   logSfMemory('before_geo_signals');
   const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch, { siteMode });
+  attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(urlToFetch));
   logSf('AFTER_GEO_SIGNALS', {
     hasGeoSignals: !!geoSignalsV1,
     error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -24993,6 +25109,7 @@ if (require.main === module) {
 }
 
 module.exports.__lightBudgetTestHooks = {
+  buildAiPolicyTrustSignalV1_,
   detectBreadcrumbUiFromCheerio_,
   buildGeoSignalsV1,
   attachContactDestination_,
