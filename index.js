@@ -21686,7 +21686,11 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         retrySucceeded: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1
       });
       attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch));
-      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page));
+      // attachCoverageSignalsToGeoSignalsLight_ rebuilds coverageSignals below.
+      // Retain this completed Cloud Run observation and re-attach it afterwards
+      // so both the coverage and coverageSignals authority paths survive.
+      const htmlSitemapCoverageSignal = await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page);
+      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, htmlSitemapCoverageSignal);
       if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'build_geo_signals_end');
       if (signalsFirstLight) {
         const observedCore = geoSignalsV1 && geoSignalsV1.observed || {};
@@ -21772,6 +21776,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         debugHeavySiteStartedAt,
         lightBudget: signalsFirstLight ? lightBudget : null
       });
+      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, htmlSitemapCoverageSignal);
       if (signalsFirstLight) {
         const coverageSkippedDueToBudget = !!(coverageSignals && coverageSignals.skippedDueToBudget === true);
         lightBudget.coverageTrace.skippedDueToBudget = coverageSkippedDueToBudget;
