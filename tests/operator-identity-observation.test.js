@@ -3,7 +3,10 @@ const {
   extractOperatorIdentityInfoFromHtml_,
   extractLegalOperatorInfoFromHtml_,
   isHighConfidenceCompanyProfileCandidate_,
+  collectOfficialExternalOperatorProfileCandidates_,
   selectOperatorIdentityProbeCandidate_,
+  normalizeOperatorIdentityInfo_,
+  attachOperatorIdentityProbeProvenance_,
   buildLightCoverageObservationPlan_,
 } = require('../index.js').__lightBudgetTestHooks;
 
@@ -264,5 +267,34 @@ for (const siteMode of ['shop', 'shop_facility', 'media', 'saas', 'ec']) {
 // Case 6: company-profile evidence requires a legal entity name in addition to address and phone.
 const nameless = extractOperatorIdentityInfoFromHtml_('<table><tr><th>所在地</th><td>東京都千代田区1-1</td></tr><tr><th>TEL</th><td>03-1234-5678</td></tr></table>', 'https://example.test/company/', { highConfidenceCompanyProfile: true });
 assert.strictEqual(nameless.hasOperatorInfo, false);
+
+// An external profile is eligible only through an explicit operator relation
+// on the analysed site's nav/footer. The company page itself remains subject
+// to the same labelled-field extraction contract as same-origin profiles.
+const externalOperatorCandidates = collectOfficialExternalOperatorProfileCandidates_({
+  navLinks: [
+    { href: 'https://operator.example.test/info/profile.html', text: '運営会社' },
+    { href: 'https://social.example.test/acme', text: '公式SNS' },
+  ],
+  footerLinks: []
+}, 'https://service.example.test');
+assert.strictEqual(externalOperatorCandidates.length, 1);
+assert.strictEqual(externalOperatorCandidates[0].officialExternalOperatorProfile, true);
+assert.strictEqual(selectOperatorIdentityProbeCandidate_(externalOperatorCandidates, 'corporate').url, 'https://operator.example.test/info/profile.html');
+const externalInfo = extractOperatorIdentityInfoFromHtml_(
+  '<table><tr><th>商　号</th><td>Example株式会社</td></tr><tr><th>本社所在地</th><td>〒210-0007 神奈川県川崎市川崎区駅前本町22-2<br>TEL 044（246）1951</td></tr></table>',
+  externalOperatorCandidates[0].url,
+  { highConfidenceCompanyProfile: true }
+);
+assert.strictEqual(externalInfo.hasOperatorInfo, true);
+const externalRecord = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(externalInfo, 'company_profile'), externalOperatorCandidates[0]);
+assert.strictEqual(externalRecord.authority, 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1');
+assert.strictEqual(externalRecord.provenance.relation, 'explicit_external_operator_profile_link');
+assert.strictEqual(externalRecord.provenance.relationLabel, '運営会社');
+
+// External links without the explicit operator relation never become probes.
+assert.deepStrictEqual(collectOfficialExternalOperatorProfileCandidates_({
+  navLinks: [], footerLinks: [{ href: 'https://social.example.test/acme', text: '公式SNS' }]
+}, 'https://service.example.test'), []);
 
 console.log('operator identity observation fixtures: PASS');

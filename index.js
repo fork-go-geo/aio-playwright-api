@@ -3265,7 +3265,45 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
   const hasSitemapCorroboration = sources.some(source => source === 'sitemap' || source === 'htmlSitemap');
   const hasHumanNavigationCorroboration = sources.some(source => source === 'nav' || source === 'footer');
   const corroborated = sources.length >= 2 && hasSitemapCorroboration && hasHumanNavigationCorroboration;
+  // A service site can explicitly identify a separate corporate domain as its
+  // operator.  This narrow candidate is created only from its own rendered
+  // nav/footer link with an operator relation label; arbitrary external links
+  // never reach this branch or the profile fetcher.
+  if (candidate && candidate.officialExternalOperatorProfile === true) {
+    const sourceOrigin = String(candidate.operatorRelationSourceOrigin || '');
+    let candidateOrigin = '';
+    try { candidateOrigin = new URL(url).origin; } catch (_) {}
+    const explicitOperatorRelation = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i.test(label);
+    return !!sourceOrigin && !!candidateOrigin && candidateOrigin !== sourceOrigin &&
+      explicitOperatorRelation && hasHumanNavigationCorroboration;
+  }
   return companyPath && companyLabel && corroborated;
+}
+
+// A page that has already been fetched by the coverage observer may be used
+// for positive operator identity only when its own URL/title/H1 establishes a
+// company/profile scope. This does not create a new fetch or treat a link as
+// identity evidence; the explicit, labelled fields in the page still decide
+// whether an identity record exists.
+function isObservedCompanyProfileScope_(url, title, h1Texts) {
+  const path = (() => {
+    try { return new URL(String(url || '')).pathname.toLowerCase(); }
+    catch (_) { return String(url || '').toLowerCase(); }
+  })();
+  const text = [title].concat(Array.isArray(h1Texts) ? h1Texts : [])
+    .map(value => normalizeSubpageJsonLdText(value)).join(' ').toLowerCase();
+  return /\/(?:about(?:[_-]?site)?|about-us|company|corporate|profile|outline|overview|company-profile)(?:\/|$|-|_|\.)/i.test(path) ||
+    /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i.test(text);
+}
+
+function operatorIdentityScopeKey_(url) {
+  const path = (() => {
+    try { return new URL(String(url || '')).pathname.toLowerCase(); }
+    catch (_) { return String(url || '').toLowerCase(); }
+  })();
+  const segments = path.split('/').filter(Boolean);
+  const key = segments.find(segment => /^(?:about(?:[_-]?site)?|about-us|company|corporate|profile|outline|overview|company-profile)$/i.test(segment));
+  return key || '';
 }
 
 function inferLegalOperatorPageType_(url, title, h1Texts) {
@@ -3321,26 +3359,30 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
 
     const canonicalLabel = (value, kind = '') => {
       const text = normalizeSubpageJsonLdText(value);
+      // Table headers frequently use full-width spaces for visual alignment
+      // (for example, 「商　号」).  They remain explicit labels after that
+      // presentation-only spacing is removed.
+      const compact = text.replace(/[\s　]+/g, '');
       if (!text) return '';
-      if (/事業者名/.test(text)) return '事業者名';
-      if (/販売業者/.test(text)) return '販売業者';
-      if (/運営会社/.test(text)) return '運営会社';
-      if (/^商号$/i.test(text)) return '商号';
-      if (/本社所在地/.test(text)) return '本社所在地';
-      if (/^本社事務所$/i.test(text)) return '本社事務所';
+      if (/事業者名/.test(compact)) return '事業者名';
+      if (/販売業者/.test(compact)) return '販売業者';
+      if (/運営会社/.test(compact)) return '運営会社';
+      if (/^商号$/i.test(compact)) return '商号';
+      if (/本社所在地/.test(compact)) return '本社所在地';
+      if (/^本社事務所$/i.test(compact)) return '本社事務所';
       // "本社" is a valid address field only as a complete table/dl label
       // (with an optional, equally-specific parenthetical note).  Do not
       // accept prose such as "本社へのアクセス" or "本社移転のお知らせ".
       if (/^本社(?:\s*[（(](?:所在地|事務所)[）)])?$/i.test(text)) return '本社';
-      if (/所在地/.test(text)) return '所在地';
-      if (/住所/.test(text)) return '住所';
-      if (/お客様相談室/.test(text)) return 'お客様相談室';
+      if (/所在地/.test(compact)) return '所在地';
+      if (/住所/.test(compact)) return '住所';
+      if (/お客様相談室/.test(compact)) return 'お客様相談室';
       // Telephone labels must be a complete table/dl field label.  In
       // particular, do not turn prose such as "電話受付時間" or
       // "電話番号変更のお知らせ" into a telephone field merely because it
       // contains a telephone-related word.
       if (/^電話番号(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(text)) return '電話番号';
-      if (/^電話$/i.test(text)) return '電話';
+      if (/^電話$/i.test(compact)) return '電話';
       if (/^tel(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(text)) return text;
       if (/^連絡先$/i.test(text)) return '連絡先';
       if (kind === 'operator' && /^(?:会社名|社名)$/.test(text)) return text;
@@ -3363,6 +3405,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
       .replace(/[ー‐‑‒–—−]/g, '-')
       .replace(/[（）]/g, m => (m === '（' ? '(' : ')'))
+      .replace(/\((\d{1,5})\)/g, '-$1-')
       .replace(/\s+/g, '');
     const extractJapanesePhone = value => {
       // This helper is called only after an explicit structured telephone
@@ -3414,7 +3457,8 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     const labelValueFromText = (labelRe, kind) => {
       for (const row of rows) {
         const label = canonicalLabel(row.label, kind);
-        if (label && labelRe.test(row.label) && row.value) {
+        const comparableLabel = normalizeSubpageJsonLdText(row.label).replace(/[\s　]+/g, '');
+        if (label && labelRe.test(comparableLabel) && row.value) {
           if (kind === 'telephone' && !extractJapanesePhone(row.value)) continue;
           return { value: row.value, label };
         }
@@ -3442,7 +3486,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       for (const row of rows) {
         const addressLabel = canonicalLabel(row.label, 'address');
         if (!addressLabel || !/^(?:本社所在地|本社事務所|本社|所在地|住所)$/.test(addressLabel)) continue;
-        const match = normalizeSubpageJsonLdText(row.value).match(/(?:^|\s)((?:TEL\s*(?:[（(](?:代表|お問い合わせ|連絡先)[）)])?)|電話番号|電話)\s*[：:：]\s*([^\s]+)/i);
+        const match = normalizeSubpageJsonLdText(row.value).match(/(?:^|\s)((?:TEL\s*(?:[（(](?:代表|お問い合わせ|連絡先)[）)])?)|電話番号|電話)\s*(?:[：:：]\s*)?([^\s]+)/i);
         const telephone = match ? extractJapanesePhone(match[2]) : '';
         if (telephone) return { value: telephone, label: normalizeSubpageJsonLdText(match[1]) };
       }
@@ -3493,7 +3537,12 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     out.hasOperatorInfo = requireCompanyName
       ? (out.hasCompanyName && out.hasAddress && out.hasTelephone)
       : (out.hasAddress && out.hasTelephone);
-    out.observed = out.hasOperatorName || out.hasOperatorInfo;
+    // Preserve explicit partial company-profile fields for the existing
+    // coverage-observation producer. They remain non-positive here; the
+    // later identity producer confirms only a complete, conflict-free set.
+    out.observed = sourceType === 'company_profile'
+      ? (out.hasCompanyName || out.hasAddress || out.hasTelephone)
+      : (out.hasOperatorName || out.hasOperatorInfo);
     out.evidenceLabels = Array.from(new Set(out.evidenceLabels.filter(Boolean))).slice(0, 10);
     return out;
   } catch (_) {
@@ -4019,13 +4068,22 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
   const legalOperatorInfo = legalPageType === 'legal'
     ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
     : null;
-  const operatorIdentityInfo = opts && opts.operatorIdentitySourceType === 'company_profile'
+  const observedCompanyProfileScope = (opts && opts.operatorIdentitySourceType === 'company_profile') ||
+    isObservedCompanyProfileScope_(finalUrl || url, title, h1Texts);
+  const operatorIdentityInfo = observedCompanyProfileScope
     ? extractOperatorIdentityInfoFromHtml_(html, finalUrl || url, {
         title,
         h1Texts,
-        highConfidenceCompanyProfile: opts.highConfidenceCompanyProfile === true
+        // The request has already been selected and fetched by a trusted
+        // coverage scope. The extractor still requires explicit labelled
+        // company/address/telephone fields before it becomes positive.
+        highConfidenceCompanyProfile: true
       })
     : null;
+  if (operatorIdentityInfo && typeof operatorIdentityInfo === 'object') {
+    operatorIdentityInfo.scope = 'company_profile_page';
+    operatorIdentityInfo.scopeKey = operatorIdentityScopeKey_(finalUrl || url) || null;
+  }
   const contactSignals = pageType === 'contact'
     ? extractContactSignalsFromHtml_(html, finalUrl || url)
     : null;
@@ -5071,7 +5129,11 @@ function isSubpageHtmlLightTlsSslFailure_(page) {
 
 function normalizeDiscoverSubpageUrl(rawUrl, origin, opts = {}) {
   let parsed = null;
-  try { parsed = new URL(String(rawUrl || ''), origin); } catch (_) { return null; }
+  try {
+    parsed = origin
+      ? new URL(String(rawUrl || ''), origin)
+      : new URL(String(rawUrl || ''));
+  } catch (_) { return null; }
   if (!/^https?:$/.test(parsed.protocol)) return null;
   if (origin && parsed.origin !== origin) return null;
   parsed.hash = '';
@@ -5181,6 +5243,45 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   map.set(key, item);
   if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
   return true;
+}
+
+// Keep external operator candidates out of the ordinary coverage crawl. They
+// may be observed only when the analysed site itself labels a nav/footer link
+// as its operating company (or equivalent). This deliberately reuses the
+// rendered navigation link collection and the existing profile-probe gate.
+function collectOfficialExternalOperatorProfileCandidates_(links, origin) {
+  const out = [];
+  const seen = new Set();
+  const sourceOrigin = String(origin || '');
+  const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
+  const add = (raw, source) => {
+    if (out.length >= 2 || !raw || !sourceOrigin) return;
+    const label = normalizeSubpageJsonLdText([raw.text, raw.ariaLabel, raw.title].filter(Boolean).join(' '));
+    if (!relationRe.test(label)) return;
+    const url = normalizeDiscoverSubpageUrl(raw.href || raw.url || '', '', { allowCategory: false });
+    if (!url) return;
+    let candidateOrigin = '';
+    try { candidateOrigin = new URL(url).origin; } catch (_) { return; }
+    if (!candidateOrigin || candidateOrigin === sourceOrigin) return;
+    const key = discoverSubpageCandidateKey(url);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      url,
+      label: label.slice(0, 120),
+      source,
+      sources: [source],
+      score: source === 'nav' ? 100 : 90,
+      reason: 'explicit_operator_relation_from_rendered_navigation',
+      officialExternalOperatorProfile: true,
+      operatorRelationLabel: label.slice(0, 120),
+      operatorRelationSource: source,
+      operatorRelationSourceOrigin: sourceOrigin
+    });
+  };
+  (Array.isArray(links && links.navLinks) ? links.navLinks : []).forEach(link => add(link, 'nav'));
+  (Array.isArray(links && links.footerLinks) ? links.footerLinks : []).forEach(link => add(link, 'footer'));
+  return out;
 }
 
 function addDiscoverArticleCandidatesFromLinks_(links, origin, candidateMap, sourceSummary) {
@@ -5841,10 +5942,11 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
       logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
       if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
+      return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin);
     } catch (e) {
       errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
     }
-    return;
+    return [];
   }
   let browser = null;
   let context = null;
@@ -5910,6 +6012,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
     logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
     if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
+    return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin);
   } catch (e) {
     errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
   } finally {
@@ -5917,6 +6020,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     try { if (context) await context.close(); } catch (_) {}
     try { if (browser) await browser.close(); } catch (_) {}
   }
+  return [];
 }
 
 function normalizeDiscoverTopUrl(rawTopUrl) {
@@ -5938,7 +6042,7 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
   const errors = [];
   const candidateMap = new Map();
   await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
-  await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts);
+  const officialExternalOperatorProfileCandidates = await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts);
   const allCandidates = Array.from(candidateMap.values())
     .map(item => ({
       url: item.url,
@@ -5951,6 +6055,7 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
   const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
   const operatorIdentityCandidates = allCandidates
+    .concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : [])
     .filter(isHighConfidenceCompanyProfileCandidate_)
     .slice(0, 5);
   emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates);
@@ -6743,6 +6848,23 @@ function compactSubpageJsonLdObservation_(page) {
       hasOperatorInfo: page.legalOperatorInfo.hasOperatorInfo === true,
       extractionMethod: String(page.legalOperatorInfo.extractionMethod || 'html_text').slice(0, 80),
       evidenceLabels: Array.isArray(page.legalOperatorInfo.evidenceLabels) ? page.legalOperatorInfo.evidenceLabels.slice(0, 10) : []
+    } : null,
+    operatorIdentityInfo: page && page.operatorIdentityInfo && page.operatorIdentityInfo.observed === true ? {
+      observed: true,
+      pageType: 'company_profile',
+      sourceType: 'company_profile',
+      sourceUrl: String(page.operatorIdentityInfo.sourceUrl || page.finalUrl || page.url || ''),
+      companyName: normalizeSubpageJsonLdText(page.operatorIdentityInfo.companyName).slice(0, 120),
+      address: normalizeSubpageJsonLdText(page.operatorIdentityInfo.address).slice(0, 160),
+      telephone: normalizeSubpageJsonLdText(page.operatorIdentityInfo.telephone).slice(0, 60),
+      hasCompanyName: page.operatorIdentityInfo.hasCompanyName === true,
+      hasAddress: page.operatorIdentityInfo.hasAddress === true,
+      hasTelephone: page.operatorIdentityInfo.hasTelephone === true,
+      hasOperatorInfo: page.operatorIdentityInfo.hasOperatorInfo === true,
+      extractionMethod: String(page.operatorIdentityInfo.extractionMethod || 'html_text').slice(0, 80),
+      evidenceLabels: Array.isArray(page.operatorIdentityInfo.evidenceLabels) ? page.operatorIdentityInfo.evidenceLabels.slice(0, 10) : [],
+      scope: page.operatorIdentityInfo.scope === 'company_profile_page' ? 'company_profile_page' : null,
+      scopeKey: normalizeSubpageJsonLdText(page.operatorIdentityInfo.scopeKey).slice(0, 80) || null
     } : null,
     observationMethod: page && page.observationMethod
       ? String(page.observationMethod).slice(0, 80)
@@ -9629,7 +9751,97 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
     hasTelephone: !!telephone,
     hasOperatorInfo,
     extractionMethod: String(info.extractionMethod || 'html_text'),
-    evidenceLabels: Array.isArray(info.evidenceLabels) ? info.evidenceLabels.slice(0, 10) : []
+    evidenceLabels: Array.isArray(info.evidenceLabels) ? info.evidenceLabels.slice(0, 10) : [],
+    authority: String(info.authority || 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1'),
+    provenance: info.provenance && typeof info.provenance === 'object' ? info.provenance : null
+  };
+}
+
+function attachOperatorIdentityProbeProvenance_(identity, candidate) {
+  if (!identity || typeof identity !== 'object') return identity;
+  const external = candidate && candidate.officialExternalOperatorProfile === true;
+  const sourceUrl = String(candidate && candidate.url || identity.sourceUrl || '');
+  const provenance = {
+    source: 'bounded_company_profile_probe',
+    scope: 'company_profile_page',
+    candidateSourceUrl: sourceUrl,
+    candidateSource: String(candidate && candidate.operatorRelationSource || candidate && candidate.source || ''),
+    relationLabel: String(candidate && candidate.operatorRelationLabel || candidate && candidate.label || ''),
+    relationSourceOrigin: String(candidate && candidate.operatorRelationSourceOrigin || ''),
+    relation: external ? 'explicit_external_operator_profile_link' : 'same_origin_company_profile_candidate'
+  };
+  identity.authority = 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1';
+  identity.provenance = provenance;
+  return identity;
+}
+
+// Reuse only already-observed company-profile pages. Values may be distributed
+// across detail pages, but they must stay in one explicit profile scope and
+// every populated field must agree. Links, raw contact booleans, external
+// pages, and free-form body text never enter this producer.
+function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
+  const candidates = (Array.isArray(pages) ? pages : [])
+    .map(page => page && page.operatorIdentityInfo)
+    .filter(info => info && info.observed === true && info.sourceType === 'company_profile' && info.scope === 'company_profile_page');
+  if (!candidates.length) return { record: null, reason: 'no_observed_company_profile' };
+
+  const norm = value => normalizeSubpageJsonLdText(value).toLowerCase();
+  const uniqueValues = field => Array.from(new Set(candidates
+    .map(info => ({ value: normalizeSubpageJsonLdText(info[field]), normalized: norm(info[field]), sourceUrl: String(info.sourceUrl || '') }))
+    .filter(item => !!item.value)
+    .map(item => item.normalized)));
+  const displayValue = (field, normalized) => {
+    const found = candidates.find(info => norm(info[field]) === normalized);
+    return found ? normalizeSubpageJsonLdText(found[field]) : '';
+  };
+  const scopeKeys = Array.from(new Set(candidates.map(info => String(info.scopeKey || '').trim()).filter(Boolean)));
+  if (scopeKeys.length !== 1) return { record: null, reason: 'company_profile_scope_conflict' };
+
+  const names = uniqueValues('companyName');
+  const addresses = uniqueValues('address');
+  const phones = uniqueValues('telephone');
+  if (names.length > 1 || addresses.length > 1 || phones.length > 1) {
+    return { record: null, reason: 'company_profile_field_conflict' };
+  }
+  if (names.length !== 1 || addresses.length !== 1 || phones.length !== 1) {
+    return { record: null, reason: 'company_profile_required_fields_missing' };
+  }
+
+  const companyName = displayValue('companyName', names[0]);
+  const address = displayValue('address', addresses[0]);
+  const telephone = displayValue('telephone', phones[0]);
+  const sourceUrls = Array.from(new Set(candidates.map(info => String(info.sourceUrl || '')).filter(Boolean))).slice(0, 5);
+  const fieldSource = field => {
+    const found = candidates.find(info => !!normalizeSubpageJsonLdText(info[field]));
+    return found ? String(found.sourceUrl || '') : '';
+  };
+  return {
+    record: {
+      observed: true,
+      observationComplete: true,
+      sourceType: 'company_profile',
+      sourceUrl: sourceUrls[0] || '',
+      companyName,
+      address,
+      telephone,
+      hasCompanyName: true,
+      hasAddress: true,
+      hasTelephone: true,
+      hasOperatorInfo: true,
+      extractionMethod: 'observed_company_profile_fields',
+      evidenceLabels: ['company_profile_scope', 'explicit_company_name', 'explicit_address', 'explicit_telephone'],
+      authority: 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1',
+      provenance: {
+        source: 'existing_coverage_observations',
+        scope: 'company_profile_page',
+        scopeKey: scopeKeys[0],
+        sourceUrls,
+        companyNameSourceUrl: fieldSource('companyName'),
+        addressSourceUrl: fieldSource('address'),
+        telephoneSourceUrl: fieldSource('telephone')
+      }
+    },
+    reason: 'observed_company_profile_complete'
   };
 }
 
@@ -10426,19 +10638,24 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidates: discovered.candidates
     }));
     const legalOperatorInfo = pickBestLegalOperatorInfo_(observations);
+    const observedCompanyProfileIdentity = buildOperatorIdentityInfoFromObservedCompanyProfiles_(observations);
     let operatorIdentityInfo = legalOperatorInfo && legalOperatorInfo.hasOperatorInfo === true
       ? normalizeOperatorIdentityInfo_(legalOperatorInfo, 'legal')
-      : null;
+      : (observedCompanyProfileIdentity.record || null);
     let operatorIdentityProbe = {
       attempted: false,
       observationComplete: false,
       sourceUrl: null,
       sourceType: null,
-      reason: operatorIdentityInfo ? 'existing_legal_operator_identity' : 'no_high_confidence_company_profile_candidate'
+      reason: operatorIdentityInfo
+        ? (legalOperatorInfo && legalOperatorInfo.hasOperatorInfo === true
+          ? 'existing_legal_operator_identity'
+          : observedCompanyProfileIdentity.reason)
+        : observedCompanyProfileIdentity.reason
     };
     // This probe is intentionally outside the normal representative-page plan:
     // it never changes maxObserve=2 or displaces business/contact observation.
-    if (!operatorIdentityInfo) {
+    if (!operatorIdentityInfo && observedCompanyProfileIdentity.reason.indexOf('conflict') < 0) {
       const operatorCandidate = selectOperatorIdentityProbeCandidate_(discovered.operatorIdentityCandidates, siteMode);
       if (operatorCandidate) {
         operatorIdentityProbe = {
@@ -10465,7 +10682,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       if (operatorPage && operatorPage.operatorIdentityInfo) {
         const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(operatorPage.operatorIdentityInfo, 'company_profile');
         if (normalizedOperatorIdentity) {
-          operatorIdentityInfo = normalizedOperatorIdentity;
+          operatorIdentityInfo = attachOperatorIdentityProbeProvenance_(normalizedOperatorIdentity, operatorCandidate);
           operatorIdentityInfo.observationComplete = operatorIdentityProbe.observationComplete;
         } else {
           const rawOperatorIdentity = operatorPage.operatorIdentityInfo;
@@ -13229,6 +13446,210 @@ function attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, signal) {
   geoSignalsV1.observed.coverage.htmlSitemapObservationV1 = signal;
 }
 
+// A frameset/iframe entry page is only an envelope.  Observe a bounded set of
+// already-loaded child Frames and make one selected document the entry page's
+// content scope.  This deliberately does not infer content from a src string:
+// completion is granted only after a rendered child-document evaluation.
+const FRAME_CONTENT_OBSERVATION_MAX_DEPTH_V1_ = 2;
+const FRAME_CONTENT_OBSERVATION_MAX_CANDIDATES_V1_ = 4;
+
+function normalizeFrameContentUrlV1_(value, baseUrl) {
+  try {
+    const normalized = new URL(String(value || ''), String(baseUrl || '')).toString();
+    return /^https?:\/\//i.test(normalized) ? normalized : null;
+  } catch (_) { return null; }
+}
+
+function frameDepthFromMainV1_(frame, mainFrame) {
+  let depth = 0;
+  let cursor = frame;
+  const seen = new Set();
+  while (cursor && cursor !== mainFrame && !seen.has(cursor) && depth <= 20) {
+    seen.add(cursor);
+    cursor = typeof cursor.parentFrame === 'function' ? cursor.parentFrame() : null;
+    depth += 1;
+  }
+  return cursor === mainFrame ? depth : null;
+}
+
+// A navigated Frame can expose an HTML error document even when Playwright's
+// evaluate() succeeds.  Such a document is not evidence about the requested
+// child content and must never satisfy the completion authority.
+function isUsableFrameContentObservationV1_(signals) {
+  const src = signals && typeof signals === 'object' ? signals : {};
+  const title = String(src.title || '').replace(/\s+/g, ' ').trim();
+  const body = String(src.bodyTextSample || '').replace(/\s+/g, ' ').trim();
+  const h1 = Array.isArray(src.headings && src.headings.h1) ? src.headings.h1.join(' ') : '';
+  const errorDocument = /^(?:\d{3}\s+)?(?:error|access denied|request blocked|forbidden|not found)/i.test(title) ||
+    /\b(?:403|404|429|500|502|503)\s+(?:error|forbidden|not found|bad gateway|service unavailable)\b/i.test(`${title} ${h1}`) ||
+    /(?:request could not be satisfied|generated by cloudfront|access denied|request blocked)/i.test(body);
+  if (errorDocument) return false;
+  return Number(src.htmlLength || 0) > 0 &&
+    (Number(src.bodyTextLength || 0) > 0 || Number(src.links && src.links.total || 0) > 0 || Number(src.structuredData && src.structuredData.rawCount || 0) > 0);
+}
+
+async function collectFrameContentObservationV1_(page, entryUrl) {
+  const result = {
+    version: 'frame_content_observation_v1',
+    authority: 'parent_html_only',
+    frameContentObserved: false,
+    contentScopeComplete: false,
+    state: 'unobserved',
+    entryUrl: normalizeFrameContentUrlV1_(entryUrl, entryUrl) || String(entryUrl || ''),
+    selectedFrameUrl: null,
+    candidates: [],
+    provenance: { parent: { url: String(entryUrl || '') }, frame: null, merged: false },
+    signals: null,
+    error: null
+  };
+  try {
+    const mainFrame = page && typeof page.mainFrame === 'function' ? page.mainFrame() : null;
+    // Do not treat an ordinary page's embedded map/video/widget as its primary
+    // content.  A frame becomes an entry-content candidate only for a classic
+    // frameset or for a sparse shell with no main content of its own.
+    const parentShell = mainFrame && typeof mainFrame.evaluate === 'function'
+      ? await mainFrame.evaluate(() => {
+          const bodyText = String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim();
+          const frameCount = document.querySelectorAll('frame[src],iframe[src]').length;
+          const hasFrameset = !!document.querySelector('frameset');
+          const hasMain = !!document.querySelector('main,[role="main"]');
+          return { hasFrameset, frameCount, hasMain, bodyTextLength: bodyText.length };
+        }).catch(() => null)
+      : null;
+    result.parentFrameShell = parentShell;
+    const isEntryContentShell = !!(parentShell && parentShell.frameCount > 0 &&
+      (parentShell.hasFrameset === true || (parentShell.hasMain !== true && Number(parentShell.bodyTextLength || 0) < 300)));
+    if (!isEntryContentShell) return result;
+    const allFrames = page && typeof page.frames === 'function' ? page.frames() : [];
+    const seenUrls = new Set();
+    const candidates = [];
+    for (const frame of (Array.isArray(allFrames) ? allFrames : [])) {
+      if (!frame || frame === mainFrame) continue;
+      const depth = frameDepthFromMainV1_(frame, mainFrame);
+      if (depth == null || depth > FRAME_CONTENT_OBSERVATION_MAX_DEPTH_V1_) continue;
+      const finalUrl = normalizeFrameContentUrlV1_(typeof frame.url === 'function' ? frame.url() : '', entryUrl);
+      if (!finalUrl || seenUrls.has(finalUrl)) continue;
+      seenUrls.add(finalUrl);
+      candidates.push({ frame, depth, finalUrl });
+      if (candidates.length >= FRAME_CONTENT_OBSERVATION_MAX_CANDIDATES_V1_) break;
+    }
+    result.candidates = candidates.map(item => ({ url: item.finalUrl, depth: item.depth, status: 'candidate' }));
+    if (!candidates.length) return result;
+    const extract = async (frame) => frame.evaluate(() => {
+      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const uniq = values => Array.from(new Set((values || []).filter(Boolean)));
+      const limit = (values, max) => uniq(values).slice(0, max);
+      const links = Array.from(document.querySelectorAll('a[href]')).map(a => ({
+        text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+        href: (() => { try { return new URL(a.getAttribute('href') || '', location.href).toString(); } catch (_) { return ''; } })(),
+        inNav: !!a.closest('nav,[role="navigation"],header,footer'),
+        inFooter: !!a.closest('footer')
+      })).filter(item => item.href);
+      const haystack = links.map(item => `${item.text} ${item.href}`).join(' ');
+      const has = re => re.test(haystack);
+      const types = [], sameAs = [];
+      const walk = (node, depth = 0) => {
+        if (!node || depth > 8) return;
+        if (Array.isArray(node)) return node.forEach(item => walk(item, depth + 1));
+        if (typeof node !== 'object') return;
+        const type = node['@type'];
+        (Array.isArray(type) ? type : [type]).forEach(value => { if (value) types.push(clean(value)); });
+        const values = Array.isArray(node.sameAs) ? node.sameAs : (node.sameAs ? [node.sameAs] : []);
+        values.forEach(value => { if (/^https?:\/\//i.test(clean(value))) sameAs.push(clean(value)); });
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach(item => walk(item, depth + 1));
+      };
+      let jsonLdCount = 0, parseableCount = 0, parseErrorsCount = 0;
+      Array.from(document.querySelectorAll('script[type*="ld+json" i]')).forEach(script => {
+        const text = clean(script.textContent || '');
+        if (!text) return;
+        jsonLdCount += 1;
+        try { walk(JSON.parse(text)); parseableCount += 1; } catch (_) { parseErrorsCount += 1; }
+      });
+      const typeSet = new Set(types.map(type => type.toLowerCase()));
+      const images = Array.from(document.querySelectorAll('img'));
+      const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+      return {
+        title: clean(document.title), bodyTextLength: bodyText.length, bodyTextSample: bodyText.slice(0, 1000),
+        htmlLength: String(document.documentElement && document.documentElement.outerHTML || '').length,
+        headings: { h1: limit(Array.from(document.querySelectorAll('h1')).map(el => clean(el.innerText || el.textContent)), 10), h2: limit(Array.from(document.querySelectorAll('h2')).map(el => clean(el.innerText || el.textContent)), 20), h3: limit(Array.from(document.querySelectorAll('h3')).map(el => clean(el.innerText || el.textContent)), 20) },
+        semantic: { hasHeaderElement: !!document.querySelector('header'), hasNavElement: !!document.querySelector('nav,[role="navigation"]'), hasFooterElement: !!document.querySelector('footer'), hasMainElement: !!document.querySelector('main,[role="main"]') },
+        links: { total: links.length, navTextsSample: limit(links.filter(item => item.inNav).map(item => item.text), 50), internalLinksSample: links.slice(0, 100), hasCompanyLikeLink: has(/会社概要|企業情報|about|company|corporate/i), hasServiceLikeLink: has(/サービス|製品|product|service/i), hasContactLikeLink: has(/お問い合わせ|問合せ|contact|inquiry/i), hasPrivacyLikeLink: has(/個人情報保護方針|プライバシー|privacy/i), hasSitemapLikeLink: has(/サイトマップ|sitemap/i), footerTextsSample: limit(links.filter(item => item.inFooter).map(item => item.text), 30) },
+        images: { altTotal: images.length, altMissingCount: images.filter(img => !clean(img.getAttribute('alt'))).length },
+        structuredData: { types: limit(types, 50), rawCount: jsonLdCount, parseableCount, parseErrorsCount, hasJsonLd: jsonLdCount > 0, hasWebsite: typeSet.has('website'), hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'), hasBreadcrumbList: typeSet.has('breadcrumblist'), sameAsCount: limit(sameAs, 20).length, sameAsValuesSample: limit(sameAs, 8) },
+        trust: { hasPrivacyPolicyLink: has(/個人情報保護方針|プライバシー|privacy/i), hasContactLink: has(/お問い合わせ|問合せ|contact|inquiry/i), hasCompanyLink: has(/会社概要|企業情報|about|company|corporate/i), hasAddress: /(?:都|道|府|県).{0,20}(?:市|区|町|村)|〒\s*\d{3}/.test(bodyText), hasPhone: /(?:\d{2,4}[-−]\d{2,4}[-−]\d{3,4}|tel[:：])/i.test(bodyText) },
+        candidates: { sitemap: has(/サイトマップ|sitemap/i), breadcrumb: !!document.querySelector('[aria-label*="breadcrumb" i],.breadcrumb,[class*="breadcrumb" i]'), faq: has(/よくある質問|faq/i) }
+      };
+    });
+    let selected = null;
+    for (const candidate of candidates) {
+      try {
+        const signals = await extract(candidate.frame);
+        if (!isUsableFrameContentObservationV1_(signals)) {
+          candidate.error = 'frame_content_blocked_or_error_document';
+          continue;
+        }
+        candidate.signals = signals;
+        candidate.score = Number(signals.bodyTextLength || 0) + Number(signals.links && signals.links.total || 0) * 20;
+        if (!selected || candidate.score > selected.score) selected = candidate;
+      } catch (error) {
+        candidate.error = String(error && (error.message || error) || 'frame_evaluate_failed').slice(0, 160);
+      }
+    }
+    result.candidates = candidates.map(item => ({ url: item.finalUrl, depth: item.depth, status: item.signals ? 'observed' : 'failed', error: item.error || null }));
+    if (!selected || !selected.signals) { result.error = 'no_frame_content_observed'; return result; }
+    result.authority = 'cloud_run_frame_content_v1';
+    result.frameContentObserved = true;
+    result.contentScopeComplete = true;
+    result.state = 'complete';
+    result.selectedFrameUrl = selected.finalUrl;
+    result.signals = selected.signals;
+    result.provenance.frame = { url: selected.finalUrl, depth: selected.depth, source: 'playwright_rendered_frame' };
+    result.provenance.merged = true;
+    return result;
+  } catch (error) {
+    result.error = String(error && (error.message || error) || 'frame_observation_failed').slice(0, 180);
+    return result;
+  }
+}
+
+function mergeFrameContentObservationIntoGeoSignalsV1_(geoSignalsV1, frameObservation) {
+  if (!geoSignalsV1 || !frameObservation || frameObservation.contentScopeComplete !== true || !frameObservation.signals) return;
+  const s = frameObservation.signals;
+  const structured = s.structuredData || {};
+  const semantic = s.semantic || {};
+  const headings = s.headings || {};
+  const links = s.links || {};
+  const trust = s.trust || {};
+  const observed = geoSignalsV1.observed = geoSignalsV1.observed || {};
+  const structuredData = Object.assign({}, geoSignalsV1.structuredData || {}, structured, {
+    source: 'frame_content_rendered_dom', observationScope: 'frame_content_rendered_dom', observationLimited: false, renderedDomObserved: true
+  });
+  geoSignalsV1.structuredData = structuredData;
+  geoSignalsV1.structuredDataQualityV1 = Object.assign({}, geoSignalsV1.structuredDataQualityV1 || {}, { frameContentObserved: true, observationScope: 'frame_content_rendered_dom' });
+  observed.structuredData = structuredData;
+  geoSignalsV1.headings = Object.assign({}, geoSignalsV1.headings || {}, { h1Count: (headings.h1 || []).length, h2Count: (headings.h2 || []).length, h3Count: (headings.h3 || []).length, hasH1: (headings.h1 || []).length > 0, h1Texts: headings.h1 || [], headingTexts: [].concat(headings.h1 || [], headings.h2 || [], headings.h3 || []), source: 'frame_content_rendered_dom', h1Source: 'frame_content_rendered_dom', headingObservationLimited: false });
+  observed.h1 = { values: headings.h1 || [], count: (headings.h1 || []).length, observed: true, source: 'frame_content_rendered_dom', confidence: 'high' };
+  observed.headings = Object.assign({}, geoSignalsV1.headings);
+  observed.links = Object.assign({}, observed.links || {}, links, { source: 'frame_content_rendered_dom', observed: true, confidence: 'high' });
+  geoSignalsV1.coverage = Object.assign({}, geoSignalsV1.coverage || {}, { semanticElements: Object.assign({}, geoSignalsV1.coverage && geoSignalsV1.coverage.semanticElements || {}, semantic, { source: 'frame_content_rendered_dom' }), hasFaqLink: links.hasSitemapLikeLink === true ? geoSignalsV1.coverage && geoSignalsV1.coverage.hasFaqLink : geoSignalsV1.coverage && geoSignalsV1.coverage.hasFaqLink, hasBreadcrumbUi: s.candidates && s.candidates.breadcrumb === true, source: 'frame_content_rendered_dom' });
+  geoSignalsV1.trustSignals = Object.assign({}, geoSignalsV1.trustSignals || {}, trust, { source: 'frame_content_rendered_dom' });
+  observed.trustSignals = geoSignalsV1.trustSignals;
+  observed.coverage = geoSignalsV1.coverage;
+  geoSignalsV1.multimodalSignals = Object.assign({}, geoSignalsV1.multimodalSignals || {}, {
+    image: Object.assign({}, geoSignalsV1.multimodalSignals && geoSignalsV1.multimodalSignals.image || {}, s.images || {}, { source: 'frame_content_rendered_dom' })
+  });
+  geoSignalsV1.altTotal = Number(s.images && s.images.altTotal || 0);
+  geoSignalsV1.altMissing = Number(s.images && s.images.altMissingCount || 0);
+  geoSignalsV1.bodyTextLength = Number(s.bodyTextLength || 0);
+  geoSignalsV1.mainTextLength = Number(s.bodyTextLength || 0);
+  observed.multimodalSignals = geoSignalsV1.multimodalSignals;
+  observed.body = { textLength: Number(s.bodyTextLength || 0), sample: String(s.bodyTextSample || ''), observed: true, source: 'frame_content_rendered_dom', confidence: 'high' };
+  geoSignalsV1.frameContentObservationV1 = frameObservation;
+  geoSignalsV1.coverageFrameObservationV1 = frameObservation;
+  observed.frameContentObservationV1 = frameObservation;
+  observed.coverageFrameObservationV1 = frameObservation;
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
@@ -15400,6 +15821,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         })
       }
     };
+    // Keep parent and selected-child provenance separate, but make the child
+    // the authoritative content scope only after its rendered observation has
+    // completed.  Failed/timeout/partial child reads leave the existing
+    // parent-only UNKNOWN contract intact.
+    const frameContentObservationV1 = await collectFrameContentObservationV1_(page, observed && observed.finalUrl || url);
+    geoSignalsV1.frameContentObservationV1 = frameContentObservationV1;
+    geoSignalsV1.coverageFrameObservationV1 = frameContentObservationV1;
+    geoSignalsV1.observed.frameContentObservationV1 = frameContentObservationV1;
+    geoSignalsV1.observed.coverageFrameObservationV1 = frameContentObservationV1;
+    mergeFrameContentObservationIntoGeoSignalsV1_(geoSignalsV1, frameContentObservationV1);
     geoSignalsV1.renderedDomObservationV1 = buildRenderedDomObservationV1_(geoSignalsV1, {
       navigationCompleted: opts.navigationCompleted === true,
       staticFallback: opts.staticFallback === true,
@@ -25249,6 +25680,13 @@ module.exports.__lightBudgetTestHooks = {
   HTML_SITEMAP_STANDARD_PATHS_V1_,
   detectBreadcrumbUiFromCheerio_,
   buildGeoSignalsV1,
+  normalizeFrameContentUrlV1_,
+  frameDepthFromMainV1_,
+  isUsableFrameContentObservationV1_,
+  collectFrameContentObservationV1_,
+  mergeFrameContentObservationIntoGeoSignalsV1_,
+  FRAME_CONTENT_OBSERVATION_MAX_DEPTH_V1_,
+  FRAME_CONTENT_OBSERVATION_MAX_CANDIDATES_V1_,
   attachContactDestination_,
   buildHeadObservations_,
   extractTopPageStaticSignalsFromHtml_,
@@ -25261,9 +25699,14 @@ module.exports.__lightBudgetTestHooks = {
   parseSubpageJsonLdLightHtml,
   extractOperatorIdentityInfoFromHtml_,
   extractLegalOperatorInfoFromHtml_,
+  isObservedCompanyProfileScope_,
+  operatorIdentityScopeKey_,
+  buildOperatorIdentityInfoFromObservedCompanyProfiles_,
   isHighConfidenceCompanyProfileCandidate_,
+  collectOfficialExternalOperatorProfileCandidates_,
   selectOperatorIdentityProbeCandidate_,
   normalizeOperatorIdentityInfo_,
+  attachOperatorIdentityProbeProvenance_,
   compactSubpageJsonLdObservation_,
   normalizeArticleVisibleDate_,
   pickArticleVisibleDate_,
