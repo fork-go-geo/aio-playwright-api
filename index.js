@@ -3277,7 +3277,47 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
     return !!sourceOrigin && !!candidateOrigin && candidateOrigin !== sourceOrigin &&
       explicitOperatorRelation && hasHumanNavigationCorroboration;
   }
-  return companyPath && companyLabel && corroborated;
+  // A sitemap URL is often a detail page with no human-facing text.  It may
+  // inherit a company/profile label only from an explicit same-origin
+  // navigation or footer hub whose path is its parent.  The discovery phase
+  // sets this flag after checking both relationships; it is not a URL-only
+  // fallback and does not admit arbitrary "company" paths.
+  const semanticHubCorroborated = candidate && candidate.companyProfileHubCorroborated === true;
+  return companyPath && ((companyLabel && corroborated) || semanticHubCorroborated);
+}
+
+function applyCompanyProfileHubCorroboration_(candidates) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const companyLabelRe = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i;
+  const companyPathRe = /\/(?:about(?:us)?|company|corporate|profile|outline|company-info|overview)(?:\/|$|-|_)/i;
+  const pathFor = value => {
+    try { return new URL(String(value || '')).pathname.replace(/\/+$/, '') || '/'; }
+    catch (_) { return ''; }
+  };
+  const originFor = value => {
+    try { return new URL(String(value || '')).origin; }
+    catch (_) { return ''; }
+  };
+  const hubs = list.filter(candidate => {
+    const sources = Array.isArray(candidate && candidate.sources) ? candidate.sources : [];
+    const label = normalizeSubpageJsonLdText(candidate && candidate.label || '');
+    const path = pathFor(candidate && candidate.url);
+    return (sources.includes('nav') || sources.includes('footer')) &&
+      companyLabelRe.test(label) && path && path !== '/';
+  });
+  list.forEach(candidate => {
+    if (!candidate || !candidate.url) return;
+    const sources = Array.isArray(candidate.sources) ? candidate.sources : [];
+    const candidatePath = pathFor(candidate.url);
+    const candidateOrigin = originFor(candidate.url);
+    if (!sources.includes('sitemap') || !candidatePath || !companyPathRe.test(candidatePath)) return;
+    candidate.companyProfileHubCorroborated = hubs.some(hub => {
+      const hubPath = pathFor(hub.url);
+      return !!hubPath && hubPath !== '/' && originFor(hub.url) === candidateOrigin &&
+        candidatePath.indexOf(hubPath + '/') === 0;
+    });
+  });
+  return list;
 }
 
 // A page that has already been fetched by the coverage observer may be used
@@ -6081,6 +6121,7 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
       reason: item.reason
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
+  applyCompanyProfileHubCorroboration_(allCandidates);
   const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
   const operatorIdentityCandidates = allCandidates
     .concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : [])
@@ -25807,6 +25848,7 @@ module.exports.__lightBudgetTestHooks = {
   operatorIdentityScopeKey_,
   buildOperatorIdentityInfoFromObservedCompanyProfiles_,
   isHighConfidenceCompanyProfileCandidate_,
+  applyCompanyProfileHubCorroboration_,
   collectOfficialExternalOperatorProfileCandidates_,
   selectOperatorIdentityProbeCandidate_,
   normalizeOperatorIdentityInfo_,

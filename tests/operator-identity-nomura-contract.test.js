@@ -68,6 +68,38 @@ const shopCover = hooks.buildOperatorIdentityObservationV1_(null, {}, { siteMode
 assert.strictEqual(shopCover.applicability, 'not_applicable');
 assert.strictEqual(shopCover.signalState, 'unknown');
 
+// Discovery: a sitemap-only company detail inherits a label only from an
+// explicit same-origin company-information navigation hub.
+const nomuraDiscovery = [
+  { url: 'https://example.test/introduc/company/', label: '', source: 'sitemap', sources: ['sitemap'] },
+  { url: 'https://example.test/introduc/', label: '会社情報', source: 'nav', sources: ['nav'] }
+];
+hooks.applyCompanyProfileHubCorroboration_(nomuraDiscovery);
+assert.strictEqual(nomuraDiscovery[0].companyProfileHubCorroborated, true);
+assert.strictEqual(hooks.isHighConfidenceCompanyProfileCandidate_(nomuraDiscovery[0]), true);
+
+const genericDiscovery = [
+  { url: 'https://example.test/about/company-profile/', label: '', source: 'sitemap', sources: ['sitemap'] },
+  { url: 'https://example.test/about/', label: 'About Us', source: 'footer', sources: ['footer'] }
+];
+hooks.applyCompanyProfileHubCorroboration_(genericDiscovery);
+assert.strictEqual(hooks.isHighConfidenceCompanyProfileCandidate_(genericDiscovery[0]), true);
+
+for (const candidates of [
+  [
+    { url: 'https://example.test/recruit/company/', label: '', source: 'sitemap', sources: ['sitemap'] },
+    { url: 'https://example.test/recruit/', label: '採用情報', source: 'nav', sources: ['nav'] }
+  ],
+  [
+    { url: 'https://example.test/ir/company/news/', label: '', source: 'sitemap', sources: ['sitemap'] },
+    { url: 'https://example.test/ir/', label: 'IR情報', source: 'footer', sources: ['footer'] }
+  ]
+]) {
+  hooks.applyCompanyProfileHubCorroboration_(candidates);
+  assert.strictEqual(candidates[0].companyProfileHubCorroborated, false);
+  assert.strictEqual(hooks.isHighConfidenceCompanyProfileCandidate_(candidates[0]), false);
+}
+
 console.log(JSON.stringify({
   pass: true,
   fixture: 'operator_identity_nomura_contract_v1',
@@ -77,6 +109,9 @@ console.log(JSON.stringify({
     unrelatedTelRejected: true,
     conflictRejected: true,
     coverOnlyCanonical: true,
-    shopFacilityUnchanged: true
+    shopFacilityUnchanged: true,
+    nomuraCompanyHubDiscovery: true,
+    genericCompanyHubDiscovery: true,
+    recruitmentAndIrRejected: true
   }
 }, null, 2));
