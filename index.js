@@ -3493,10 +3493,38 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return { value: '', label: '' };
     };
 
+    // A formal company profile can place its representative number in a
+    // semantic tel: link below a clearly labelled address section instead of
+    // a dedicated telephone row.  This is still an explicit number, but it is
+    // accepted only in the qualified company-profile flow, under an address
+    // heading, and only when that section contains an address.  Footer,
+    // support, sales, and store tel: links cannot meet all three conditions.
+    const telephoneFromAddressSectionTelLink = () => {
+      if (sourceType !== 'company_profile') return { value: '', label: '' };
+      let found = { value: '', label: '' };
+      $('a[href]').each((_, el) => {
+        if (found.value) return;
+        const href = String($(el).attr('href') || '');
+        if (!/^tel:/i.test(href)) return;
+        const section = $(el).closest('section');
+        if (!section.length) return;
+        const heading = normalizeSubpageJsonLdText(section.find('h1,h2,h3').first().text());
+        if (!/^(?:本社所在地|本社事務所|本社|所在地|住所)$/i.test(heading)) return;
+        const sectionAddress = extractJapaneseAddress(section.text());
+        if (!sectionAddress || !/(?:〒?\s?\d{3}[-‐‑‒–—]?\d{4}|北海道|東京都|(?:京都|大阪)府|..県)/.test(sectionAddress)) return;
+        const telephone = extractJapanesePhone(href.replace(/^tel:/i, ''));
+        if (telephone) found = { value: telephone, label: 'tel_link_under_address_section' };
+      });
+      return found;
+    };
+
     const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|社名|商号/i, 'operator');
     const address = labelValueFromText(/本社所在地|本社事務所|本社|所在地|住所/i, 'address');
     const directTelephone = labelValueFromText(/電話番号|電話|TEL(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?|Tel|連絡先|お客様相談室/i, 'telephone');
-    const telephone = directTelephone.value ? directTelephone : telephoneFromStructuredAddressValue();
+    const structuredTelephone = telephoneFromStructuredAddressValue();
+    const telephone = directTelephone.value
+      ? directTelephone
+      : (structuredTelephone.value ? structuredTelephone : telephoneFromAddressSectionTelLink());
 
     // "名前" is deliberately not a general company-name label. Some
     // conventional Japanese company-profile tables use it for the legal
@@ -9775,6 +9803,67 @@ function attachOperatorIdentityProbeProvenance_(identity, candidate) {
   return identity;
 }
 
+// Cover-only transport for the GAS snapshot.  It deliberately contains no
+// company name, address, or telephone, so it can report the bounded probe's
+// state without becoming an identity authority itself.
+const OPERATOR_IDENTITY_OBSERVATION_AUTHORITY_V1 = 'geoSignalsV1_operator_identity_v1';
+function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdentityProbe, opts = {}) {
+  const info = operatorIdentityInfo && typeof operatorIdentityInfo === 'object' ? operatorIdentityInfo : null;
+  const probe = operatorIdentityProbe && typeof operatorIdentityProbe === 'object' ? operatorIdentityProbe : {};
+  const mode = String(opts.siteMode || '').toLowerCase();
+  const applicable = mode === 'corporate' || mode === 'generic';
+  const candidateCount = Array.isArray(opts.candidates) ? opts.candidates.length : 0;
+  const selectedCount = probe.attempted === true ? 1 : 0;
+  const conflict = /conflict/i.test(String(probe.reason || ''));
+  const complete = !!(info && info.hasOperatorInfo === true &&
+    info.hasCompanyName === true && info.hasAddress === true && info.hasTelephone === true && !conflict);
+  const observed = !!(info && info.observed === true) || probe.attempted === true;
+  const sourcePath = (() => {
+    try {
+      const path = new URL(String((info && info.sourceUrl) || probe.sourceUrl || '')).pathname;
+      return /^\//.test(path) ? path.slice(0, 300) : '';
+    } catch (_) { return ''; }
+  })();
+  const failureReasons = [];
+  if (applicable) {
+    if (conflict) failureReasons.push('company_profile_field_conflict');
+    else if (observed && !complete) failureReasons.push('required_fields_missing');
+    else if (!observed) failureReasons.push('no_observed_company_profile');
+  }
+  return {
+    version: 1,
+    authority: OPERATOR_IDENTITY_OBSERVATION_AUTHORITY_V1,
+    applicability: applicable ? 'applicable' : 'not_applicable',
+    signalState: !applicable ? 'unknown' : (complete ? 'true' : (observed ? 'false' : 'unknown')),
+    inputObserved: observed,
+    observationLimited: opts.observationLimited === true,
+    discovery: {
+      complete: opts.discoveryComplete === true,
+      candidateCount,
+      selectedCount,
+      capped: opts.discoveryCapped === true
+    },
+    scopes: {
+      required: applicable ? ['company_profile'] : [],
+      observed: sourcePath ? ['company_profile'] : [],
+      failed: probe.attempted === true && probe.observationComplete !== true ? ['company_profile'] : []
+    },
+    scopeComplete: probe.observationComplete === true,
+    strongEvidenceCount: complete ? 3 : 0,
+    evidence: sourcePath ? [{
+      type: 'company_profile',
+      role: 'operator_identity_probe',
+      pageRole: 'company_profile',
+      evidenceRole: complete ? 'complete_positive_fields' : 'incomplete_candidate_scope',
+      sourcePath,
+      extractionMethod: String((info && info.extractionMethod) || 'html_text').slice(0, 80),
+      label: 'company_profile'
+    }] : [],
+    conflict,
+    failureReasons
+  };
+}
+
 // Reuse only already-observed company-profile pages. Values may be distributed
 // across detail pages, but they must stay in one explicit profile scope and
 // every populated field must agree. Links, raw contact booleans, external
@@ -10731,6 +10820,21 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       geoSignalsV1.trustSignals.operatorIdentityInfo = operatorIdentityInfo;
       geoSignalsV1.trustSignals.operatorIdentityProbe = operatorIdentityProbe;
     }
+    // This bounded provenance record is intentionally separate from the
+    // formal identity record above.  GAS can persist it safely even when a
+    // probe is partial, while only a complete formal record can affect the
+    // operator-info authority.
+    geoSignalsV1.operatorIdentityObservationV1 = buildOperatorIdentityObservationV1_(
+      operatorIdentityInfo,
+      operatorIdentityProbe,
+      {
+        siteMode,
+        candidates: discovered.operatorIdentityCandidates,
+        observationLimited,
+        discoveryComplete: !(Array.isArray(discovered.errors) && discovered.errors.length),
+        discoveryCapped: Array.isArray(discovered.operatorIdentityCandidates) && discovered.operatorIdentityCandidates.length >= 5
+      }
+    );
     const contactSignals = pickBestContactSignals_(observations);
     if (contactSignals) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
@@ -25707,6 +25811,7 @@ module.exports.__lightBudgetTestHooks = {
   selectOperatorIdentityProbeCandidate_,
   normalizeOperatorIdentityInfo_,
   attachOperatorIdentityProbeProvenance_,
+  buildOperatorIdentityObservationV1_,
   compactSubpageJsonLdObservation_,
   normalizeArticleVisibleDate_,
   pickArticleVisibleDate_,
