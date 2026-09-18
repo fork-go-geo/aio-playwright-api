@@ -3240,11 +3240,9 @@ function isLegalOperatorCandidatePath_(value) {
   return /\/(?:policies\/legal-notice|legal-notice|legal|law|commercial-transactions|specified-commercial-transactions|tokushoho)(?:\/|$|-|_)/i.test(path);
 }
 
-// A company-profile probe is deliberately stricter than ordinary discovery.
-// The path is only a routing hint: a matching, human-facing company label and
-// corroboration from two discovery sources are required before we spend the
-// one additional request.
-function isHighConfidenceCompanyProfileCandidate_(candidate) {
+// Evaluate the existing high-confidence predicate once so the bounded audit
+// below can report its inputs without creating a second selection contract.
+function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
   const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
   const label = normalizeSubpageJsonLdText(candidate && (candidate.label || candidate.text || candidate.ariaLabel || candidate.title) || '');
   const path = (() => {
@@ -3265,25 +3263,108 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
   const hasSitemapCorroboration = sources.some(source => source === 'sitemap' || source === 'htmlSitemap');
   const hasHumanNavigationCorroboration = sources.some(source => source === 'nav' || source === 'footer');
   const corroborated = sources.length >= 2 && hasSitemapCorroboration && hasHumanNavigationCorroboration;
+  const semanticHubCorroborated = candidate && candidate.companyProfileHubCorroborated === true;
+  const external = candidate && candidate.officialExternalOperatorProfile === true;
+  const result = {
+    url,
+    label,
+    path,
+    sources,
+    pathMatched: companyPath,
+    labelMatched: companyLabel,
+    sitemapCorroborated: hasSitemapCorroboration,
+    navFooterCorroborated: hasHumanNavigationCorroboration,
+    semanticHubCorroborated,
+    independentCorroborationSatisfied: corroborated,
+    highConfidenceEligible: false,
+    rejectionReasons: []
+  };
   // A service site can explicitly identify a separate corporate domain as its
   // operator.  This narrow candidate is created only from its own rendered
   // nav/footer link with an operator relation label; arbitrary external links
   // never reach this branch or the profile fetcher.
-  if (candidate && candidate.officialExternalOperatorProfile === true) {
+  if (external) {
     const sourceOrigin = String(candidate.operatorRelationSourceOrigin || '');
     let candidateOrigin = '';
     try { candidateOrigin = new URL(url).origin; } catch (_) {}
     const explicitOperatorRelation = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i.test(label);
-    return !!sourceOrigin && !!candidateOrigin && candidateOrigin !== sourceOrigin &&
-      explicitOperatorRelation && hasHumanNavigationCorroboration;
+    result.labelMatched = explicitOperatorRelation;
+    if (!sourceOrigin || !candidateOrigin || candidateOrigin === sourceOrigin) result.rejectionReasons.push('external_origin_not_distinct');
+    if (!explicitOperatorRelation) result.rejectionReasons.push('external_operator_relation_label_missing');
+    if (!hasHumanNavigationCorroboration) result.rejectionReasons.push('nav_footer_corroboration_missing');
+    result.highConfidenceEligible = result.rejectionReasons.length === 0;
+    return result;
   }
   // A sitemap URL is often a detail page with no human-facing text.  It may
   // inherit a company/profile label only from an explicit same-origin
   // navigation or footer hub whose path is its parent.  The discovery phase
   // sets this flag after checking both relationships; it is not a URL-only
   // fallback and does not admit arbitrary "company" paths.
-  const semanticHubCorroborated = candidate && candidate.companyProfileHubCorroborated === true;
-  return companyPath && ((companyLabel && corroborated) || semanticHubCorroborated);
+  if (!companyPath) result.rejectionReasons.push('path_not_company_profile');
+  if (!companyLabel && !semanticHubCorroborated) result.rejectionReasons.push('company_profile_label_missing');
+  if (!corroborated && !semanticHubCorroborated) result.rejectionReasons.push('independent_corroboration_missing');
+  result.highConfidenceEligible = companyPath && ((companyLabel && corroborated) || semanticHubCorroborated);
+  return result;
+}
+
+// A company-profile probe is deliberately stricter than ordinary discovery.
+// The path is only a routing hint: a matching, human-facing company label and
+// corroboration from two discovery sources are required before we spend the
+// one additional request.
+function isHighConfidenceCompanyProfileCandidate_(candidate) {
+  return evaluateHighConfidenceCompanyProfileCandidate_(candidate).highConfidenceEligible === true;
+}
+
+function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCandidate, opts = {}) {
+  const mode = String(siteMode || '').toLowerCase();
+  const entries = (Array.isArray(candidates) ? candidates : []).map(candidate => {
+    const evaluation = evaluateHighConfidenceCompanyProfileCandidate_(candidate);
+    const sourceTypes = Array.from(new Set(evaluation.sources)).sort();
+    const titleHint = normalizeSubpageJsonLdText(candidate && (candidate.titleHint || candidate.pageTitle || '') || '');
+    const headingHint = normalizeSubpageJsonLdText(candidate && (candidate.headingHint || candidate.h1 || '') || '');
+    return {
+      url: String(evaluation.url || '').slice(0, 500),
+      normalizedPath: String(evaluation.path || '').slice(0, 300),
+      anchorLabel: String(evaluation.label || '').slice(0, 180),
+      titleHintPresent: !!titleHint,
+      headingHintPresent: !!headingHint,
+      sources: {
+        nav: sourceTypes.includes('nav'),
+        footer: sourceTypes.includes('footer'),
+        xmlSitemap: sourceTypes.includes('sitemap'),
+        htmlSitemap: sourceTypes.includes('htmlSitemap'),
+        semanticHub: evaluation.semanticHubCorroborated === true
+      },
+      pathMatched: evaluation.pathMatched === true,
+      labelMatched: evaluation.labelMatched === true,
+      sitemapCorroborated: evaluation.sitemapCorroborated === true,
+      navFooterCorroborated: evaluation.navFooterCorroborated === true,
+      semanticHubCorroborated: evaluation.semanticHubCorroborated === true,
+      independentCorroborationSatisfied: evaluation.independentCorroborationSatisfied === true,
+      highConfidenceEligible: evaluation.highConfidenceEligible === true,
+      score: Number(candidate && candidate.score || 0),
+      rejectionReasons: evaluation.rejectionReasons.slice(0, 5),
+      selectedForProbe: String(selectedCandidate && selectedCandidate.url || '') === String(evaluation.url || '')
+    };
+  });
+  // Always retain eligible candidates first, so a selected candidate remains
+  // inspectable even when higher-scored rejected discovery candidates exist.
+  const bounded = entries.filter(item => item.highConfidenceEligible)
+    .concat(entries.filter(item => !item.highConfidenceEligible))
+    .slice(0, 5);
+  const selected = bounded.find(item => item.selectedForProbe) || null;
+  return {
+    version: 'operator_identity_candidate_audit_v1',
+    siteMode: mode || null,
+    candidates: bounded,
+    selection: {
+      selectedCandidateUrl: selected ? selected.url : null,
+      selectedCandidateScore: selected ? selected.score : null,
+      selectedCandidateSources: selected ? selected.sources : null,
+      selectedCandidateLabel: selected ? selected.anchorLabel : null,
+      noCandidateReason: selected ? null : (opts.noCandidateReason || (mode === 'corporate' || mode === 'generic' ? 'no_high_confidence_candidate' : 'site_mode_not_applicable'))
+    }
+  };
 }
 
 function applyCompanyProfileHubCorroboration_(candidates) {
@@ -6132,6 +6213,9 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
     candidates: allCandidates.slice(0, normalizedLimit),
     roleRepresentativeCandidates,
     operatorIdentityCandidates,
+    // Kept in-process only until the light response is assembled. The audit
+    // builder bounds it to five metadata-only entries before transport.
+    operatorIdentityAuditCandidates: allCandidates.concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : []),
     totalCandidates: allCandidates.length,
     sourceSummary,
     errors
@@ -10785,9 +10869,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     };
     // This probe is intentionally outside the normal representative-page plan:
     // it never changes maxObserve=2 or displaces business/contact observation.
+    let selectedOperatorIdentityCandidate = null;
+    let operatorIdentityCandidateNoCandidateReason = null;
     if (!operatorIdentityInfo && observedCompanyProfileIdentity.reason.indexOf('conflict') < 0) {
       const operatorCandidate = selectOperatorIdentityProbeCandidate_(discovered.operatorIdentityCandidates, siteMode);
       if (operatorCandidate) {
+        selectedOperatorIdentityCandidate = operatorCandidate;
         operatorIdentityProbe = {
           attempted: true,
           observationComplete: false,
@@ -10846,7 +10933,15 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             evidenceLabels: []
           };
         }
+      } else {
+        operatorIdentityCandidateNoCandidateReason = (String(siteMode || '').toLowerCase() === 'corporate' || String(siteMode || '').toLowerCase() === 'generic')
+          ? 'no_high_confidence_candidate'
+          : 'site_mode_not_applicable';
       }
+    } else if (operatorIdentityInfo) {
+      operatorIdentityCandidateNoCandidateReason = 'existing_operator_identity_record';
+    } else {
+      operatorIdentityCandidateNoCandidateReason = 'observed_company_profile_conflict';
     }
     if (legalOperatorInfo) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
@@ -10869,6 +10964,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       formalRecordPath: operatorIdentityInfo ? 'geoSignalsV1.trustSignals.operatorIdentityInfo' : null,
       producerComplete: !!(operatorIdentityProbe && operatorIdentityProbe.observationComplete === true)
     };
+    geoSignalsV1.operatorIdentityCandidateAuditV1 = buildOperatorIdentityCandidateAuditV1_(
+      discovered.operatorIdentityAuditCandidates,
+      siteMode,
+      selectedOperatorIdentityCandidate,
+      { noCandidateReason: operatorIdentityCandidateNoCandidateReason }
+    );
     // This bounded provenance record is intentionally separate from the
     // formal identity record above.  GAS can persist it safely even when a
     // probe is partial, while only a complete formal record can affect the
@@ -18291,6 +18392,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   }
   if (g.freshnessOperationSignalsInputAudit && typeof g.freshnessOperationSignalsInputAudit === 'object') {
     shortGeoSignalsV1.freshnessOperationSignalsInputAudit = g.freshnessOperationSignalsInputAudit;
+  }
+  if (g.operatorIdentityCandidateAuditV1 && typeof g.operatorIdentityCandidateAuditV1 === 'object') {
+    shortGeoSignalsV1.operatorIdentityCandidateAuditV1 = g.operatorIdentityCandidateAuditV1;
   }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
@@ -25855,7 +25959,9 @@ module.exports.__lightBudgetTestHooks = {
   isObservedCompanyProfileScope_,
   operatorIdentityScopeKey_,
   buildOperatorIdentityInfoFromObservedCompanyProfiles_,
+  evaluateHighConfidenceCompanyProfileCandidate_,
   isHighConfidenceCompanyProfileCandidate_,
+  buildOperatorIdentityCandidateAuditV1_,
   applyCompanyProfileHubCorroboration_,
   collectOfficialExternalOperatorProfileCandidates_,
   selectOperatorIdentityProbeCandidate_,
