@@ -47,7 +47,17 @@ const nameAddress = observedProfile('https://example.test/about_site/address/', 
   <title>当サイトについて</title><h1>当サイトについて</h1>
   <table><tr><th>運営会社</th><td>Example株式会社</td></tr>
   <tr><th>所在地</th><td>〒100-0001 東京都千代田区1-1</td></tr></table>`);
-assert.equal(resolve([nameAddress]).record, null);
+const nameAddressResult = resolve([nameAddress]);
+assert.equal(nameAddressResult.record.hasOperatorInfo, true);
+assert.equal(nameAddressResult.record.hasTelephone, false);
+assert.equal(nameAddressResult.record.telephone, '');
+
+const associationNameAddress = observedProfile('https://example.test/about_site/association/', `
+  <title>当サイトについて</title><h1>当サイトについて</h1>
+  <dl><dt>名称</dt><dd>匿名一般社団法人</dd><dt>所在地</dt><dd>〒100-0001 東京都千代田区1-1</dd></dl>`);
+const associationResult = resolve([associationNameAddress]);
+assert.equal(associationResult.record.hasOperatorInfo, true);
+assert.equal(associationResult.record.hasTelephone, false);
 
 const conflicting = observedProfile('https://example.test/about_site/other/', `
   <title>当サイトについて</title><h1>当サイトについて</h1>
@@ -71,7 +81,8 @@ console.log(JSON.stringify({
     completeCompanyProfile: !!fullResult.record,
     distributedSameScope: !!distributedResult.record,
     companyNameOnlyRejected: nameOnly.record === null,
-    companyNameAddressOnlyRejected: resolve([nameAddress]).record === null,
+    companyNameAddressWithoutTelephoneAccepted: !!nameAddressResult.record,
+    associationNameAddressWithoutTelephoneAccepted: !!associationResult.record,
     sourceConflictRejected: conflictResult.record === null,
     normalExistingProfileRegression: !!fullResult.record,
     covezEquivalent: !!distributedResult.record,

@@ -3683,9 +3683,10 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     out.hasAddress = !!out.address;
     out.hasTelephone = !!out.telephone;
     // Legal notices retain their historical address + telephone contract.
-    // A general company profile additionally requires an explicit company name.
+    // A high-confidence company profile identifies its operator from the
+    // explicit name + address pair; telephone remains supporting evidence.
     out.hasOperatorInfo = requireCompanyName
-      ? (out.hasCompanyName && out.hasAddress && out.hasTelephone)
+      ? (out.hasCompanyName && out.hasAddress)
       : (out.hasAddress && out.hasTelephone);
     // Preserve explicit partial company-profile fields for the existing
     // coverage-observation producer. They remain non-positive here; the
@@ -4332,7 +4333,8 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
         h1Texts,
         // The request has already been selected and fetched by a trusted
         // coverage scope. The extractor still requires explicit labelled
-        // company/address/telephone fields before it becomes positive.
+        // company/address fields before it becomes positive; telephone is
+        // retained as supporting evidence when present.
         highConfidenceCompanyProfile: true
       })
     : null;
@@ -9994,10 +9996,11 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
   const address = normalizeSubpageJsonLdText(info.address).slice(0, 160);
   const telephone = normalizeSubpageJsonLdText(info.telephone).slice(0, 60);
   const type = sourceType === 'company_profile' ? 'company_profile' : 'legal';
-  // Legal notices keep their historical acceptance contract. Company profiles
-  // must prove the named organization as well as its address and telephone.
+  // Legal notices keep their historical acceptance contract. A selected,
+  // high-confidence company profile proves the named organization with its
+  // explicit name + address; telephone is optional supporting evidence.
   const hasOperatorInfo = type === 'company_profile'
-    ? (!!companyName && !!address && !!telephone)
+    ? (!!companyName && !!address)
     : (!!address && !!telephone);
   return {
     observed: info.observed === true,
@@ -10011,6 +10014,7 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
     hasAddress: !!address,
     hasTelephone: !!telephone,
     hasOperatorInfo,
+    conflict: info.conflict === true,
     extractionMethod: String(info.extractionMethod || 'html_text'),
     evidenceLabels: Array.isArray(info.evidenceLabels) ? info.evidenceLabels.slice(0, 10) : [],
     authority: String(info.authority || 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1'),
@@ -10049,7 +10053,7 @@ function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdent
   const selectedCount = probe.attempted === true ? 1 : 0;
   const conflict = /conflict/i.test(String(probe.reason || ''));
   const complete = !!(info && info.hasOperatorInfo === true &&
-    info.hasCompanyName === true && info.hasAddress === true && info.hasTelephone === true && !conflict);
+    info.hasCompanyName === true && info.hasAddress === true && !conflict);
   const observed = !!(info && info.observed === true) || probe.attempted === true;
   const sourcePath = (() => {
     try {
@@ -10082,7 +10086,7 @@ function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdent
       failed: probe.attempted === true && probe.observationComplete !== true ? ['company_profile'] : []
     },
     scopeComplete: probe.observationComplete === true,
-    strongEvidenceCount: complete ? 3 : 0,
+    strongEvidenceCount: complete ? (info && info.hasTelephone === true ? 3 : 2) : 0,
     evidence: sourcePath ? [{
       type: 'company_profile',
       role: 'operator_identity_probe',
@@ -10125,7 +10129,7 @@ function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
   if (names.length > 1 || addresses.length > 1 || phones.length > 1) {
     return { record: null, reason: 'company_profile_field_conflict' };
   }
-  if (names.length !== 1 || addresses.length !== 1 || phones.length !== 1) {
+  if (names.length !== 1 || addresses.length !== 1) {
     return { record: null, reason: 'company_profile_required_fields_missing' };
   }
 
@@ -10148,10 +10152,10 @@ function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
       telephone,
       hasCompanyName: true,
       hasAddress: true,
-      hasTelephone: true,
+      hasTelephone: !!telephone,
       hasOperatorInfo: true,
       extractionMethod: 'observed_company_profile_fields',
-      evidenceLabels: ['company_profile_scope', 'explicit_company_name', 'explicit_address', 'explicit_telephone'],
+      evidenceLabels: ['company_profile_scope', 'explicit_company_name', 'explicit_address'].concat(telephone ? ['explicit_telephone'] : []),
       authority: 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1',
       provenance: {
         source: 'existing_coverage_observations',
@@ -10160,7 +10164,7 @@ function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
         sourceUrls,
         companyNameSourceUrl: fieldSource('companyName'),
         addressSourceUrl: fieldSource('address'),
-        telephoneSourceUrl: fieldSource('telephone')
+        telephoneSourceUrl: telephone ? fieldSource('telephone') : ''
       }
     };
   if (fieldExtractionAudit) record.operatorIdentityFieldExtractionAuditV1 = fieldExtractionAudit;

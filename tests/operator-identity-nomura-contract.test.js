@@ -27,13 +27,14 @@ assert.ok(nomuraRecord.record);
 assert.strictEqual(nomuraRecord.record.hasOperatorInfo, true);
 assert.strictEqual(nomuraRecord.record.authority, 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1');
 
-// B: Missing telephone remains non-positive.
+// B: A selected company profile identifies its operator from name + address;
+// telephone remains optional supporting evidence.
 const noTelephone = observedProfile('https://example.test/company/', `
   <title>会社概要</title><h1>会社概要</h1>
   <table><tr><th>会社名</th><td>Example株式会社</td></tr>
   <tr><th>所在地</th><td>東京都千代田区1-1</td></tr></table>`);
-assert.strictEqual(noTelephone.operatorIdentityInfo.hasOperatorInfo, false);
-assert.strictEqual(hooks.buildOperatorIdentityInfoFromObservedCompanyProfiles_([noTelephone]).record, null);
+assert.strictEqual(noTelephone.operatorIdentityInfo.hasOperatorInfo, true);
+assert.ok(hooks.buildOperatorIdentityInfoFromObservedCompanyProfiles_([noTelephone]).record);
 
 // C: A support/footer tel: link without an address section never qualifies.
 const footerTelephone = observedProfile('https://example.test/company/', `
@@ -42,7 +43,7 @@ const footerTelephone = observedProfile('https://example.test/company/', `
   <tr><th>所在地</th><td>東京都千代田区1-1</td></tr></table>
   <footer><a href="tel:0312345678">サポート窓口</a></footer>`);
 assert.strictEqual(footerTelephone.operatorIdentityInfo.telephone, '');
-assert.strictEqual(footerTelephone.operatorIdentityInfo.hasOperatorInfo, false);
+assert.strictEqual(footerTelephone.operatorIdentityInfo.hasOperatorInfo, true);
 
 // D: Conflicting complete records, including competing telephone values,
 // cannot become a positive identity.
@@ -59,8 +60,8 @@ const partialCover = hooks.buildOperatorIdentityObservationV1_(noTelephone.opera
   attempted: true, observationComplete: true, sourceUrl: 'https://example.test/company/', reason: 'company_profile_fetched'
 }, { siteMode: 'corporate', candidates: [{ url: 'https://example.test/company/' }], discoveryComplete: true });
 assert.strictEqual(partialCover.authority, 'geoSignalsV1_operator_identity_v1');
-assert.strictEqual(partialCover.signalState, 'false');
-assert.strictEqual(partialCover.strongEvidenceCount, 0);
+assert.strictEqual(partialCover.signalState, 'true');
+assert.strictEqual(partialCover.strongEvidenceCount, 2);
 assert.strictEqual(Object.prototype.hasOwnProperty.call(partialCover, 'companyName'), false);
 
 // F: The existing non-applicable mode contract remains fail-closed.
@@ -105,7 +106,7 @@ console.log(JSON.stringify({
   fixture: 'operator_identity_nomura_contract_v1',
   cases: {
     addressSectionTelAccepted: true,
-    partialRejected: true,
+    phoneOptionalProfileAccepted: true,
     unrelatedTelRejected: true,
     conflictRejected: true,
     coverOnlyCanonical: true,

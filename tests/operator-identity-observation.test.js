@@ -164,7 +164,7 @@ for (const label of ['電話受付時間', '電話対応時間', '電話番号�
     { highConfidenceCompanyProfile: true }
   );
   assert.strictEqual(info.telephone, '', label);
-  assert.strictEqual(info.hasOperatorInfo, false, label);
+  assert.strictEqual(info.hasOperatorInfo, true, label);
 }
 const proseOnly = extractOperatorIdentityInfoFromHtml_('<p>お問い合わせはお電話ください（03-1234-5678）。</p>', 'https://example.test/company/', { highConfidenceCompanyProfile: true });
 assert.strictEqual(proseOnly.telephone, '');
@@ -189,6 +189,7 @@ const bareNumberInAddress = extractOperatorIdentityInfoFromHtml_(
   { highConfidenceCompanyProfile: true }
 );
 assert.strictEqual(bareNumberInAddress.telephone, '');
+assert.strictEqual(bareNumberInAddress.hasOperatorInfo, true);
 for (const [label, value] of [
   ['本社へのアクセス', '東京都千代田区1-1'],
   ['本社移転のお知らせ', '東京都千代田区1-1'],
