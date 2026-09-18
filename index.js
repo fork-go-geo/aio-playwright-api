@@ -3488,6 +3488,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       if (/事業者名/.test(compact)) return '事業者名';
       if (/販売業者/.test(compact)) return '販売業者';
       if (/運営会社/.test(compact)) return '運営会社';
+      if (/^名称$/i.test(compact)) return '名称';
       if (/^商号$/i.test(compact)) return '商号';
       if (/本社所在地/.test(compact)) return '本社所在地';
       if (/^本社事務所$/i.test(compact)) return '本社事務所';
@@ -3516,7 +3517,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     const stripLeadingLabel = (value, kind) => {
       const text = normalizeSubpageJsonLdText(value);
       const labelRe = kind === 'operator'
-        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|社名|商号)\s*[：:：]?\s*/
+        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|社名|名称|商号)\s*[：:：]?\s*/
         : (kind === 'address'
             ? /^(?:本社所在地|本社事務所|本社|所在地|住所)\s*[：:：]?\s*/
             : /^(?:連絡先|電話番号|電話|TEL|Tel|お客様相談室)\s*[：:：]?\s*/);
@@ -3639,7 +3640,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return found;
     };
 
-    const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|社名|商号/i, 'operator');
+    const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|社名|名称|商号/i, 'operator');
     const address = labelValueFromText(/本社所在地|本社事務所|本社|所在地|住所/i, 'address');
     const directTelephone = labelValueFromText(/電話番号|電話|TEL(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?|Tel|連絡先|お客様相談室/i, 'telephone');
     const structuredTelephone = telephoneFromStructuredAddressValue();
@@ -3736,7 +3737,7 @@ function buildOperatorIdentityFieldExtractionAuditV1_(html, meta = {}, identity)
   };
   const labelMatches = (field, label) => {
     const raw = normalize(label), compact = normalizeLabel(label);
-    if (field === 'companyName') return /事業者名/.test(compact) || /販売業者/.test(compact) || /運営会社/.test(compact) || /^商号$/i.test(compact) || /^(?:会社名|社名)$/.test(raw);
+    if (field === 'companyName') return /事業者名/.test(compact) || /販売業者/.test(compact) || /運営会社/.test(compact) || /^(?:名称|商号)$/i.test(compact) || /^(?:会社名|社名)$/.test(raw);
     if (field === 'address') return /本社所在地/.test(compact) || /^本社事務所$/.test(compact) || /^本社(?:\s*[（(](?:所在地|事務所)[）)])?$/i.test(raw) || /所在地/.test(compact) || /住所/.test(compact);
     return /^電話番号(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^電話$/i.test(compact) || /^tel(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^連絡先$/i.test(raw) || /お客様相談室/.test(compact);
   };

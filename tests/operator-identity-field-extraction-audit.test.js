@@ -26,9 +26,17 @@ assert.strictEqual(field(houjin, 'companyName').summary.finalFailureReason, 'lab
 assert.strictEqual(field(houjin, 'companyName').candidates[0].rawLabel, '法人名');
 
 const name = extract('<dl><dt>名称</dt><dd>匿名株式会社</dd><dt>所在地</dt><dd>東京都匿名区1-1</dd><dt>電話番号</dt><dd>03-0000-0000</dd></dl>');
-assert.strictEqual(name.hasCompanyName, false);
-assert.strictEqual(field(name, 'companyName').summary.finalFailureReason, 'label_not_matched');
+assert.strictEqual(name.hasCompanyName, true);
+assert.strictEqual(field(name, 'companyName').summary.matchedCandidateSeen, true);
+assert.strictEqual(field(name, 'companyName').accepted, true);
+assert.strictEqual(field(name, 'companyName').summary.finalFailureReason, null);
 assert.strictEqual(field(name, 'companyName').candidates[0].rawLabel, '名称');
+
+const emptyName = extract('<dl><dt>名称</dt><dd></dd><dt>所在地</dt><dd>東京都匿名区1-1</dd><dt>電話番号</dt><dd>03-0000-0000</dd></dl>');
+assert.strictEqual(emptyName.hasCompanyName, false);
+
+const invalidStructuredName = extract('<dl><dt>名前</dt><dd>匿名組織名</dd><dt>本社所在地</dt><dd>東京都匿名区1-1</dd><dt>電話番号</dt><dd>03-0000-0000</dd></dl>');
+assert.strictEqual(invalidStructuredName.hasCompanyName, false);
 
 const unrelated = extract('<table><tr><th>担当部署</th><td>匿名部</td></tr><tr><th>所在地</th><td>東京都匿名区1-1</td></tr><th>電話番号</th><td>03-0000-0000</td></table>');
 assert.strictEqual(field(unrelated, 'companyName').summary.finalFailureReason, 'label_not_matched');
@@ -66,4 +74,4 @@ assert.strictEqual(missingParity.hasAddress, true);
 assert.strictEqual(missingParity.hasTelephone, true);
 assert.strictEqual(missingParity.hasOperatorInfo, false);
 
-console.log(JSON.stringify({ pass: true, cases: 9, bounded: Object.values(complete.operatorIdentityFieldExtractionAuditV1.fields).every(item => item.candidates.length <= 5) }));
+console.log(JSON.stringify({ pass: true, cases: 11, bounded: Object.values(complete.operatorIdentityFieldExtractionAuditV1.fields).every(item => item.candidates.length <= 5) }));
