@@ -3256,7 +3256,7 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
   // when the destination page itself contains a Japanese company profile.
   // A label is still only a discovery hint: the sitemap + human-navigation
   // corroboration below remains mandatory before the extra probe is made.
-  const companyLabel = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i.test(label);
+  const companyLabel = /会社概要|法人概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i.test(label);
   // XML and HTML sitemaps are both discovery corroboration.  An HTML
   // sitemap alone is not enough: it must be independently linked from a
   // human-facing navigation surface as well.
@@ -3369,7 +3369,7 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
 
 function applyCompanyProfileHubCorroboration_(candidates) {
   const list = Array.isArray(candidates) ? candidates : [];
-  const companyLabelRe = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i;
+  const companyLabelRe = /会社概要|法人概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i;
   const companyPathRe = /\/(?:about(?:us)?|company|corporate|profile|outline|company-info|overview)(?:\/|$|-|_)/i;
   const pathFor = value => {
     try { return new URL(String(value || '')).pathname.replace(/\/+$/, '') || '/'; }
