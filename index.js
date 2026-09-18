@@ -3693,6 +3693,12 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       ? (out.hasCompanyName || out.hasAddress || out.hasTelephone)
       : (out.hasOperatorName || out.hasOperatorInfo);
     out.evidenceLabels = Array.from(new Set(out.evidenceLabels.filter(Boolean))).slice(0, 10);
+    if (sourceType === 'company_profile') {
+      out.operatorIdentityFieldExtractionAuditV1 = buildOperatorIdentityFieldExtractionAuditV1_(html, {
+        title,
+        h1Texts
+      }, out);
+    }
     return out;
   } catch (_) {
     return empty;
@@ -3704,6 +3710,106 @@ function extractOperatorIdentityInfoFromHtml_(html, sourceUrl, meta = {}) {
     sourceType: 'company_profile',
     highConfidenceCompanyProfile: meta && meta.highConfidenceCompanyProfile === true
   }));
+}
+
+// Bounded, value-free explanation of the existing company-profile extractor.
+// This is diagnostic-only: it replays no selection and never feeds its output
+// back into the identity record or any decision.
+function buildOperatorIdentityFieldExtractionAuditV1_(html, meta = {}, identity) {
+  const limit = 5;
+  const fields = {
+    companyName: { candidates: [], candidateCount: 0, evidenceSeen: false, matchedCandidateSeen: false },
+    address: { candidates: [], candidateCount: 0, evidenceSeen: false, matchedCandidateSeen: false },
+    telephone: { candidates: [], candidateCount: 0, evidenceSeen: false, matchedCandidateSeen: false }
+  };
+  const result = identity && typeof identity === 'object' ? identity : {};
+  const normalize = value => normalizeSubpageJsonLdText(value).slice(0, 120);
+  const normalizeLabel = value => normalize(value).replace(/[\s　]+/g, '');
+  const legalForm = value => /(?:株式会社|有限会社|合同会社|合資会社|合名会社|一般社団法人|一般財団法人|公益社団法人|公益財団法人|医療法人|学校法人|特定非営利活動法人|\b(?:inc\.?|corp\.?|corporation|co\.?\s*,?\s*ltd\.?|ltd\.?|llc)\b)/i.test(normalize(value));
+  const normalizedPhone = value => normalize(value).replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/[ー‐‑‒–—−]/g, '-').replace(/[（）]/g, m => (m === '（' ? '(' : ')'));
+  const phoneDigits = value => (normalizedPhone(value).match(/\d/g) || []).length;
+  const validPhone = value => /(?:0120[-‐‑‒–—]?\d{2,4}[-‐‑‒–—]?\d{3,4}|0\d{1,4}[-‐‑‒–—]?\d{1,4}[-‐‑‒–—]?\d{3,4}|0\d{9,10})/.test(normalizedPhone(value).replace(/[()]/g, ''));
+  const fieldTokens = {
+    companyName: /(?:名|社|法人|団体|組織|事業者|商号|運営|販売)/,
+    address: /(?:本社|所在地|住所)/,
+    telephone: /(?:電話|tel|連絡|相談)/i
+  };
+  const labelMatches = (field, label) => {
+    const raw = normalize(label), compact = normalizeLabel(label);
+    if (field === 'companyName') return /事業者名/.test(compact) || /販売業者/.test(compact) || /運営会社/.test(compact) || /^商号$/i.test(compact) || /^(?:会社名|社名)$/.test(raw);
+    if (field === 'address') return /本社所在地/.test(compact) || /^本社事務所$/.test(compact) || /^本社(?:\s*[（(](?:所在地|事務所)[）)])?$/i.test(raw) || /所在地/.test(compact) || /住所/.test(compact);
+    return /^電話番号(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^電話$/i.test(compact) || /^tel(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^連絡先$/i.test(raw) || /お客様相談室/.test(compact);
+  };
+  const add = (field, sourceType, rawLabel, value, extra = {}) => {
+    const state = fields[field];
+    const label = normalize(rawLabel);
+    const valuePresent = !!normalize(value);
+    const labelMatched = extra.labelMatched === true || (extra.labelMatched !== false && labelMatches(field, label));
+    const validationPassed = extra.validationPassed === true || (extra.validationPassed !== false && labelMatched && valuePresent && (field !== 'telephone' || validPhone(value)));
+    const reasons = Array.isArray(extra.rejectionReasons) ? extra.rejectionReasons.slice(0, 3) : [];
+    if (!labelMatched && !reasons.length) reasons.push('label_not_matched');
+    else if (labelMatched && !valuePresent && !reasons.length) reasons.push('value_empty');
+    else if (field === 'telephone' && labelMatched && valuePresent && !validationPassed && !reasons.length) reasons.push('format_invalid');
+    else if (field === 'companyName' && labelMatched && valuePresent && !validationPassed && !reasons.length) reasons.push('organization_form_invalid');
+    state.evidenceSeen = true;
+    state.matchedCandidateSeen = state.matchedCandidateSeen || labelMatched;
+    if (labelMatched && !validationPassed && !state.firstMatchedFailureReason && reasons.length) state.firstMatchedFailureReason = reasons[0];
+    state.candidateCount += 1;
+    if (state.candidates.length < limit) state.candidates.push({
+      sourceType, rawLabel: label || null, normalizedLabel: normalizeLabel(label) || null, labelMatched,
+      valuePresent, validationPassed, normalizedValueLength: normalize(value).length || 0,
+      organizationFormDetected: field === 'companyName' ? legalForm(value) : null,
+      telephoneNormalizedDigitCount: field === 'telephone' ? phoneDigits(value) : null,
+      rejectionReasons: validationPassed ? [] : reasons
+    });
+  };
+  try {
+    const $ = cheerio.load(String(html || ''));
+    const title = normalize((meta && meta.title) || $('title').first().text());
+    const h1 = Array.isArray(meta && meta.h1Texts) ? meta.h1Texts.map(normalize).filter(Boolean) : $('h1').map((_, el) => normalize($(el).text())).get();
+    const rows = [];
+    const text = cell => normalize($(cell).clone().find('br').replaceWith(' || ').end().text());
+    $('tr').each((_, el) => { const cells = $(el).find('th,td').map((__, cell) => text(cell)).get().filter(Boolean); if (cells.length >= 2) rows.push({ sourceType: 'table', label: cells[0], value: cells.slice(1).join(' ') }); });
+    $('dt').each((_, el) => { const label = text(el), value = text($(el).next('dd')); if (label && value) rows.push({ sourceType: 'dl', label, value }); });
+    // Every explicit table/dl label is audit evidence for each field.  This
+    // makes an unrelated or newly-seen label distinguishable from absence
+    // without changing the extractor's much narrower matching predicates.
+    rows.forEach(row => Object.keys(fields).forEach(field => { if (normalizeLabel(row.label)) add(field, row.sourceType, row.label, row.value); }));
+    const body = $('body').clone(); body.find('script,style,noscript,svg').remove(); body.find('br,p,div,li,tr,dt,dd,th,td,section,article').append('\n');
+    body.text().split(/\n+/).map(normalize).filter(Boolean).forEach(line => {
+      const label = normalize(line.split(/[：:]/)[0]);
+      Object.keys(fields).forEach(field => { if (fieldTokens[field].test(normalizeLabel(label))) add(field, 'visible_labeled_text', label, line.slice(label.length).replace(/^[：:]\s*/, '')); });
+    });
+    // "名前" remains a narrowly gated fallback; audit its gates without
+    // broadening the current source or validation contract.
+    rows.filter(row => normalize(row.label) === '名前').forEach(row => {
+      const titleContext = /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要/.test([title].concat(h1).join(' '));
+      const accepted = result.hasCompanyName === true && legalForm(row.value);
+      const reasons = [];
+      if (!titleContext) reasons.push('context_invalid');
+      else if (!(result.hasAddress === true && result.hasTelephone === true)) reasons.push('context_invalid');
+      else if (!legalForm(row.value)) reasons.push('organization_form_invalid');
+      add('companyName', 'structured_fallback', row.label, row.value, { labelMatched: true, validationPassed: accepted, rejectionReasons: reasons });
+    });
+    $('a[href]').each((_, el) => {
+      const href = String($(el).attr('href') || ''); if (!/^tel:/i.test(href)) return;
+      const section = $(el).closest('section');
+      const heading = section.length ? normalize(section.find('h1,h2,h3').first().text()) : '';
+      const scopeOk = !!section.length && /^(?:本社所在地|本社事務所|本社|所在地|住所)$/i.test(heading);
+      add('telephone', 'tel_link', 'tel:', href.replace(/^tel:/i, ''), { labelMatched: true, validationPassed: scopeOk && validPhone(href.replace(/^tel:/i, '')), rejectionReasons: scopeOk ? [] : ['tel_link_scope_invalid'] });
+    });
+    Object.keys(fields).forEach(field => { fields[field].titleEvidencePresent = !!title; fields[field].h1EvidencePresent = h1.length > 0; });
+  } catch (_) {}
+  const fieldMap = { companyName: ['hasCompanyName', 'companyName'], address: ['hasAddress', 'address'], telephone: ['hasTelephone', 'telephone'] };
+  const output = { version: 'operator_identity_field_extraction_audit_v1', fields: {} };
+  Object.keys(fields).forEach(field => {
+    const state = fields[field], target = fieldMap[field], accepted = result[target[0]] === true && !!normalize(result[target[1]]);
+    const acceptedCandidate = accepted ? state.candidates.find(item => item.validationPassed === true) : null;
+    const finalFailureReason = accepted ? null : (!state.evidenceSeen ? 'no_candidate_evidence' : (!state.matchedCandidateSeen ? 'label_not_matched' : (state.firstMatchedFailureReason || null)));
+    delete state.firstMatchedFailureReason;
+    output.fields[field] = Object.assign({}, state, { accepted, acceptedSourceType: acceptedCandidate ? acceptedCandidate.sourceType : null, acceptedLabel: acceptedCandidate ? acceptedCandidate.normalizedLabel : null, acceptedValuePresent: accepted, validationPassed: accepted, rejectionReasons: accepted || !finalFailureReason ? [] : [finalFailureReason], summary: { evidenceSeen: state.evidenceSeen, matchedCandidateSeen: state.matchedCandidateSeen, accepted, finalFailureReason } });
+  });
+  return output;
 }
 
 function extractContactSignalsFromHtml_(html, sourceUrl) {
@@ -7016,6 +7122,7 @@ function compactSubpageJsonLdObservation_(page) {
       hasOperatorInfo: page.operatorIdentityInfo.hasOperatorInfo === true,
       extractionMethod: String(page.operatorIdentityInfo.extractionMethod || 'html_text').slice(0, 80),
       evidenceLabels: Array.isArray(page.operatorIdentityInfo.evidenceLabels) ? page.operatorIdentityInfo.evidenceLabels.slice(0, 10) : [],
+      operatorIdentityFieldExtractionAuditV1: page.operatorIdentityInfo.operatorIdentityFieldExtractionAuditV1 || null,
       scope: page.operatorIdentityInfo.scope === 'company_profile_page' ? 'company_profile_page' : null,
       scopeKey: normalizeSubpageJsonLdText(page.operatorIdentityInfo.scopeKey).slice(0, 80) || null
     } : null,
@@ -10025,12 +10132,12 @@ function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
   const address = displayValue('address', addresses[0]);
   const telephone = displayValue('telephone', phones[0]);
   const sourceUrls = Array.from(new Set(candidates.map(info => String(info.sourceUrl || '')).filter(Boolean))).slice(0, 5);
+  const fieldExtractionAudit = candidates.map(info => info && info.operatorIdentityFieldExtractionAuditV1).find(audit => audit && typeof audit === 'object') || null;
   const fieldSource = field => {
     const found = candidates.find(info => !!normalizeSubpageJsonLdText(info[field]));
     return found ? String(found.sourceUrl || '') : '';
   };
-  return {
-    record: {
+  const record = {
       observed: true,
       observationComplete: true,
       sourceType: 'company_profile',
@@ -10054,7 +10161,10 @@ function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
         addressSourceUrl: fieldSource('address'),
         telephoneSourceUrl: fieldSource('telephone')
       }
-    },
+    };
+  if (fieldExtractionAudit) record.operatorIdentityFieldExtractionAuditV1 = fieldExtractionAudit;
+  return {
+    record,
     reason: 'observed_company_profile_complete'
   };
 }
@@ -10897,8 +11007,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           ? 'company_profile_fetched'
           : String(operatorPage && operatorPage.error || 'company_profile_fetch_failed');
       if (operatorPage && operatorPage.operatorIdentityInfo) {
-        const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(operatorPage.operatorIdentityInfo, 'company_profile');
-        if (normalizedOperatorIdentity) {
+      const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(operatorPage.operatorIdentityInfo, 'company_profile');
+      if (normalizedOperatorIdentity) {
+          normalizedOperatorIdentity.operatorIdentityFieldExtractionAuditV1 = operatorPage.operatorIdentityInfo.operatorIdentityFieldExtractionAuditV1 || null;
           operatorIdentityInfo = attachOperatorIdentityProbeProvenance_(normalizedOperatorIdentity, operatorCandidate);
           operatorIdentityInfo.observationComplete = operatorIdentityProbe.observationComplete;
         } else {
@@ -10917,6 +11028,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             hasOperatorInfo: false,
             extractionMethod: String(rawOperatorIdentity.extractionMethod || 'html_text'),
             evidenceLabels: Array.isArray(rawOperatorIdentity.evidenceLabels) ? rawOperatorIdentity.evidenceLabels.slice(0, 10) : [],
+            operatorIdentityFieldExtractionAuditV1: rawOperatorIdentity.operatorIdentityFieldExtractionAuditV1 || null,
             provenance: { reason: 'required_fields_missing' },
           };
         }
@@ -25956,6 +26068,7 @@ module.exports.__lightBudgetTestHooks = {
   parseSubpageJsonLdLightHtml,
   extractOperatorIdentityInfoFromHtml_,
   extractLegalOperatorInfoFromHtml_,
+  buildOperatorIdentityFieldExtractionAuditV1_,
   isObservedCompanyProfileScope_,
   operatorIdentityScopeKey_,
   buildOperatorIdentityInfoFromObservedCompanyProfiles_,
