@@ -10861,6 +10861,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       geoSignalsV1.trustSignals.operatorIdentityInfo = operatorIdentityInfo;
       geoSignalsV1.trustSignals.operatorIdentityProbe = operatorIdentityProbe;
     }
+    // Presence-only handoff contract for the GAS light bridge.  It deliberately
+    // carries neither company name, address, nor telephone.
+    geoSignalsV1.operatorIdentityBridgeProvenanceV1 = {
+      version: 'operator_identity_bridge_provenance_v1',
+      formalRecordPresent: !!operatorIdentityInfo,
+      formalRecordPath: operatorIdentityInfo ? 'geoSignalsV1.trustSignals.operatorIdentityInfo' : null,
+      producerComplete: !!(operatorIdentityProbe && operatorIdentityProbe.observationComplete === true)
+    };
     // This bounded provenance record is intentionally separate from the
     // formal identity record above.  GAS can persist it safely even when a
     // probe is partial, while only a complete formal record can affect the
