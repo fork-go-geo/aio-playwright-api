@@ -260,8 +260,10 @@ const legalInfo = extractLegalOperatorInfoFromHtml_('<table><tr><th>所在地</t
 assert.strictEqual(legalInfo.hasOperatorInfo, true);
 assert.strictEqual(legalInfo.sourceType, 'legal');
 
-// Case 5: the independent probe is limited to corporate/generic site modes.
-for (const siteMode of ['shop', 'shop_facility', 'media', 'saas', 'ec']) {
+// Case 5: SaaS uses the same bounded operator-profile probe, while modes
+// without this operator-identity contract remain excluded.
+assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCandidate], 'saas').url, asuzacUrl);
+for (const siteMode of ['shop', 'shop_facility', 'media', 'ec']) {
   assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCandidate], siteMode), null, siteMode);
 }
 
