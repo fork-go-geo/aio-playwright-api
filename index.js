@@ -2412,6 +2412,7 @@ async function collectMultimodalSignals(page, jsonldForFlags) {
         imageObjectCount,
         structuredImageTypes: take(uniq(structuredImageTypes), 12),
         primaryImageOfPage: primaryImageOfPage || '',
+        primaryImageOfPageSource: primaryImageOfPage ? 'jsonld_primary' : 'none',
         thumbnailUrlCount
       },
       video: {
@@ -15894,10 +15895,20 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       }, { totalImages:0, decorativeImages:0, contextCoveredImages:0, informativeImages:0, informativeAltMissingCount:0, decorativeEmptyAltCount:0, informativeAltPresentCount:0 });
       const altTotal = altObservationCounts.totalImages;
       const altMissingCount = altObservationCounts.informativeAltMissingCount;
-      const primaryImageCandidate = ogImageUrl || twitterImageUrl || multimodalJsonLd.primaryImageOfPage || multimodalJsonLd.structuredLogoUrl ||
-        absUrl((imgNodes.find((img) => clean(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src'))) || {}).currentSrc ||
-          (imgNodes.find((img) => clean(img.getAttribute && (img.getAttribute('src') || img.getAttribute('data-src')))) || {}).getAttribute?.('src') ||
-          '');
+      // A document-order <img> can be a menu control, tracking asset, or other UI
+      // element. It is not sufficient evidence for a page representative image.
+      let primaryImageCandidate = '';
+      let primaryImageOfPageSource = 'none';
+      if (ogImageUrl) {
+        primaryImageCandidate = ogImageUrl;
+        primaryImageOfPageSource = 'og';
+      } else if (twitterImageUrl) {
+        primaryImageCandidate = twitterImageUrl;
+        primaryImageOfPageSource = 'twitter';
+      } else if (multimodalJsonLd.primaryImageOfPage) {
+        primaryImageCandidate = multimodalJsonLd.primaryImageOfPage;
+        primaryImageOfPageSource = 'jsonld_primary';
+      }
       const contactRe = /contact|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/;
       const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
       const serviceRe = /service|business|solution|plan|サービス|事業|料金|プラン/;
@@ -16033,6 +16044,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         decorativeEmptyAltCount: altObservationCounts.decorativeEmptyAltCount,
         informativeAltPresentCount: altObservationCounts.informativeAltPresentCount,
         primaryImageOfPage: primaryImageCandidate || '',
+        primaryImageOfPageSource,
         sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
         source: 'balanced_light'
       };
@@ -21806,6 +21818,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           structuredImageCount: null,
           imgCount: multimodalNumber('imgCount'),
           primaryImageOfPage: ogImageUrl || twitterImageUrl || '',
+          primaryImageOfPageSource: ogImageUrl ? 'og' : (twitterImageUrl ? 'twitter' : 'none'),
           sampleImageUrls: [ogImageUrl, twitterImageUrl].filter(Boolean).slice(0, 5),
           source: 'shortfast_phase_builder'
         },
