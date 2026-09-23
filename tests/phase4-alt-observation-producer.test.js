@@ -9,8 +9,8 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
 
 function geo({ total, missing, navigationCompleted = true, observationLimited = false, frame = null } = {}) {
   const multimodalSignals = { checked: true, source: 'rendered_dom_open_shadow' };
-  if (total !== undefined) multimodalSignals.altTotal = total;
-  if (missing !== undefined) multimodalSignals.altMissingCount = missing;
+  if (total !== undefined) { multimodalSignals.totalImages = total; multimodalSignals.informativeImages = total; }
+  if (missing !== undefined) multimodalSignals.informativeAltMissingCount = missing;
   return {
     multimodalSignals,
     observed: {},
@@ -31,17 +31,14 @@ function gasAltState(raw) {
   // The GAS bridge preserves the producer fields but replaces authority with
   // its own bridge authority. This is the evaluator's validity contract.
   const o = Object.assign({}, raw, { authority: 'geoSignalsV1_light_bridge_v1', sourceAuthority: raw.authority });
-  const countOK = Number.isFinite(o.evaluatedImageCount) && Number.isFinite(o.altMissingCount) &&
-    o.evaluatedImageCount >= 0 && o.altMissingCount >= 0 && o.altMissingCount <= o.evaluatedImageCount;
-  const zero = countOK && o.evaluatedImageCount === 0 && o.altMissingCount === 0;
-  const ratioOK = o.evaluatedImageCount > 0 && Number.isFinite(o.weakRatio) &&
-    o.weakRatio === o.altMissingCount / o.evaluatedImageCount;
-  const semanticOK = zero ? o.hasWeakAlts === false :
-    (ratioOK && typeof o.hasWeakAlts === 'boolean' && o.hasWeakAlts === (o.weakRatio > 0.30));
+  const countOK = Number.isFinite(o.informativeImages) && Number.isFinite(o.informativeAltMissingCount) && o.informativeAltMissingCount <= o.informativeImages;
+  const zero = countOK && o.informativeImages === 0 && o.informativeAltMissingCount === 0;
+  const ratioOK = o.informativeImages > 0 && Number.isFinite(o.informativeAltMissingRatio) && o.informativeAltMissingRatio === o.informativeAltMissingCount / o.informativeImages;
+  const semanticOK = zero ? o.hasInformativeAltMissingIssue === false : (ratioOK && o.hasInformativeAltMissingIssue === (o.informativeAltMissingRatio > 0.30));
   const valid = o.checked === true && o.completeness === 'complete' && o.limited === false &&
     o.fallbackApplied !== true && o.requiredScopeComplete === true && countOK && semanticOK &&
     (zero || ratioOK);
-  return !valid ? 'unknown' : (o.hasWeakAlts ? 'fired' : 'not_fired');
+  return !valid ? 'unknown' : (o.hasInformativeAltMissingIssue ? 'fired' : 'not_fired');
 }
 
 let cases = 0;
@@ -50,19 +47,19 @@ function check(name, actual, expected) { assert.deepEqual(actual, expected, name
 const weak = hooks.buildAltObservationV2_(geo({ total: 10, missing: 4 }));
 check('complete 10 images / 4 missing', {
   completeness: weak.completeness, limited: weak.limited, requiredScopeComplete: weak.requiredScopeComplete,
-  evaluatedImageCount: weak.evaluatedImageCount, altMissingCount: weak.altMissingCount,
-  weakRatio: weak.weakRatio, hasWeakAlts: weak.hasWeakAlts
-}, { completeness:'complete', limited:false, requiredScopeComplete:true, evaluatedImageCount:10, altMissingCount:4, weakRatio:0.4, hasWeakAlts:true });
+  informativeImages: weak.informativeImages, informativeAltMissingCount: weak.informativeAltMissingCount,
+  informativeAltMissingRatio: weak.informativeAltMissingRatio, hasInformativeAltMissingIssue: weak.hasInformativeAltMissingIssue
+}, { completeness:'complete', limited:false, requiredScopeComplete:true, informativeImages:10, informativeAltMissingCount:4, informativeAltMissingRatio:0.4, hasInformativeAltMissingIssue:true });
 check('complete weak reaches GAS fired contract', gasAltState(weak), 'fired');
 
 const boundary = hooks.buildAltObservationV2_(geo({ total: 10, missing: 3 }));
-check('0.30 boundary remains non-weak', { completeness: boundary.completeness, weakRatio: boundary.weakRatio, hasWeakAlts: boundary.hasWeakAlts },
-  { completeness:'complete', weakRatio:0.3, hasWeakAlts:false });
+check('0.30 boundary remains non-weak', { completeness: boundary.completeness, informativeAltMissingRatio: boundary.informativeAltMissingRatio, hasInformativeAltMissingIssue: boundary.hasInformativeAltMissingIssue },
+  { completeness:'complete', informativeAltMissingRatio:0.3, hasInformativeAltMissingIssue:false });
 check('complete good reaches GAS not_fired contract', gasAltState(boundary), 'not_fired');
 
 const zero = hooks.buildAltObservationV2_(geo({ total: 0, missing: 0 }));
-check('zero image complete observation', { completeness: zero.completeness, requiredScopeComplete: zero.requiredScopeComplete, evaluatedImageCount: zero.evaluatedImageCount, weakRatio: zero.weakRatio, hasWeakAlts: zero.hasWeakAlts },
-  { completeness:'complete', requiredScopeComplete:true, evaluatedImageCount:0, weakRatio:null, hasWeakAlts:false });
+check('zero image complete observation', { completeness: zero.completeness, requiredScopeComplete: zero.requiredScopeComplete, informativeImages: zero.informativeImages, informativeAltMissingRatio: zero.informativeAltMissingRatio, hasInformativeAltMissingIssue: zero.hasInformativeAltMissingIssue },
+  { completeness:'complete', requiredScopeComplete:true, informativeImages:0, informativeAltMissingRatio:null, hasInformativeAltMissingIssue:false });
 check('zero image reaches GAS not_fired contract', gasAltState(zero), 'not_fired');
 
 const renderIncomplete = hooks.buildAltObservationV2_(geo({ total: 10, missing: 4, observationLimited: true }));
@@ -96,5 +93,12 @@ assert.ok(source.includes('lightweightSummary.altObservationV2 = multimodalObser
 assert.equal(JSON.stringify(weak).includes('http'), false, 'no URL in ALT observation');
 assert.equal(JSON.stringify(weak).includes('alt text'), false, 'no alt text in ALT observation');
 cases += 3;
+
+const classify = hooks.classifyAltPurposeV2_;
+check('presentation empty alt is decorative', classify({alt:'',role:'presentation'}), {decorative:true,contextCovered:false,informative:false,altPresent:false});
+check('aria-hidden empty alt is decorative', classify({alt:'',ariaHidden:'true'}), {decorative:true,contextCovered:false,informative:false,altPresent:false});
+check('unmarked empty alt remains informative', classify({alt:''}), {decorative:false,contextCovered:false,informative:true,altPresent:false});
+check('present alt remains informative and present', classify({alt:'商品の外観'}), {decorative:false,contextCovered:false,informative:true,altPresent:true});
+check('empty image in named control is context covered', classify({alt:'',controlAccessibleName:true}), {decorative:false,contextCovered:true,informative:false,altPresent:false});
 
 console.log(JSON.stringify({ pass:true, caseCount:cases }));

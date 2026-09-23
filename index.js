@@ -14165,6 +14165,18 @@ function attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, signal) {
 // later GAS transport/evaluator phase; no scoring decision is made here.
 const COVERAGE_OBSERVATION_V2_AUTHORITY_ = 'cloud_run_geoSignalsV1_coverageObservationV2';
 const ALT_OBSERVATION_V2_AUTHORITY_ = 'cloud_run_geoSignalsV1_multimodal_altObservationV2';
+// This classification deliberately has only explicit exclusions.  An empty alt
+// alone never proves decoration: uncertain images remain informative so the
+// observation does not silently discard a potentially meaningful image.
+function classifyAltPurposeV2_(input) {
+  const value = input && typeof input === 'object' ? input : {};
+  const role = String(value.role || '').trim().toLowerCase();
+  const ariaHidden = String(value.ariaHidden || '').trim().toLowerCase() === 'true';
+  const alt = String(value.alt || '').replace(/\s+/g, ' ').trim();
+  const decorative = role === 'presentation' || role === 'none' || ariaHidden;
+  const contextCovered = !decorative && !alt && value.controlAccessibleName === true;
+  return { decorative, contextCovered, informative: !decorative && !contextCovered, altPresent: !!alt };
+}
 const PRIMARY_MESSAGE_OBSERVATION_V2_AUTHORITY_ = 'cloud_run_geoSignalsV1_primaryMessageObservationV2';
 const COVERAGE_OBSERVATION_V2_PAGE_TIMEOUT_MS_ = 7000;
 const COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_ = 3;
@@ -14228,11 +14240,13 @@ function buildAltObservationV2_(geoSignalsV1, opts = {}) {
   // normal page may contain decorative frames without making its own document
   // scope incomplete.
   const source = childContentScope ? image : multimodal;
-  const total = typeof source.altTotal === 'number' && Number.isFinite(source.altTotal)
-    ? source.altTotal : null;
-  const missing = typeof source.altMissingCount === 'number' && Number.isFinite(source.altMissingCount)
-    ? source.altMissingCount : null;
-  const countsValid = total !== null && missing !== null && total >= 0 && missing >= 0 && missing <= total;
+  const totalImages = typeof source.totalImages === 'number' && Number.isFinite(source.totalImages) ? source.totalImages : null;
+  const informativeImages = typeof source.informativeImages === 'number' && Number.isFinite(source.informativeImages) ? source.informativeImages : null;
+  const informativeAltMissingCount = typeof source.informativeAltMissingCount === 'number' && Number.isFinite(source.informativeAltMissingCount) ? source.informativeAltMissingCount : null;
+  const countsValid = totalImages !== null && informativeImages !== null && informativeAltMissingCount !== null &&
+    totalImages >= informativeImages && informativeImages >= 0 && informativeAltMissingCount >= 0 && informativeAltMissingCount <= informativeImages;
+  const total = informativeImages;
+  const missing = informativeAltMissingCount;
   const imageScanComplete = childContentScope
     ? frame.frameContentObserved === true
     : multimodal.checked === true;
@@ -14244,8 +14258,8 @@ function buildAltObservationV2_(geoSignalsV1, opts = {}) {
   const requiredScopeComplete = countsValid && imageScanComplete && fallbackApplied !== true && renderComplete && frameScopeComplete;
   const checked = countsValid && imageScanComplete;
   const completeness = !checked ? 'unavailable' : (requiredScopeComplete ? 'complete' : 'partial');
-  const weakRatio = countsValid && total > 0 ? missing / total : null;
-  const hasWeakAlts = countsValid ? (total > 0 ? weakRatio > 0.30 : false) : null;
+  const informativeAltMissingRatio = countsValid && total > 0 ? missing / total : null;
+  const hasInformativeAltMissingIssue = countsValid ? (total > 0 ? informativeAltMissingRatio > 0.30 : false) : null;
   let failureKind = null;
   if (!checked) failureKind = entryContentShell && !childContentScope ? 'frame_incomplete' : 'fetch_error';
   else if (fallbackApplied) failureKind = 'fallback_applied';
@@ -14260,10 +14274,15 @@ function buildAltObservationV2_(geoSignalsV1, opts = {}) {
       (entryContentShell ? 'entry_content_frame_pending' : 'entry_rendered_dom_open_shadow'),
     authority: ALT_OBSERVATION_V2_AUTHORITY_,
     requiredScopeComplete,
-    evaluatedImageCount: total,
-    altMissingCount: missing,
-    weakRatio,
-    hasWeakAlts,
+    totalImages,
+    decorativeImages: typeof source.decorativeImages === 'number' ? source.decorativeImages : null,
+    contextCoveredImages: typeof source.contextCoveredImages === 'number' ? source.contextCoveredImages : null,
+    informativeImages: total,
+    informativeAltMissingCount: missing,
+    decorativeEmptyAltCount: typeof source.decorativeEmptyAltCount === 'number' ? source.decorativeEmptyAltCount : null,
+    informativeAltPresentCount: typeof source.informativeAltPresentCount === 'number' ? source.informativeAltPresentCount : null,
+    informativeAltMissingRatio,
+    hasInformativeAltMissingIssue,
     failureKind
   };
 }
@@ -14398,7 +14417,7 @@ function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
     const item = raw && typeof raw === 'object' ? raw : {};
     const url = normalizeCoverageObservationV2Url_(origin, item.href);
     if (!url || seen.has(url)) continue;
-    const text = `${item.text || ''} ${item.aria || ''} ${item.href || ''}`;
+    const text = `${item.text || ''} ${item.aria || ''} ${item.title || ''} ${item.href || ''}`;
     if (!include.test(text) || exclude.test(text)) continue;
     const candidate = new URL(url);
     if (target === 'breadcrumb') {
@@ -14413,6 +14432,23 @@ function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
   return out;
 }
 
+// Keep the FAQ-content decision conservative: a lone interrogative sentence
+// is not FAQ evidence.  A semantic FAQ container/heading needs either a
+// question-and-answer structure or multiple question prompts; FAQPage data is
+// an explicit positive signal only when it is present in the rendered page.
+function detectFaqContentV2_(input) {
+  const value = input && typeof input === 'object' ? input : {};
+  const mainObserved = value.mainObserved === true;
+  const faqHeading = value.faqHeading === true;
+  const faqContainer = value.faqContainer === true;
+  const faqStructuredData = value.faqStructuredData === true;
+  const pairCount = Number.isFinite(value.pairCount) ? value.pairCount : 0;
+  const questionCount = Number.isFinite(value.questionCount) ? value.questionCount : 0;
+  if (!mainObserved) return false;
+  if (faqStructuredData) return true;
+  return (faqHeading || faqContainer) && (pairCount >= 1 || questionCount >= 2);
+}
+
 function buildFaqObservationV2_(entry, candidates, discoveryComplete) {
   const candidateRows = Array.isArray(candidates) ? candidates : [];
   const entryComplete = isCoverageObservationV2CompletePage_(entry);
@@ -14421,7 +14457,10 @@ function buildFaqObservationV2_(entry, candidates, discoveryComplete) {
   // this producer's contract is a rendered-main observation, not a hint.
   const anyContent = [entry].concat(candidateRows).some(row => isCoverageObservationV2CompletePage_(row) && row.faqContent === true);
   const failureKind = [entry].concat(candidateRows).map(row => row && row.failureKind).find(Boolean) || null;
-  const complete = entryComplete && discoveryComplete === true && candidateComplete;
+  // A recognized FAQ link with no corresponding candidate is a discovery
+  // inconsistency, never absence authority.
+  const discoveryConsistent = !(entry && entry.faqLinkObserved === true && candidateRows.length === 0);
+  const complete = entryComplete && discoveryComplete === true && candidateComplete && discoveryConsistent;
   const value = anyContent ? true : (complete ? false : null);
   return Object.assign(coverageObservationV2Common_({
     checked: !!(entry && entry.checked),
@@ -14432,28 +14471,32 @@ function buildFaqObservationV2_(entry, candidates, discoveryComplete) {
     value,
     entry: { checked: !!(entry && entry.checked), value: entryComplete ? !!entry.faqContent : null,
       completeness: entryComplete ? 'complete' : ((entry && entry.checked) ? 'partial' : 'unavailable'), limited: !entryComplete },
-    candidates: { discoveryComplete: discoveryComplete === true, discoveredCount: candidateRows.length,
+    candidates: { discoveryComplete: discoveryComplete === true && discoveryConsistent, discoveredCount: candidateRows.length,
       attemptedCount: candidateRows.filter(row => row && row.attempted === true).length,
       completedCount: candidateRows.filter(isCoverageObservationV2CompletePage_).length,
       foundFaqContentCount: candidateRows.filter(row => row && row.faqContent === true).length,
-      failureKind }
+      failureKind: failureKind || (!discoveryConsistent ? 'faq_link_candidate_unresolved' : null) }
   });
 }
 
 function buildServiceContentObservationV2_(entry, candidates, discoveryComplete) {
   const rows = [entry].concat(Array.isArray(candidates) ? candidates : []).filter(Boolean);
   const lengthsComplete = rows.every(row => Number.isFinite(row.mainTextLength) && Number.isFinite(row.serviceTextLength));
-  const complete = discoveryComplete === true && rows.length > 0 && lengthsComplete && rows.every(isCoverageObservationV2CompletePage_) && rows.every(row => row.mainContentObserved === true && row.serviceRegionCertain === true);
+  // If a rendered service link was observed but could not be represented by a
+  // candidate, the bounded observation cannot establish a complete scope.
+  const discoveryConsistent = !(entry && entry.serviceLinkObserved === true && (Array.isArray(candidates) ? candidates.length : 0) === 0);
+  const complete = discoveryComplete === true && discoveryConsistent && rows.length > 0 && lengthsComplete && rows.every(isCoverageObservationV2CompletePage_) && rows.every(row => row.mainContentObserved === true && row.serviceRegionCertain === true);
   const mainTextLength = rows.some(row => typeof row.mainTextLength !== 'number') ? null : rows.reduce((n, row) => n + row.mainTextLength, 0);
   const serviceTextLength = rows.some(row => typeof row.serviceTextLength !== 'number') ? null : rows.reduce((n, row) => n + row.serviceTextLength, 0);
   return Object.assign(coverageObservationV2Common_({ checked: !!(entry && entry.checked),
     completeness: complete ? 'complete' : ((entry && entry.checked) ? 'partial' : 'unavailable'), limited: !complete,
     scope: 'entry_and_explicit_service_pages' }), {
-    candidateDiscoveryComplete: discoveryComplete === true,
+    candidateDiscoveryComplete: discoveryComplete === true && discoveryConsistent,
     explicitCandidateCount: Math.max(0, rows.length - 1), observedPageCount: rows.length,
     completedPageCount: rows.filter(isCoverageObservationV2CompletePage_).length,
     limitedPageCount: rows.filter(row => !isCoverageObservationV2CompletePage_(row) || row.mainContentObserved !== true || row.serviceRegionCertain !== true).length,
-    mainTextLength, serviceTextLength
+    mainTextLength, serviceTextLength,
+    failureKind: discoveryConsistent ? null : 'service_link_candidate_unresolved'
   });
 }
 
@@ -14474,12 +14517,12 @@ function buildBreadcrumbObservationV2_(entry, subpages, discoveryComplete) {
 }
 
 function buildHtmlSitemapCandidateDiscoveryV1_(entry, candidates) {
-  const complete = isCoverageObservationV2CompletePage_(entry);
+  const complete = isCoverageObservationV2CompletePage_(entry) && entry && entry.sitemapLinkDiscoveryComplete === true;
   return {
     checked: !!(entry && entry.checked), discoveryComplete: complete, discoveredCount: Array.isArray(candidates) ? candidates.length : 0,
     candidates: complete ? (Array.isArray(candidates) ? candidates.slice(0, COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : []) : [],
     completeness: complete ? 'complete' : ((entry && entry.checked) ? 'partial' : 'unavailable'),
-    limited: !complete, scope: 'entry_rendered_nav_footer_main', authority: COVERAGE_OBSERVATION_V2_AUTHORITY_, fallbackApplied: false,
+    limited: !complete, scope: 'entry_rendered_document_and_open_shadow_links', authority: COVERAGE_OBSERVATION_V2_AUTHORITY_, fallbackApplied: false,
     failureKind: complete ? null : (entry && entry.failureKind || 'render_incomplete')
   };
 }
@@ -14491,9 +14534,39 @@ async function readCoverageObservationV2Page_(page) {
       const mainElement = document.querySelector('main, [role="main"]');
       const main = mainElement || document.body;
       const mainText = clean(main && main.innerText);
-      const all = Array.from(document.querySelectorAll('a[href]')).map(a => ({ href: a.href, text: clean(a.textContent), aria: clean(a.getAttribute('aria-label')), region: a.closest('nav, footer, main, [role="navigation"], [role="main"]')?.tagName || '' }));
-      const faqHeading = !!mainElement && Array.from(main.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')).some(el => /(?:faq|q\s*&\s*a|よくある質問|質問)/i.test(clean(el.textContent)));
-      const faqPairs = mainElement ? main.querySelectorAll('details, dl, [itemtype*="FAQPage" i], [class*="faq" i], [id*="faq" i]').length : 0;
+      // Candidate discovery deliberately shares the broad rendered-link scope
+      // used for FAQ navigation signals: document links plus all reachable open
+      // shadow roots.  `links` remains bounded for non-FAQ observations, while
+      // `faqLinks` is the canonical unbounded FAQ-qualified subset.
+      const anchorNodes = [];
+      const collectAnchors = root => {
+        if (!root) return;
+        anchorNodes.push(...Array.from(root.querySelectorAll('a[href]')));
+        Array.from(root.querySelectorAll('*')).forEach(host => {
+          if (host.shadowRoot) collectAnchors(host.shadowRoot);
+        });
+      };
+      collectAnchors(document);
+      const all = anchorNodes.map(a => ({ href: a.href, text: clean(a.textContent), aria: clean(a.getAttribute('aria-label')), title: clean(a.getAttribute('title')), region: a.closest('nav, footer, main, [role="navigation"], [role="main"]')?.tagName || '' }));
+      const faqLinkRe=/(?:faq|q\s*&\s*a|qanda|よくある質問|よくあるご質問|質問|サポート|support|help)/i;
+      const faqLinks=all.filter(a=>faqLinkRe.test(`${a.text} ${a.aria} ${a.title} ${a.href}`));
+      const serviceLinkRe=/(?:service|services|product|products|solution|solutions|feature|features|pricing|料金|サービス|製品|商品|機能|ソリューション)/i;
+      const serviceLinkExcludeRe=/(?:faq|よくある質問|会社概要|company|about|採用|career|privacy|terms|legal|contact|お問い合わせ|login|search|blog|news|article)/i;
+      const serviceLinks=all.filter(a=>{
+        const text=`${a.text} ${a.aria} ${a.title} ${a.href}`;
+        return serviceLinkRe.test(text) && !serviceLinkExcludeRe.test(text);
+      });
+      const sitemapLinkRe=/(?:サイト\s*マップ|sitemap|site[-\s]?map)/i;
+      const sitemapLinks=all.filter(a=>sitemapLinkRe.test(`${a.text} ${a.aria} ${a.title} ${a.href}`));
+      const faqHeading = Array.from(main.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')).some(el => /(?:faq|q\s*&\s*a|よくある質問|よくあるご質問|質問)/i.test(clean(el.textContent)));
+      const faqContainer = !!main.querySelector('[itemtype*="FAQPage" i], [class*="faq" i], [id*="faq" i]');
+      const questionCount=Array.from(main.querySelectorAll('h2,h3,h4,[role="heading"], summary, dt, button')).filter(el => {
+        const text = clean(el.textContent);
+        return /[？?]/.test(text) || ((faqHeading || faqContainer) && text.length >= 4 && text.length <= 160 && /(?:について|ですか|ますか|方法|料金|条件|利用|対応|手続き|サポート)/.test(text));
+      }).length;
+      const faqPairs = main.querySelectorAll('details, dl, [itemtype*="FAQPage" i]').length;
+      const faqStructuredData = Array.from(document.querySelectorAll('script[type="application/ld+json" i]')).some(script => /"@type"\s*:\s*(?:\[[^\]]*)?"FAQPage"/i.test(script.textContent || ''));
+      const faqDetector = { mainObserved:!!mainElement, faqHeading, faqContainer, faqStructuredData, pairCount:faqPairs, questionCount };
       const breadcrumb = !!document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="パンくず" i], [class*="breadcrumb" i], [id*="breadcrumb" i], ol.breadcrumb, ul.breadcrumb');
       const serviceNodes = Array.from(main.querySelectorAll('section, article, [class], [id], [aria-label]')).filter(el => /(?:service|product|solution|feature|pricing|サービス|製品|商品|機能|料金)/i.test(`${el.id || ''} ${el.className || ''} ${el.getAttribute('aria-label') || ''}`));
       const serviceText = clean(serviceNodes.map(el => el.innerText || '').join(' '));
@@ -14502,9 +14575,13 @@ async function readCoverageObservationV2Page_(page) {
         // rendered service region exists. Null is reserved for an unobserved
         // region and must not accompany completeness='complete'.
         serviceTextLength: serviceNodes.length > 0 ? serviceText.length : null, serviceRegionCertain: serviceNodes.length > 0,
-        faqContent: faqHeading && faqPairs > 0, breadcrumbUi: breadcrumb, links: all.slice(0, 120) };
+        faqDetector, breadcrumbUi: breadcrumb, links: all.slice(0, 120), faqLinks, faqLinkObserved:faqLinks.length>0,
+        serviceLinks, serviceLinkObserved:serviceLinks.length>0,
+        sitemapLinks, sitemapLinkDiscoveryComplete:true };
     });
-    return Object.assign({ checked: true, attempted: true, renderComplete: fact.readyState === 'complete', frameComplete: !fact.hasFrame, failureKind: null }, fact);
+    return Object.assign({ checked: true, attempted: true, renderComplete: fact.readyState === 'complete', frameComplete: !fact.hasFrame, failureKind: null }, fact, {
+      faqContent: detectFaqContentV2_(fact.faqDetector)
+    });
   } catch (error) {
     return { checked: false, attempted: true, renderComplete: false, frameComplete: false,
       failureKind: coverageObservationV2FailureKind_(error && (error.message || error)), mainTextLength: null, serviceTextLength: null,
@@ -14535,11 +14612,13 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   let origin = '';
   try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
   const entry = await readCoverageObservationV2Page_(page);
+  entry.faqLinkObserved = entry.faqLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasFaqLink === true || geoSignalsV1.coverage.hasFaqNav === true));
+  entry.serviceLinkObserved = entry.serviceLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasServicePageLink === true || geoSignalsV1.coverage.hasServiceNav === true));
   const discoveryComplete = isCoverageObservationV2CompletePage_(entry) && !!origin;
-  const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_) : [];
-  const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
+  const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.faqLinks || entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_) : [];
+  const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.serviceLinks || entry.links, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
   const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
-  const sitemapUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
+  const sitemapUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
   const canOpen = context && typeof context.newPage === 'function';
   const faqRows = canOpen ? await observeCoverageObservationV2Candidates_(context, faqUrls) : [];
   const serviceRows = canOpen ? await observeCoverageObservationV2Candidates_(context, serviceUrls) : [];
@@ -14720,7 +14799,22 @@ async function collectFrameContentObservationV1_(page, entryUrl) {
         headings: { h1: limit(Array.from(document.querySelectorAll('h1')).map(el => clean(el.innerText || el.textContent)), 10), h2: limit(Array.from(document.querySelectorAll('h2')).map(el => clean(el.innerText || el.textContent)), 20), h3: limit(Array.from(document.querySelectorAll('h3')).map(el => clean(el.innerText || el.textContent)), 20) },
         semantic: { hasHeaderElement: !!document.querySelector('header'), hasNavElement: !!document.querySelector('nav,[role="navigation"]'), hasFooterElement: !!document.querySelector('footer'), hasMainElement: !!document.querySelector('main,[role="main"]') },
         links: { total: links.length, navTextsSample: limit(links.filter(item => item.inNav).map(item => item.text), 50), internalLinksSample: links.slice(0, 100), hasCompanyLikeLink: has(/会社概要|企業情報|about|company|corporate/i), hasServiceLikeLink: has(/サービス|製品|product|service/i), hasContactLikeLink: has(/お問い合わせ|問合せ|contact|inquiry/i), hasPrivacyLikeLink: has(/個人情報保護方針|プライバシー|privacy/i), hasSitemapLikeLink: has(/サイトマップ|sitemap/i), footerTextsSample: limit(links.filter(item => item.inFooter).map(item => item.text), 30) },
-        images: { altTotal: images.length, altMissingCount: images.filter(img => !clean(img.getAttribute('alt'))).length },
+        images: (() => {
+          const counts = images.reduce((out, img) => {
+            const alt = clean(img.getAttribute('alt'));
+            const role = clean(img.getAttribute('role')).toLowerCase();
+            const decorative = role === 'presentation' || role === 'none' || clean(img.getAttribute('aria-hidden')).toLowerCase() === 'true';
+            const control = img.closest && img.closest('a,button');
+            const controlName = control && clean(control.getAttribute('aria-label') || control.innerText || control.textContent);
+            out.totalImages++;
+            if (decorative) { out.decorativeImages++; if (!alt) out.decorativeEmptyAltCount++; }
+            else if (!alt && controlName) out.contextCoveredImages++;
+            else if (alt) { out.informativeImages++; out.informativeAltPresentCount++; }
+            else { out.informativeImages++; out.informativeAltMissingCount++; }
+            return out;
+          }, {totalImages:0,decorativeImages:0,contextCoveredImages:0,informativeImages:0,informativeAltMissingCount:0,decorativeEmptyAltCount:0,informativeAltPresentCount:0});
+          return Object.assign(counts, {altTotal:counts.totalImages,altMissingCount:counts.informativeAltMissingCount});
+        })(),
         structuredData: { types: limit(types, 50), rawCount: jsonLdCount, parseableCount, parseErrorsCount, hasJsonLd: jsonLdCount > 0, hasWebsite: typeSet.has('website'), hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'), hasBreadcrumbList: typeSet.has('breadcrumblist'), sameAsCount: limit(sameAs, 20).length, sameAsValuesSample: limit(sameAs, 8) },
         trust: { hasPrivacyPolicyLink: has(/個人情報保護方針|プライバシー|privacy/i), hasContactLink: has(/お問い合わせ|問合せ|contact|inquiry/i), hasCompanyLink: has(/会社概要|企業情報|about|company|corporate/i), hasAddress: /(?:都|道|府|県).{0,20}(?:市|区|町|村)|〒\s*\d{3}/.test(bodyText), hasPhone: /(?:\d{2,4}[-−]\d{2,4}[-−]\d{3,4}|tel[:：])/i.test(bodyText) },
         candidates: { sitemap: has(/サイトマップ|sitemap/i), breadcrumb: !!document.querySelector('[aria-label*="breadcrumb" i],.breadcrumb,[class*="breadcrumb" i]'), faq: has(/よくある質問|faq/i) }
@@ -15762,11 +15856,44 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         'link[rel~="apple-touch-icon"][href]',
         'link[rel="apple-touch-icon-precomposed"][href]'
       ]);
+      const classifyAltPurpose = (input) => {
+        const role = clean(input.role).toLowerCase();
+        const decorative = role === 'presentation' || role === 'none' || clean(input.ariaHidden).toLowerCase() === 'true';
+        const altPresent = !!clean(input.alt);
+        const contextCovered = !decorative && !altPresent && input.controlAccessibleName === true;
+        return { decorative, contextCovered, informative: !decorative && !contextCovered, altPresent };
+      };
       const imgNodes = queryAllDeep('img');
-      const altTotal = Array.isArray(imgNodes) ? imgNodes.length : null;
-      const altMissingCount = Array.isArray(imgNodes)
-        ? imgNodes.reduce((count, img) => count + (clean(img && img.getAttribute && img.getAttribute('alt')) ? 0 : 1), 0)
-        : null;
+      const altObservationCounts = (Array.isArray(imgNodes) ? imgNodes : []).reduce((counts, img) => {
+        const attr = (name) => clean(img && img.getAttribute && img.getAttribute(name));
+        const control = img && img.closest ? img.closest('a,button') : null;
+        let controlName = '';
+        if (control) {
+          controlName = clean(control.getAttribute('aria-label'));
+          if (!controlName) {
+            const ids = clean(control.getAttribute('aria-labelledby')).split(/\s+/).filter(Boolean);
+            controlName = clean(ids.map((id) => { const node = document.getElementById(id); return node && (node.innerText || node.textContent); }).join(' '));
+          }
+          if (!controlName) controlName = clean(control.innerText || control.textContent);
+        }
+        const classified = classifyAltPurpose({
+          alt: attr('alt'), role: attr('role'), ariaHidden: attr('aria-hidden'), controlAccessibleName: !!controlName
+        });
+        counts.totalImages += 1;
+        if (classified.decorative) {
+          counts.decorativeImages += 1;
+          if (!classified.altPresent) counts.decorativeEmptyAltCount += 1;
+        } else if (classified.contextCovered) {
+          counts.contextCoveredImages += 1;
+        } else {
+          counts.informativeImages += 1;
+          if (classified.altPresent) counts.informativeAltPresentCount += 1;
+          else counts.informativeAltMissingCount += 1;
+        }
+        return counts;
+      }, { totalImages:0, decorativeImages:0, contextCoveredImages:0, informativeImages:0, informativeAltMissingCount:0, decorativeEmptyAltCount:0, informativeAltPresentCount:0 });
+      const altTotal = altObservationCounts.totalImages;
+      const altMissingCount = altObservationCounts.informativeAltMissingCount;
       const primaryImageCandidate = ogImageUrl || twitterImageUrl || multimodalJsonLd.primaryImageOfPage || multimodalJsonLd.structuredLogoUrl ||
         absUrl((imgNodes.find((img) => clean(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src'))) || {}).currentSrc ||
           (imgNodes.find((img) => clean(img.getAttribute && (img.getAttribute('src') || img.getAttribute('data-src')))) || {}).getAttribute?.('src') ||
@@ -15898,6 +16025,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         imgCount: imgNodes.length,
         altTotal,
         altMissingCount,
+        totalImages: altObservationCounts.totalImages,
+        decorativeImages: altObservationCounts.decorativeImages,
+        contextCoveredImages: altObservationCounts.contextCoveredImages,
+        informativeImages: altObservationCounts.informativeImages,
+        informativeAltMissingCount: altObservationCounts.informativeAltMissingCount,
+        decorativeEmptyAltCount: altObservationCounts.decorativeEmptyAltCount,
+        informativeAltPresentCount: altObservationCounts.informativeAltPresentCount,
         primaryImageOfPage: primaryImageCandidate || '',
         sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
         source: 'balanced_light'
@@ -26910,12 +27044,14 @@ module.exports.__lightBudgetTestHooks = {
   attachHtmlSitemapCoverageSignalToGeoSignalsV1_,
   coverageObservationV2Common_,
   buildAltObservationV2_,
+  classifyAltPurposeV2_,
   attachAltObservationV2ToGeoSignalsV1_,
   ALT_OBSERVATION_V2_AUTHORITY_,
   buildPrimaryMessageObservationV2_,
   attachPrimaryMessageObservationV2ToGeoSignalsV1_,
   PRIMARY_MESSAGE_OBSERVATION_V2_AUTHORITY_,
   selectCoverageObservationV2Candidates_,
+  detectFaqContentV2_,
   buildFaqObservationV2_,
   buildServiceContentObservationV2_,
   buildBreadcrumbObservationV2_,

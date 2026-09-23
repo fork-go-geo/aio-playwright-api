@@ -4,7 +4,7 @@ const assert = require('assert');
 const hooks = require('../index.js').__lightBudgetTestHooks;
 
 const complete = extra => Object.assign({ checked:true, attempted:true, renderComplete:true, frameComplete:true,
-  failureKind:null, faqContent:false, breadcrumbUi:false, mainContentObserved:true, mainTextLength:120, serviceTextLength:80, serviceRegionCertain:true }, extra || {});
+  failureKind:null, faqContent:false, breadcrumbUi:false, mainContentObserved:true, mainTextLength:120, serviceTextLength:80, serviceRegionCertain:true, sitemapLinkDiscoveryComplete:true }, extra || {});
 const partial = kind => complete({ renderComplete:false, frameComplete:false, failureKind:kind || 'render_incomplete' });
 const cases = [];
 const check = (name, actual, expected) => { assert.deepStrictEqual(actual, expected, name); cases.push(name); };
