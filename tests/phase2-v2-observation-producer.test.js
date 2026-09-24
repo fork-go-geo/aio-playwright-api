@@ -33,11 +33,22 @@ check('service-body-fallback-partial', hooks.buildServiceContentObservationV2_(c
 
 // Breadcrumb requires a fully observed hierarchical subpage; entry-only is
 // unknown, never an explicit missing UI result.
-check('breadcrumb-hierarchical-present', hooks.buildBreadcrumbObservationV2_(complete(), [complete({ breadcrumbUi:true })], true).hasAnyUi, true);
+const breadcrumbPresent = hooks.buildBreadcrumbObservationV2_(complete(), [complete({ breadcrumbUi:true })], true);
+check('breadcrumb-hierarchical-present', breadcrumbPresent.hasAnyUi, true);
+check('breadcrumb-hierarchical-present-scope', breadcrumbPresent.observedScope, 'entry_and_hierarchical_subpage');
+check('breadcrumb-hierarchical-present-subpage-ui', breadcrumbPresent.subpageHasUi, true);
 check('breadcrumb-complete-absence', hooks.buildBreadcrumbObservationV2_(complete(), [complete()], true).hasAnyUi, false);
-check('breadcrumb-entry-only', hooks.buildBreadcrumbObservationV2_(complete(), [], true).hasAnyUi, null);
+const entryOnlyBreadcrumb = hooks.buildBreadcrumbObservationV2_(complete(), [], true);
+check('breadcrumb-entry-only', entryOnlyBreadcrumb.hasAnyUi, null);
+check('breadcrumb-entry-only-scope', entryOnlyBreadcrumb.observedScope, 'entry_only');
+check('breadcrumb-entry-only-formal-count', entryOnlyBreadcrumb.observedSubpageCount, 0);
 check('breadcrumb-frame-incomplete', hooks.buildBreadcrumbObservationV2_(complete(), [partial('frame_incomplete')], true).subpageHasUi, null);
 check('breadcrumb-render-incomplete', hooks.buildBreadcrumbObservationV2_(partial('render_incomplete'), [complete()], true).hasAnyUi, null);
+const mixedBreadcrumb = hooks.buildBreadcrumbObservationV2_(complete(), [complete(), partial('timeout')], true);
+check('breadcrumb-mixed-candidates-entry-only', mixedBreadcrumb.observedScope, 'entry_only');
+check('breadcrumb-mixed-candidates-formal-count-is-zero', mixedBreadcrumb.observedSubpageCount, 0);
+check('breadcrumb-mixed-candidates-debug-completed-count', mixedBreadcrumb.completedCandidateCount, 1);
+check('breadcrumb-jsonld-only-is-not-ui-positive', hooks.buildBreadcrumbObservationV2_(complete({ breadcrumbUi:false, hasBreadcrumbJsonLd:true }), [complete({ breadcrumbUi:false, hasBreadcrumbJsonLd:true })], true).hasAnyUi, false);
 
 // Rendered sitemap discovery is transport-only and emits at most five URLs.
 check('sitemap-rendered-link-found', hooks.buildHtmlSitemapCandidateDiscoveryV1_(complete(), [
@@ -58,9 +69,38 @@ const selectedService = hooks.selectCoverageObservationV2Candidates_('https://fi
 ], 'service', 3);
 check('service-candidate-cap', selectedService.length, 3);
 const selectedBreadcrumb = hooks.selectCoverageObservationV2Candidates_('https://fixture.invalid/', [
-  { href:'/product/detail', text:'Product detail' }, { href:'/faq', text:'FAQ' }
-], 'breadcrumb', 2);
-check('breadcrumb-hierarchical-only', selectedBreadcrumb, ['https://fixture.invalid/product/detail']);
+  { href:'/company/', text:'Company' }, { href:'/product/detail', text:'Product detail' },
+  { href:'/news/example', text:'News article' }, { href:'/faq', text:'FAQ' }
+], 'breadcrumb', 3);
+check('breadcrumb-candidate-priority-and-cap', selectedBreadcrumb, [
+  'https://fixture.invalid/product/detail', 'https://fixture.invalid/news/example', 'https://fixture.invalid/company/'
+]);
+check('breadcrumb-excludes-faq', selectedBreadcrumb.includes('https://fixture.invalid/faq'), false);
+check('breadcrumb-company-about-is-generic-hierarchical-candidate', selectedBreadcrumb.includes('https://fixture.invalid/company/'), true);
+const privacyOnlyBreadcrumb = hooks.selectCoverageObservationV2Candidates_('https://fixture.invalid/', [
+  { href:'/privacy/', text:'Privacy' }, { href:'/legal/', text:'Legal' }, { href:'/contact/', text:'Contact' }
+], 'breadcrumb', 3);
+check('breadcrumb-excludes-privacy-legal-contact', privacyOnlyBreadcrumb, []);
+
+// Cross-boundary synthetic contract.  This models the formal object only: the
+// GAS-side merge/readback implementation has its own fixture.  No network,
+// Sheet, Cloud Run, or target site is involved here.
+const formalBreadcrumb = hooks.buildBreadcrumbObservationV2_(complete({ breadcrumbUi:false }), [complete({ breadcrumbUi:true })], true);
+const cloudRunPayload = { geoSignalsV1:{ coverage:{ breadcrumbObservationV2:formalBreadcrumb } } };
+const gasBridgeAuditSig = { coverageObservationV2:{ breadcrumb:cloudRunPayload.geoSignalsV1.coverage.breadcrumbObservationV2 } };
+const observationRow = { itemKey:'breadcrumb_ui', ruleEvidenceV1:{
+  hasAnyUi:gasBridgeAuditSig.coverageObservationV2.breadcrumb.hasAnyUi,
+  topHasUi:gasBridgeAuditSig.coverageObservationV2.breadcrumb.topHasUi,
+  subpageHasUi:gasBridgeAuditSig.coverageObservationV2.breadcrumb.subpageHasUi,
+  observedScope:gasBridgeAuditSig.coverageObservationV2.breadcrumb.observedScope,
+  observedSubpageCount:gasBridgeAuditSig.coverageObservationV2.breadcrumb.observedSubpageCount
+} };
+const snapshotReadback = JSON.parse(JSON.stringify({ auditSig:gasBridgeAuditSig }));
+check('breadcrumb-e2e-cloud-run-to-gas-snapshot', snapshotReadback.auditSig.coverageObservationV2.breadcrumb, formalBreadcrumb);
+check('breadcrumb-e2e-row-uses-same-formal-values', observationRow.ruleEvidenceV1, {
+  hasAnyUi:true, topHasUi:false, subpageHasUi:true,
+  observedScope:'entry_and_hierarchical_subpage', observedSubpageCount:1
+});
 const selectedSitemap = hooks.selectCoverageObservationV2Candidates_('https://fixture.invalid', [
   { href:'/site-map/', text:'Site map' }, { href:'/sitemap.html', text:'Sitemap' }
 ], 'sitemap', 5);

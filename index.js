@@ -14182,7 +14182,7 @@ const PRIMARY_MESSAGE_OBSERVATION_V2_AUTHORITY_ = 'cloud_run_geoSignalsV1_primar
 const COVERAGE_OBSERVATION_V2_PAGE_TIMEOUT_MS_ = 7000;
 const COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_ = 3;
 const COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_ = 3;
-const COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_ = 2;
+const COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_ = 3;
 const COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_ = 5;
 
 function normalizeCoverageObservationV2Url_(origin, value) {
@@ -14404,16 +14404,17 @@ function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
     : target === 'service'
       ? /(?:service|services|product|products|solution|solutions|feature|features|pricing|料金|サービス|製品|商品|機能|ソリューション)/i
       : target === 'breadcrumb'
-        ? /(?:service|product|solution|company|about|detail|category|サービス|製品|商品|会社|事業|施設)/i
+        ? /(?:service|product|solution|company|about|detail|category|case|article|post|news|blog|item|guide|store|facility|サービス|製品|商品|会社|事業|施設|事例|記事|ニュース|ブログ|店舗|ガイド)/i
         : /(?:sitemap|site[-_\s]?map|サイト\s*マップ)/i;
   const exclude = target === 'service'
     ? /(?:faq|よくある質問|会社概要|company|about|採用|career|privacy|terms|legal|contact|お問い合わせ|login|search|blog|news|article)/i
     : target === 'breadcrumb'
-      ? /(?:faq|よくある質問|privacy|terms|legal|contact|お問い合わせ|login|search|blog|news|article)/i
+      ? /(?:faq|よくある質問|privacy|terms|legal|contact|お問い合わせ|login|search)/i
       : /(?:javascript:|mailto:|tel:)/i;
   const base = new URL(origin);
   const seen = new Set();
   const out = [];
+  let ordinal = 0;
   for (const raw of (Array.isArray(links) ? links : [])) {
     const item = raw && typeof raw === 'object' ? raw : {};
     const url = normalizeCoverageObservationV2Url_(origin, item.href);
@@ -14427,10 +14428,24 @@ function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
       if (depth <= rootDepth) continue;
     }
     seen.add(url);
-    out.push(url);
-    if (out.length >= maxCount) break;
+    if (target === 'breadcrumb') {
+      // A detail/content page gives the UI observation more opportunity to
+      // encounter a real hierarchy than a broad landing page.  This is only a
+      // generic lexical priority over the rendered internal-link graph; it
+      // never infers a breadcrumb from the role or URL itself.
+      const rankText = text.toLowerCase();
+      const rank = /(?:detail|product|item|case|article|post|news|blog|詳細|製品|商品|事例|記事|ニュース|ブログ)/i.test(rankText) ? 0
+        : /(?:service|solution|category|guide|store|facility|サービス|事業|カテゴリ|ガイド|店舗|施設)/i.test(rankText) ? 1
+          : /(?:company|about|会社|企業|概要)/i.test(rankText) ? 2 : 3;
+      out.push({ url, rank, ordinal: ordinal++ });
+    } else {
+      out.push(url);
+      if (out.length >= maxCount) break;
+    }
   }
-  return out;
+  if (target !== 'breadcrumb') return out;
+  return out.sort((a, b) => a.rank - b.rank || a.ordinal - b.ordinal)
+    .slice(0, maxCount).map(item => item.url);
 }
 
 // Keep the FAQ-content decision conservative: a lone interrogative sentence
@@ -14513,7 +14528,13 @@ function buildBreadcrumbObservationV2_(entry, subpages, discoveryComplete) {
     hasAnyUi: complete ? (entry.breadcrumbUi === true || subpageHasUi === true) : null,
     topHasUi: entryComplete ? !!entry.breadcrumbUi : null,
     subpageHasUi, observedScope: complete ? 'entry_and_hierarchical_subpage' : (entryComplete ? 'entry_only' : 'unknown'),
-    observedSubpageCount: completed.length, legacyUsed: false
+    // This formal count is meaningful only with the formal hierarchical scope:
+    // a partly failed candidate batch must not look like a completed subpage
+    // observation merely because one candidate happened to render.
+    observedSubpageCount: complete ? completed.length : 0,
+    completedCandidateCount: completed.length,
+    candidateCount: pages.length,
+    legacyUsed: false
   });
 }
 
