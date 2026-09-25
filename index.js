@@ -3241,6 +3241,13 @@ function isLegalOperatorCandidatePath_(value) {
   return /\/(?:policies\/legal-notice|legal-notice|legal|law|commercial-transactions|specified-commercial-transactions|tokushoho)(?:\/|$|-|_)/i.test(path);
 }
 
+function isOrganizationInformationContext_(url, text) {
+  const path = (() => { try { return new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { return String(url || '').toLowerCase(); } })();
+  const hay = `${path} ${String(text || '')}`;
+  return /\/(?:guide|organization|information|about|company|corporate|profile|outline|overview)(?:\/|$|-|_)/i.test(path) ||
+    /大学について|基本情報|組織概要|組織情報|法人情報|団体概要|機関概要|運営情報|会社概要|企業情報|運営主体|\b(?:organization|institution|governance|basic\s+information|company|corporate|profile|overview)\b/i.test(hay);
+}
+
 // Evaluate the existing high-confidence predicate once so the bounded audit
 // below can report its inputs without creating a second selection contract.
 function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
@@ -3257,7 +3264,7 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
   // when the destination page itself contains a Japanese company profile.
   // A label is still only a discovery hint: the sitemap + human-navigation
   // corroboration below remains mandatory before the extra probe is made.
-  const companyLabel = /会社概要|法人概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i.test(label);
+  const companyLabel = isOrganizationInformationContext_(url, label);
   // XML and HTML sitemaps are both discovery corroboration.  An HTML
   // sitemap alone is not enough: it must be independently linked from a
   // human-facing navigation surface as well.
@@ -3301,10 +3308,10 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
   // navigation or footer hub whose path is its parent.  The discovery phase
   // sets this flag after checking both relationships; it is not a URL-only
   // fallback and does not admit arbitrary "company" paths.
-  if (!companyPath) result.rejectionReasons.push('path_not_company_profile');
+  if (!companyPath && !isOrganizationInformationContext_(url, label)) result.rejectionReasons.push('path_not_company_profile');
   if (!companyLabel && !semanticHubCorroborated) result.rejectionReasons.push('company_profile_label_missing');
   if (!corroborated && !semanticHubCorroborated) result.rejectionReasons.push('independent_corroboration_missing');
-  result.highConfidenceEligible = companyPath && ((companyLabel && corroborated) || semanticHubCorroborated);
+  result.highConfidenceEligible = (companyPath || isOrganizationInformationContext_(url, label)) && ((companyLabel && corroborated) || semanticHubCorroborated);
   return result;
 }
 
@@ -3333,7 +3340,7 @@ function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
   }
   const sourceTypes = Array.from(new Set(strict.sources));
   const humanNavigation = sourceTypes.includes('nav') || sourceTypes.includes('footer');
-  const explicitCompanyOrOperatorLabel = /会社概要|法人概要|企業情報|運営会社|運営元|運営者情報|運営主体|法人情報|事業者情報|会社情報|会社案内|企業概要|事業部紹介|\b(?:company|corporate|about(?:\s+us)?|profile|overview|operator)\b/i.test(strict.label);
+  const explicitCompanyOrOperatorLabel = isOrganizationInformationContext_(strict.url, strict.label);
   const explicitLegalLink = isLegalOperatorCandidateText_(strict.label) || isLegalOperatorCandidatePath_(strict.url);
   // External destinations retain their existing explicit-relation gate.  A
   // same-origin human-facing label may use this limited fallback because the
@@ -3561,8 +3568,7 @@ function isObservedCompanyProfileScope_(url, title, h1Texts) {
   })();
   const text = [title].concat(Array.isArray(h1Texts) ? h1Texts : [])
     .map(value => normalizeSubpageJsonLdText(value)).join(' ').toLowerCase();
-  return /\/(?:about(?:[_-]?site)?|about-us|company|corporate|profile|outline|overview|company-profile)(?:\/|$|-|_|\.)/i.test(path) ||
-    /会社概要|企業情報|運営会社|法人情報|事業者情報|会社情報|会社案内|企業概要|\b(?:company|corporate|about(?:\s+us)?|profile|overview)\b/i.test(text);
+  return isOrganizationInformationContext_(url, text);
 }
 
 function operatorIdentityScopeKey_(url) {
@@ -3815,15 +3821,31 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return { value: '', label: '' };
     };
     const structuredName = operator.value ? { value: '', label: '' } : companyNameFromStructuredName();
+    let canonicalIdentityName = '';
+    if (!operator.value && !structuredName.value && sourceType === 'company_profile' && meta.highConfidenceCompanyProfile === true && meta.selectedOperatorIdentityHub === true && address.value && isOrganizationInformationContext_(sourceUrl, pageHay)) {
+      const signals = new Map();
+      const add = (raw, source) => {
+        const value = normalizeSubpageJsonLdText(raw).replace(/\s+[A-Z][A-Z\s.&,'-]{2,}$/g, '');
+        if (!value || value.length > 80 || /ニュース|お知らせ|イベント|採用|募集|入試|学部|学科/.test(value)) return;
+        if (!signals.has(value)) signals.set(value, new Set()); signals.get(value).add(source);
+      };
+      const titleParts = title.split(/[｜|]/).map(normalizeSubpageJsonLdText).filter(Boolean);
+      if (titleParts.length >= 2) add(titleParts[titleParts.length - 1], 'title_suffix');
+      $('meta[property="og:site_name"],meta[name="application-name"]').each((_, el) => add($(el).attr('content'), 'site_name_meta'));
+      $('header,[role="banner"],[class*="header" i]').find('[class*="logo" i][aria-label],[class*="logo" i] img[alt]').each((_, el) => add($(el).attr('aria-label') || $(el).attr('alt'), 'header_or_logo'));
+      const accepted = Array.from(signals.entries()).filter(([, sources]) => sources.size >= 2);
+      if (signals.size === 1 && accepted.length === 1) canonicalIdentityName = accepted[0][0];
+    }
 
     const out = Object.assign({}, empty, {
-      operatorName: operator.value ? cleanOperatorName(operator.value) : structuredName.value,
+      operatorName: operator.value ? cleanOperatorName(operator.value) : (structuredName.value || canonicalIdentityName),
       address: address.value ? extractJapaneseAddress(address.value) : '',
       telephone: telephone.value ? extractJapanesePhone(telephone.value) : ''
     });
     out.companyName = out.operatorName;
     if (out.operatorName && operator.label) out.evidenceLabels.push(operator.label);
     if (out.operatorName && structuredName.label) out.evidenceLabels.push(structuredName.label);
+    if (canonicalIdentityName) out.evidenceLabels.push('canonical_site_identity');
     if (out.address && address.label) out.evidenceLabels.push(address.label);
     if (out.telephone && telephone.label) out.evidenceLabels.push(telephone.label);
     out.hasOperatorName = !!out.operatorName;
@@ -4646,7 +4668,8 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
         // coverage scope. The extractor still requires explicit labelled
         // company/address fields before it becomes positive; telephone is
         // retained as supporting evidence when present.
-        highConfidenceCompanyProfile: true
+        highConfidenceCompanyProfile: true,
+        selectedOperatorIdentityHub: opts && opts.operatorIdentitySelectedHub === true
       })
     : null;
   if (operatorIdentityInfo && typeof operatorIdentityInfo === 'object') {
@@ -11529,6 +11552,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           reserveMs: lightBudget ? LIGHT_RESPONSE_CLEANUP_RESERVE_MS : undefined,
           minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
           operatorIdentitySourceType: operatorProbeSourceType === 'company_profile' ? 'company_profile' : undefined,
+          operatorIdentitySelectedHub: operatorProbeSourceType === 'company_profile',
           highConfidenceCompanyProfile: true,
           collectOperatorSecondPageCompanyProfileLink: operatorProbeSourceType === 'company_profile' &&
             operatorCandidate.officialExternalOperatorProfile !== true
