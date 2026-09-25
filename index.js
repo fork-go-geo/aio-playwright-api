@@ -3353,6 +3353,30 @@ function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
       probeSourceType: 'legal'
     });
   }
+  // A generic-route candidate is only a bounded fetch permission, never
+  // identity evidence.  Some corporate sites expose their primary company
+  // page in a non-semantic wrapper, so its anchor label cannot satisfy the
+  // normal nav/footer contract.  Admit a direct company/profile landing path
+  // or one non-sectional company child path here; CSR, IR, safety and other
+  // sectional pages stay excluded.
+  const genericSources = Array.from(new Set(strict.sources));
+  const genericRouteOnly = candidate && candidate.officialExternalOperatorProfile !== true &&
+    genericSources.includes('genericRoute');
+  const genericProfilePath = (() => {
+    const path = String(strict.path || '').replace(/\/{2,}/g, '/');
+    const directProfile = /\/(?:company|corporate|about|profile|outline)(?:\/(?:index\.(?:html?|htm))?)?\/?$/i.test(path);
+    const namedProfile = /\/(?:company|corporate|about)(?:\/(?:profile|overview|outline|company-info|company-information|organization|operator))(?:\/(?:index\.(?:html?|htm))?)?\/?$/i.test(path);
+    const companyChildProfile = /\/(?:company|corporate|about)\/[^/?#]+(?:\/(?:index\.(?:html?|htm))?)?\/?$/i.test(path);
+    const excludedSection = /\/(?:csr|contribution|sustainability|safety|security|ir|investor|governance|environment|health|recruit|career|group)(?:\/|$)/i.test(path);
+    return !excludedSection && (directProfile || namedProfile || companyChildProfile);
+  })();
+  if (genericRouteOnly && genericProfilePath) {
+    return Object.assign({}, strict, {
+      probeEligible: true,
+      probeTier: 'generic_route_company_profile',
+      probeSourceType: 'company_profile'
+    });
+  }
   return Object.assign({}, strict, {
     probeEligible: false,
     probeTier: null,
@@ -3401,11 +3425,18 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
     .concat(entries.filter(item => !item.highConfidenceEligible))
     .slice(0, 5);
   const selected = bounded.find(item => item.selectedForProbe) || null;
+  const probeCandidateCount = entries.filter(item => item.boundedProbeEligible === true).length;
   const discover = opts && opts.discoverLinkAudit && typeof opts.discoverLinkAudit === 'object'
     ? opts.discoverLinkAudit : null;
   return {
     version: 'operator_identity_candidate_audit_v1',
     siteMode: mode || null,
+    producerReached: opts.producerReached === true ? true : null,
+    candidateCount: typeof opts.candidateCount === 'number' ? Math.max(0, opts.candidateCount) : entries.length,
+    probeCandidateCount: typeof opts.probeCandidateCount === 'number' ? Math.max(0, opts.probeCandidateCount) : probeCandidateCount,
+    completeCandidateCount: typeof opts.completeCandidateCount === 'number' ? Math.max(0, opts.completeCandidateCount) : null,
+    failureStage: typeof opts.failureStage === 'string' ? opts.failureStage : null,
+    formalRecordPresent: opts.formalRecordPresent === true,
     discoveredLinkCount: discover ? discover.discoveredLinkCount : null,
     operatorRelationLinkCount: discover ? discover.operatorRelationLinkCount : null,
     footerLinkCount: discover ? discover.footerLinkCount : null,
@@ -3420,6 +3451,21 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
       selectedCandidateLabel: selected ? selected.anchorLabel : null,
       selectedCandidateProbeTier: selected ? selected.probeTier : null,
       selectedCandidateSourceType: selected ? selected.probeSourceType : null,
+      probedUrl: typeof opts.probedUrl === 'string' ? opts.probedUrl : null,
+      firstProbeUrl: typeof opts.firstProbeUrl === 'string' ? opts.firstProbeUrl : null,
+      firstProbeResult: typeof opts.firstProbeResult === 'string' ? opts.firstProbeResult : null,
+      landingProbeUrl: typeof opts.landingProbeUrl === 'string' ? opts.landingProbeUrl : null,
+      landingProbeResult: typeof opts.landingProbeResult === 'string' ? opts.landingProbeResult : null,
+      hubProbeAttempted: opts.hubProbeAttempted === true,
+      hubProbeUrl: typeof opts.hubProbeUrl === 'string' ? opts.hubProbeUrl : null,
+      hubProbeResult: typeof opts.hubProbeResult === 'string' ? opts.hubProbeResult : null,
+      detailProbeAttempted: opts.detailProbeAttempted === true,
+      detailProbeUrl: typeof opts.detailProbeUrl === 'string' ? opts.detailProbeUrl : null,
+      detailProbeResult: typeof opts.detailProbeResult === 'string' ? opts.detailProbeResult : null,
+      totalOperatorProbeCount: typeof opts.totalOperatorProbeCount === 'number' ? Math.max(0, opts.totalOperatorProbeCount) : null,
+      secondProbeAttempted: opts.secondProbeAttempted === true,
+      secondProbeUrl: typeof opts.secondProbeUrl === 'string' ? opts.secondProbeUrl : null,
+      secondProbeResult: typeof opts.secondProbeResult === 'string' ? opts.secondProbeResult : null,
       noCandidateReason: selected ? null : (opts.noCandidateReason || (mode === 'corporate' || mode === 'generic' ? 'no_high_confidence_candidate' : 'site_mode_not_applicable'))
     }
   };
@@ -3816,37 +3862,100 @@ function extractOperatorIdentityInfoFromHtml_(html, sourceUrl, meta = {}) {
   }));
 }
 
-// An explicitly related external operator root may be a corporate landing
-// page rather than the page that carries its formal fields.  This collector is
-// deliberately narrow: it permits one same-origin detail link with an exact,
-// human-facing company-profile label.  It is never used for ordinary coverage
-// discovery or for generic About/News/Service/Contact links.
+// A fetched company landing page may link to the one page that carries its
+// formal fields. This collector is deliberately narrow: it permits one
+// same-origin, safe HTML detail link with an explicit human-facing
+// company-profile label. It is never used for ordinary coverage discovery.
 function collectExplicitCompanyProfileDetailLinksFromHtml_(html, rootUrl) {
   const out = [];
   let root;
   try { root = new URL(String(rootUrl || '')); } catch (_) { return out; }
-  const profileLabelRe = /^(?:会社概要|会社情報|企業情報|corporate\s+profile|company\s+profile)$/i;
+  const isExplicitProfileLabel = value => {
+    const label = normalizeSubpageJsonLdText(value).replace(/\s+/g, ' ');
+    return /^(?:会社概要|企業概要|会社データ|company\s+overview(?:\s*\(english\))?|company\s+profile|corporate\s+profile|about\s+company)$/i.test(label) ||
+      /^(?:会社概要|企業概要|会社データ)\s+(?:company\s+overview|company\s+profile|corporate\s+profile)(?:\s*\(english\))?$/i.test(label);
+  };
+  const isSafeHtmlTarget = target => {
+    if (!target || !/^https?:$/.test(target.protocol) || target.origin !== root.origin) return false;
+    const path = String(target.pathname || '');
+    if (!path || /\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|7z|jpe?g|png|gif|webp|svg|mp[34]|avi|mov|css|js)(?:$|\/)/i.test(path)) return false;
+    return true;
+  };
+  const profileLabelScore = label => {
+    const normalized = normalizeSubpageJsonLdText(label).toLowerCase();
+    // A native formal-profile label is the strongest signal. This matters on
+    // bilingual company hubs where an English overview link may be stale or
+    // merely navigational while the Japanese 会社概要 is the formal detail.
+    if (/^(?:会社概要|企業概要|会社データ)$/.test(normalized)) return 4;
+    if (/(?:会社概要|企業概要|会社データ)/.test(normalized) && /company\s+(?:overview|profile)|corporate\s+profile/.test(normalized)) return 3;
+    if (/company\s+overview|company\s+profile|corporate\s+profile|about\s+company/.test(normalized)) return 2;
+    return 1;
+  };
   try {
     const $ = cheerio.load(String(html || ''));
     $('a[href]').each((_, el) => {
-      if (out.length >= 1) return;
+      if (out.length >= 5) return;
       const label = normalizeSubpageJsonLdText([
         $(el).text(), $(el).attr('aria-label'), $(el).attr('title')
       ].filter(Boolean).join(' '));
-      if (!profileLabelRe.test(label)) return;
+      if (!isExplicitProfileLabel(label)) return;
       let target;
       try { target = new URL(String($(el).attr('href') || ''), root); } catch (_) { return; }
-      if (!/^https?:$/.test(target.protocol) || target.origin !== root.origin) return;
+      if (!isSafeHtmlTarget(target)) return;
       target.hash = '';
       if (target.pathname === root.pathname && !target.search) return;
       out.push({
         url: target.toString(),
         label: label.slice(0, 80),
-        source: 'external_root_company_profile_link'
+        source: 'explicit_company_profile_link',
+        score: profileLabelScore(label)
       });
     });
   } catch (_) {}
-  return out;
+  return out.sort((a, b) => (b.score - a.score) || a.url.localeCompare(b.url)).slice(0, 1).map(item => ({
+    url: item.url, label: item.label, source: item.source
+  }));
+}
+
+// A company landing may point to a company-information hub rather than the
+// page that contains formal fields.  This is intentionally a separate role
+// from a formal-detail link: a hub may be fetched once, and only that hub may
+// nominate one explicit formal-detail page.
+function collectExplicitCompanyProfileHubLinksFromHtml_(html, rootUrl) {
+  const out = [];
+  let root;
+  try { root = new URL(String(rootUrl || '')); } catch (_) { return out; }
+  const isHubLabel = value => {
+    const label = normalizeSubpageJsonLdText(value).replace(/\s+/g, ' ');
+    return /^(?:企業情報|会社情報|corporate|company|about\s+company|company\s+(?:info(?:rmation)?|information)|corporate\s+(?:info(?:rmation)?|information))$/i.test(label);
+  };
+  const isSafeHtmlTarget = target => {
+    if (!target || !/^https?:$/.test(target.protocol) || target.origin !== root.origin) return false;
+    const path = String(target.pathname || '');
+    if (!path || /\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|7z|jpe?g|png|gif|webp|svg|mp[34]|avi|mov|css|js)(?:$|\/)/i.test(path)) return false;
+    return /(?:^|\/)(?:company|corporate|about)(?:\/|$)/i.test(path);
+  };
+  try {
+    const $ = cheerio.load(String(html || ''));
+    $('a[href]').each((_, el) => {
+      if (out.length >= 5) return;
+      const label = normalizeSubpageJsonLdText([
+        $(el).text(), $(el).attr('aria-label'), $(el).attr('title')
+      ].filter(Boolean).join(' '));
+      if (!isHubLabel(label)) return;
+      let target;
+      try { target = new URL(String($(el).attr('href') || ''), root); } catch (_) { return; }
+      if (!isSafeHtmlTarget(target)) return;
+      target.hash = '';
+      if (target.pathname === root.pathname && !target.search) return;
+      out.push({
+        url: target.toString(),
+        label: label.slice(0, 80),
+        source: 'explicit_company_profile_hub_link'
+      });
+    });
+  } catch (_) {}
+  return out.sort((a, b) => a.url.localeCompare(b.url)).slice(0, 1);
 }
 
 function isExternalOperatorRootCandidate_(candidate) {
@@ -3867,6 +3976,44 @@ function selectExternalOperatorRootCompanyProfileDetailLink_(operatorPage, candi
     : [];
   const first = links[0];
   return first && first.url ? first : null;
+}
+
+function selectOperatorSecondPageCompanyProfileDetailLink_(operatorPage, candidate, firstIdentity) {
+  if (!operatorPage || operatorPage.ok !== true || !candidate || candidate.officialExternalOperatorProfile === true) return null;
+  if (candidate.operatorIdentityProbeSourceType !== 'company_profile') return null;
+  if (!firstIdentity || firstIdentity.hasOperatorInfo === true || firstIdentity.conflict === true) return null;
+  const links = Array.isArray(operatorPage.companyProfileDetailLinks)
+    ? operatorPage.companyProfileDetailLinks : [];
+  const first = links[0];
+  if (!first || !first.url) return null;
+  try {
+    const source = new URL(String(operatorPage.finalUrl || operatorPage.url || candidate.url || ''));
+    const target = new URL(String(first.url));
+    if (target.origin !== source.origin || target.toString() === source.toString()) return null;
+  } catch (_) { return null; }
+  return first;
+}
+
+function selectOperatorCompanyProfileHubLink_(operatorPage, candidate, firstIdentity) {
+  if (!operatorPage || operatorPage.ok !== true || !candidate || candidate.officialExternalOperatorProfile === true) return null;
+  if (candidate.operatorIdentityProbeSourceType !== 'company_profile') return null;
+  if (!firstIdentity || firstIdentity.hasOperatorInfo === true || firstIdentity.conflict === true) return null;
+  const links = Array.isArray(operatorPage.companyProfileHubLinks) ? operatorPage.companyProfileHubLinks : [];
+  const first = links[0];
+  if (!first || !first.url) return null;
+  try {
+    const source = new URL(String(operatorPage.finalUrl || operatorPage.url || candidate.url || ''));
+    const target = new URL(String(first.url));
+    if (target.origin !== source.origin || target.toString() === source.toString()) return null;
+  } catch (_) { return null; }
+  return first;
+}
+
+function selectOperatorCompanyProfileFollowupV1_(operatorPage, candidate, firstIdentity) {
+  const hub = selectOperatorCompanyProfileHubLink_(operatorPage, candidate, firstIdentity);
+  if (hub) return { role: 'hub', link: hub };
+  const detail = selectOperatorSecondPageCompanyProfileDetailLink_(operatorPage, candidate, firstIdentity);
+  return detail ? { role: 'detail', link: detail } : null;
 }
 
 function operatorIdentityFieldsConflict_(rootInfo, detailInfo) {
@@ -4506,8 +4653,11 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     operatorIdentityInfo.scope = 'company_profile_page';
     operatorIdentityInfo.scopeKey = operatorIdentityScopeKey_(finalUrl || url) || null;
   }
-  const externalCompanyProfileDetailLinks = opts && opts.collectExternalCompanyProfileDetailLink === true
+  const companyProfileDetailLinks = opts && (opts.collectExternalCompanyProfileDetailLink === true || opts.collectOperatorSecondPageCompanyProfileLink === true)
     ? collectExplicitCompanyProfileDetailLinksFromHtml_(html, finalUrl || url)
+    : [];
+  const companyProfileHubLinks = opts && opts.collectOperatorSecondPageCompanyProfileLink === true
+    ? collectExplicitCompanyProfileHubLinksFromHtml_(html, finalUrl || url)
     : [];
   const contactSignals = pageType === 'contact'
     ? extractContactSignalsFromHtml_(html, finalUrl || url)
@@ -4625,7 +4775,9 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     sampledText,
     legalOperatorInfo,
     operatorIdentityInfo,
-    externalCompanyProfileDetailLinks,
+    externalCompanyProfileDetailLinks: companyProfileDetailLinks,
+    companyProfileDetailLinks,
+    companyProfileHubLinks,
     contactSignals,
     formSignals,
     articleSignals,
@@ -5620,7 +5772,7 @@ function reasonDiscoverSubpageCandidate(url, source, sources) {
 function scoreDiscoverSubpageCandidate(url, source, sources, label = '') {
   let path = '';
   try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
-  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'article' ? 35 : (source === 'ecGeneralLink' ? 30 : (source === 'sitemap' ? 20 : 0)))));
+  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'article' ? 35 : (source === 'ecGeneralLink' ? 30 : (source === 'sitemap' ? 20 : (source === 'genericRoute' ? 5 : 0))))));
   const depth = path.split('/').filter(Boolean).length;
   const sourceCount = Array.isArray(sources) ? sources.length : 1;
   let score = sourceScore;
@@ -5643,7 +5795,7 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   const url = normalizeDiscoverSubpageUrl(rawHref, origin, { allowCategory: source === 'ecGeneralLink' });
   if (!url) return false;
   const key = discoverSubpageCandidateKey(url);
-  const sourcePriority = { sitemap: 1, ecGeneralLink: 2, htmlSitemap: 3, footer: 4, nav: 5 };
+  const sourcePriority = { genericRoute: 0, sitemap: 1, ecGeneralLink: 2, htmlSitemap: 3, footer: 4, nav: 5 };
   const existing = map.get(key);
   if (existing) {
     if (!existing.sources.includes(source)) existing.sources.push(source);
@@ -5669,6 +5821,35 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   map.set(key, item);
   if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
   return true;
+}
+
+// A site may expose its primary routes in generic wrappers rather than
+// semantic nav/header/footer elements.  This is a bounded *fallback* source:
+// it supplies a URL for the existing observation pipeline, never evidence by
+// itself.  Keep it deliberately narrower than general all-link crawling.
+function isGenericRepresentativeRouteCandidate_(link, origin) {
+  const rawHref = link && (link.href || link.url || '');
+  const normalized = normalizeDiscoverSubpageUrl(rawHref, origin);
+  if (!normalized) return false;
+  const label = normalizeSubpageJsonLdText([
+    link && link.text, link && link.ariaLabel, link && link.title
+  ].filter(Boolean).join(' '));
+  const path = (() => { try { return new URL(normalized).pathname.toLowerCase(); } catch (_) { return ''; } })();
+  const haystack = `${path} ${label}`.toLowerCase();
+  return /\/(?:about|company|corporate|profile|outline|business|service|services|solution|solutions|product|products|faq|faqs|guide|guides|help|support|pricing|price|plan|plans|contact|contact-us|inquiry|inquiries)(?:\/|$|-|_)/i.test(path) ||
+    /(?:会社|企業|運営|概要|事業|サービス|製品|商品|よくある質問|お問い合わせ|問合せ|料金|価格|プラン|\b(?:about|company|corporate|profile|business|service|product|faq|pricing|price|plan|contact|inquiry)\b)/i.test(haystack);
+}
+
+function addGenericRepresentativeRouteCandidatesFromLinks_(links, origin, candidateMap, sourceSummary, limit = 6) {
+  const added = [];
+  for (const link of (Array.isArray(links) ? links : [])) {
+    if (added.length >= limit) break;
+    if (!isGenericRepresentativeRouteCandidate_(link, origin)) continue;
+    if (addDiscoverSubpageCandidate(candidateMap, link, 'genericRoute', origin, 'bounded generic same-origin representative route', sourceSummary)) {
+      added.push(link);
+    }
+  }
+  return added;
 }
 
 // Keep external operator candidates out of the ordinary coverage crawl. They
@@ -6439,6 +6620,9 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       });
       const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
       const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
+      if (candidateMap.size === 0) {
+        addGenericRepresentativeRouteCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
+      }
       logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
       if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
       return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin);
@@ -6510,6 +6694,9 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     });
     const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
     const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
+    if (candidateMap.size === 0) {
+      addGenericRepresentativeRouteCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
+    }
     logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
     if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
     return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin);
@@ -6538,7 +6725,7 @@ function normalizeDiscoverTopUrl(rawTopUrl) {
 
 async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts = {}) {
   const normalizedLimit = Math.max(1, Math.min(50, Number(limit || 20) || 20));
-  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, article: 0 };
+  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, article: 0, genericRoute: 0 };
   const errors = [];
   const candidateMap = new Map();
   await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
@@ -6565,7 +6752,7 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
   const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
   const operatorIdentityCandidates = allCandidates
     .concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : [])
-    .filter(isHighConfidenceCompanyProfileCandidate_)
+    .filter(candidate => evaluateBoundedOperatorIdentityProbeCandidate_(candidate).probeEligible === true)
     .slice(0, 5);
   emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates);
   return {
@@ -10273,6 +10460,10 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
   };
 }
 
+function isFormalOperatorIdentityRecord_(info) {
+  return !!(info && typeof info === 'object' && info.hasOperatorInfo === true);
+}
+
 function attachOperatorIdentityProbeProvenance_(identity, candidate) {
   if (!identity || typeof identity !== 'object') return identity;
   const external = candidate && candidate.officialExternalOperatorProfile === true;
@@ -10445,7 +10636,11 @@ function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
     // HTML page (for example /company/outline.html). This remains a
     // tie-breaker among already high-confidence candidates only.
     const detailSuffix = '(?:\\/|$|-|_|\\.(?:html?|htm))';
-    if (new RegExp('\\/(?:about(?:us)?|company|corporate)(?:\\/(?:profile|overview|outline|summary|company-info))' + detailSuffix, 'i').test(path)) return 2;
+    if (new RegExp('\\/(?:about(?:us)?|company|corporate)(?:\\/(?:profile|overview|outline|summary|company-info))' + detailSuffix, 'i').test(path)) return 3;
+    const genericCompanyChild = Array.from(new Set(candidate && candidate.sources || [candidate && candidate.source])).includes('genericRoute') &&
+      /\/(?:about(?:us)?|company|corporate)\/(?!index\.(?:html?|htm)\/?$)[^/?#]+(?:\/(?:index\.(?:html?|htm))?)?\/?$/i.test(path) &&
+      !/\/(?:csr|contribution|sustainability|safety|security|ir|investor|governance|environment|health|recruit|career|group)(?:\/|$)/i.test(path);
+    if (genericCompanyChild) return 2;
     if (new RegExp('\\/(?:profile|overview|outline|company-info)' + detailSuffix, 'i').test(path)) return 1;
     return 0;
   };
@@ -10853,6 +11048,55 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         siteMode,
         context: opts && opts.context
       }));
+      // Candidate selection completed, but no bounded representative page was
+      // admissible.  Preserve that distinction for the GAS audit without
+      // promoting route discovery into page or operator evidence.
+      geoSignalsV1.coverageSignals = {
+        version: 'coverageSignalsV1',
+        source: 'discover-and-observe-subpages-light',
+        checked: true,
+        observationLimited: true,
+        skipReason: 'no_subpage_candidates',
+        candidateCount: 0,
+        observedSubpageCount: 0,
+        representativePages: []
+      };
+      geoSignalsV1.operatorIdentityBridgeProvenanceV1 = {
+        version: 'operator_identity_bridge_provenance_v1',
+        producerReached: true,
+        candidateCount: 0,
+        completeCandidateCount: 0,
+        failureStage: 'candidate_selection_empty',
+        formalRecordPresent: false,
+        formalRecordPath: null,
+        producerComplete: false
+      };
+      geoSignalsV1.operatorIdentityCandidateAuditV1 = buildOperatorIdentityCandidateAuditV1_(
+        discovered.operatorIdentityAuditCandidates,
+        siteMode,
+        null,
+        {
+          noCandidateReason: 'candidate_selection_empty',
+          discoverLinkAudit: discovered.operatorIdentityDiscoverLinkAudit,
+          producerReached: true,
+          candidateCount: 0,
+          completeCandidateCount: 0,
+          failureStage: 'candidate_selection_empty'
+        }
+      );
+      geoSignalsV1.operatorIdentityObservationV1 = buildOperatorIdentityObservationV1_(null, {
+        attempted: false,
+        observationComplete: false,
+        sourceUrl: null,
+        sourceType: null,
+        reason: 'candidate_selection_empty'
+      }, {
+        siteMode,
+        candidates: [],
+        observationLimited: true,
+        discoveryComplete: true,
+        discoveryCapped: false
+      });
       logPayload.origin = normalized.origin;
       logPayload.reason = 'no_subpage_candidates';
       emitHeavySiteAudit('attach_skip_no_candidates', {
@@ -11260,7 +11504,23 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           observationComplete: false,
           sourceUrl: String(operatorCandidate.url || ''),
           sourceType: operatorProbeSourceType,
-          reason: String(operatorCandidate.operatorIdentityProbeTier || 'strict_corroborated')
+          reason: String(operatorCandidate.operatorIdentityProbeTier || 'strict_corroborated'),
+          landingProbeUrl: String(operatorCandidate.url || ''),
+          landingProbeResult: 'pending',
+          hubProbeAttempted: false,
+          hubProbeUrl: null,
+          hubProbeResult: null,
+          detailProbeAttempted: false,
+          detailProbeUrl: null,
+          detailProbeResult: null,
+          totalOperatorProbeCount: 0,
+          // Compatibility fields retained for existing debug consumers.
+          firstProbeUrl: String(operatorCandidate.url || ''),
+          firstProbeResult: 'pending',
+          firstProbeFormalRecord: false,
+          secondProbeAttempted: false,
+          secondProbeUrl: null,
+          secondProbeResult: null
         };
         const operatorProbeResult = await fetchSubpageHtmlLightUrls_([operatorCandidate.url], {
           siteMode,
@@ -11270,17 +11530,21 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
           operatorIdentitySourceType: operatorProbeSourceType === 'company_profile' ? 'company_profile' : undefined,
           highConfidenceCompanyProfile: true,
-          collectExternalCompanyProfileDetailLink: operatorProbeSourceType === 'company_profile' &&
-            isExternalOperatorRootCandidate_(operatorCandidate)
+          collectOperatorSecondPageCompanyProfileLink: operatorProbeSourceType === 'company_profile' &&
+            operatorCandidate.officialExternalOperatorProfile !== true
         });
         const operatorPage = operatorProbeResult && Array.isArray(operatorProbeResult.pages) ? operatorProbeResult.pages[0] : null;
+        operatorIdentityProbe.totalOperatorProbeCount = 1;
         operatorIdentityProbe.observationComplete = !!(operatorPage && operatorPage.ok === true);
         operatorIdentityProbe.reason = operatorPage && operatorPage.ok === true
           ? `${operatorProbeSourceType}_fetched`
           : String(operatorPage && operatorPage.error || `${operatorProbeSourceType}_fetch_failed`);
+        operatorIdentityProbe.firstProbeResult = operatorPage && operatorPage.ok === true ? 'fetched' : 'fetch_failed';
+        operatorIdentityProbe.landingProbeResult = operatorIdentityProbe.firstProbeResult;
       const rawOperatorIdentity = operatorPage && (operatorProbeSourceType === 'legal'
         ? operatorPage.legalOperatorInfo
         : operatorPage.operatorIdentityInfo);
+      operatorIdentityProbe.firstProbeFormalRecord = rawOperatorIdentity && rawOperatorIdentity.hasOperatorInfo === true;
       if (rawOperatorIdentity) {
       const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(rawOperatorIdentity, operatorProbeSourceType);
       if (normalizedOperatorIdentity) {
@@ -11321,69 +11585,122 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             evidenceLabels: []
           };
         }
-        // The explicitly-labelled external root is already the one bounded
-        // operator probe.  Only when that root was fetched but cannot form a
-        // record do we follow one exact, same-origin company-profile link
-        // discovered in its own HTML.  No generic About/News/Service/Contact
-        // links enter this lane.
-        const rootIdentityComplete = !!normalizeOperatorIdentityInfo_(rawOperatorIdentity, operatorProbeSourceType);
-        const detailLink = operatorProbeSourceType === 'company_profile'
-          ? selectExternalOperatorRootCompanyProfileDetailLink_(operatorPage, operatorCandidate, rootIdentityComplete)
-          : null;
-        if (detailLink && detailLink.url) {
-          const detailProbeResult = await fetchSubpageHtmlLightUrls_([detailLink.url], {
+        // Operator identity has its own bounded traversal budget. A landing
+        // can use one explicit company-information hub, which can in turn
+        // nominate one explicit formal-detail page. This never participates in
+        // coverage discovery and cannot recurse beyond three total fetches.
+        const incompleteIdentity = rawOperatorIdentity || { observed: false, hasOperatorInfo: false, conflict: false };
+        const fetchCompanyProfilePage = async (url, collectLinks) => {
+          const result = await fetchSubpageHtmlLightUrls_([url], {
             siteMode,
             lightBudget,
             htmlFetchTimeoutMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS : 4000,
             reserveMs: lightBudget ? LIGHT_RESPONSE_CLEANUP_RESERVE_MS : undefined,
             minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
             operatorIdentitySourceType: 'company_profile',
-            highConfidenceCompanyProfile: true
+            highConfidenceCompanyProfile: true,
+            collectOperatorSecondPageCompanyProfileLink: collectLinks === true
           });
-          const detailPage = detailProbeResult && Array.isArray(detailProbeResult.pages) ? detailProbeResult.pages[0] : null;
-          operatorIdentityProbe.sourceUrl = String(detailLink.url || operatorIdentityProbe.sourceUrl || '');
-          operatorIdentityProbe.observationComplete = !!(detailPage && detailPage.ok === true);
-          operatorIdentityProbe.reason = detailPage && detailPage.ok === true
-            ? 'company_profile_detail_fetched'
-            : String(detailPage && detailPage.error || 'company_profile_detail_fetch_failed');
-          const detailIdentity = detailPage && detailPage.operatorIdentityInfo;
-          if (detailIdentity && operatorIdentityFieldsConflict_(rawOperatorIdentity, detailIdentity)) {
+          return result && Array.isArray(result.pages) ? result.pages[0] : null;
+        };
+        const adoptCompanyProfileIdentity = (page, url, priorIdentity) => {
+          const identity = page && page.operatorIdentityInfo;
+          if (identity && operatorIdentityFieldsConflict_(priorIdentity, identity)) {
             operatorIdentityInfo = {
-              observed: true,
-              observationComplete: operatorIdentityProbe.observationComplete,
-              sourceType: 'company_profile',
-              sourceUrl: String(detailPage.finalUrl || detailLink.url || ''),
+              observed: true, observationComplete: !!(page && page.ok === true),
+              sourceType: 'company_profile', sourceUrl: String(page.finalUrl || url || ''),
               companyName: '', address: '', telephone: '',
               hasCompanyName: false, hasAddress: false, hasTelephone: false,
               hasOperatorInfo: false, conflict: true,
               extractionMethod: 'html_text', evidenceLabels: [],
               provenance: { reason: 'company_profile_field_conflict' }
             };
-            operatorIdentityProbe.reason = 'company_profile_field_conflict';
-          } else if (detailIdentity) {
-            const normalizedDetailIdentity = normalizeOperatorIdentityInfo_(detailIdentity, 'company_profile');
-            if (normalizedDetailIdentity) {
-              normalizedDetailIdentity.operatorIdentityFieldExtractionAuditV1 = detailIdentity.operatorIdentityFieldExtractionAuditV1 || null;
-              const formalRecord = attachOperatorIdentityProbeProvenance_(normalizedDetailIdentity, operatorCandidate);
-              formalRecord.observationComplete = operatorIdentityProbe.observationComplete;
-              operatorIdentityInfo = formalRecord;
-            } else {
-              operatorIdentityInfo = {
-                observed: detailIdentity.observed === true,
-                observationComplete: operatorIdentityProbe.observationComplete,
-                sourceType: 'company_profile', sourceUrl: String(detailPage.finalUrl || detailLink.url || ''),
-                companyName: String(detailIdentity.companyName || detailIdentity.operatorName || ''),
-                address: String(detailIdentity.address || ''), telephone: String(detailIdentity.telephone || ''),
-                hasCompanyName: detailIdentity.hasCompanyName === true,
-                hasAddress: detailIdentity.hasAddress === true,
-                hasTelephone: detailIdentity.hasTelephone === true,
-                hasOperatorInfo: false,
-                extractionMethod: String(detailIdentity.extractionMethod || 'html_text'),
-                evidenceLabels: Array.isArray(detailIdentity.evidenceLabels) ? detailIdentity.evidenceLabels.slice(0, 10) : [],
-                operatorIdentityFieldExtractionAuditV1: detailIdentity.operatorIdentityFieldExtractionAuditV1 || null,
-                provenance: { reason: 'required_fields_missing' }
-              };
+            return { identity, outcome: 'conflict' };
+          }
+          const normalized = identity && normalizeOperatorIdentityInfo_(identity, 'company_profile');
+          if (normalized) {
+            normalized.operatorIdentityFieldExtractionAuditV1 = identity.operatorIdentityFieldExtractionAuditV1 || null;
+            const formalRecord = attachOperatorIdentityProbeProvenance_(normalized, operatorCandidate);
+            formalRecord.observationComplete = !!(page && page.ok === true);
+            operatorIdentityInfo = formalRecord;
+            return { identity, outcome: 'complete' };
+          }
+          operatorIdentityInfo = identity ? {
+            observed: identity.observed === true, observationComplete: !!(page && page.ok === true),
+            sourceType: 'company_profile', sourceUrl: String(page.finalUrl || url || ''),
+            companyName: String(identity.companyName || identity.operatorName || ''),
+            address: String(identity.address || ''), telephone: String(identity.telephone || ''),
+            hasCompanyName: identity.hasCompanyName === true,
+            hasAddress: identity.hasAddress === true,
+            hasTelephone: identity.hasTelephone === true,
+            hasOperatorInfo: false,
+            extractionMethod: String(identity.extractionMethod || 'html_text'),
+            evidenceLabels: Array.isArray(identity.evidenceLabels) ? identity.evidenceLabels.slice(0, 10) : [],
+            operatorIdentityFieldExtractionAuditV1: identity.operatorIdentityFieldExtractionAuditV1 || null,
+            provenance: { reason: 'required_fields_missing' }
+          } : operatorIdentityInfo;
+          return { identity: identity || { observed: false, hasOperatorInfo: false, conflict: false }, outcome: 'incomplete' };
+        };
+        const landingFollowup = selectOperatorCompanyProfileFollowupV1_(
+          operatorPage, operatorCandidate, incompleteIdentity
+        );
+        const hubLink = landingFollowup && landingFollowup.role === 'hub' ? landingFollowup.link : null;
+        const directDetailLink = landingFollowup && landingFollowup.role === 'detail' ? landingFollowup.link : null;
+        if (hubLink && hubLink.url) {
+          operatorIdentityProbe.hubProbeAttempted = true;
+          operatorIdentityProbe.hubProbeUrl = String(hubLink.url || '');
+          const hubPage = await fetchCompanyProfilePage(hubLink.url, true);
+          operatorIdentityProbe.totalOperatorProbeCount += 1;
+          operatorIdentityProbe.hubProbeResult = hubPage && hubPage.ok === true ? 'fetched' : 'fetch_failed';
+          operatorIdentityProbe.sourceUrl = String(hubLink.url || operatorIdentityProbe.sourceUrl || '');
+          operatorIdentityProbe.observationComplete = !!(hubPage && hubPage.ok === true);
+          if (!hubPage || hubPage.ok !== true) {
+            operatorIdentityProbe.reason = String(hubPage && hubPage.error || 'hub_probe_fetch_failed');
+          } else {
+            const hubResult = adoptCompanyProfileIdentity(hubPage, hubLink.url, incompleteIdentity);
+            if (hubResult.outcome === 'complete') operatorIdentityProbe.reason = 'hub_probe_fetched';
+            else if (hubResult.outcome === 'conflict') operatorIdentityProbe.reason = 'hub_probe_conflict';
+            else {
+              const detailLink = selectOperatorSecondPageCompanyProfileDetailLink_(hubPage, operatorCandidate, hubResult.identity);
+              if (!detailLink || !detailLink.url) {
+                operatorIdentityProbe.reason = 'detail_candidate_missing';
+              } else {
+                operatorIdentityProbe.detailProbeAttempted = true;
+                operatorIdentityProbe.detailProbeUrl = String(detailLink.url || '');
+                const detailPage = await fetchCompanyProfilePage(detailLink.url, false);
+                operatorIdentityProbe.totalOperatorProbeCount += 1;
+                operatorIdentityProbe.detailProbeResult = detailPage && detailPage.ok === true ? 'fetched' : 'fetch_failed';
+                operatorIdentityProbe.sourceUrl = String(detailLink.url || operatorIdentityProbe.sourceUrl || '');
+                operatorIdentityProbe.observationComplete = !!(detailPage && detailPage.ok === true);
+                if (!detailPage || detailPage.ok !== true) {
+                  operatorIdentityProbe.reason = String(detailPage && detailPage.error || 'detail_probe_fetch_failed');
+                } else {
+                  const detailResult = adoptCompanyProfileIdentity(detailPage, detailLink.url, hubResult.identity);
+                  operatorIdentityProbe.reason = detailResult.outcome === 'complete' ? 'detail_probe_fetched'
+                    : (detailResult.outcome === 'conflict' ? 'detail_probe_conflict' : 'detail_probe_incomplete');
+                }
+              }
             }
+          }
+        } else if (directDetailLink && directDetailLink.url) {
+          // CASE A: no hub, so the landing's explicit formal detail is the
+          // one allowed follow-up fetch.
+          operatorIdentityProbe.detailProbeAttempted = true;
+          operatorIdentityProbe.detailProbeUrl = String(directDetailLink.url || '');
+          operatorIdentityProbe.secondProbeAttempted = true;
+          operatorIdentityProbe.secondProbeUrl = operatorIdentityProbe.detailProbeUrl;
+          const detailPage = await fetchCompanyProfilePage(directDetailLink.url, false);
+          operatorIdentityProbe.totalOperatorProbeCount += 1;
+          operatorIdentityProbe.detailProbeResult = detailPage && detailPage.ok === true ? 'fetched' : 'fetch_failed';
+          operatorIdentityProbe.secondProbeResult = operatorIdentityProbe.detailProbeResult;
+          operatorIdentityProbe.sourceUrl = String(directDetailLink.url || operatorIdentityProbe.sourceUrl || '');
+          operatorIdentityProbe.observationComplete = !!(detailPage && detailPage.ok === true);
+          if (!detailPage || detailPage.ok !== true) {
+            operatorIdentityProbe.reason = String(detailPage && detailPage.error || 'detail_probe_fetch_failed');
+          } else {
+            const detailResult = adoptCompanyProfileIdentity(detailPage, directDetailLink.url, incompleteIdentity);
+            operatorIdentityProbe.reason = detailResult.outcome === 'complete' ? 'detail_probe_fetched'
+              : (detailResult.outcome === 'conflict' ? 'detail_probe_conflict' : 'detail_probe_incomplete');
           }
         }
       } else {
@@ -11412,14 +11729,41 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     if (operatorIdentityProbe.attempted === true && geoSignalsV1.trustSignals) {
       geoSignalsV1.trustSignals.operatorIdentityProbe = operatorIdentityProbe;
     }
+    const operatorFormalRecordPresent = isFormalOperatorIdentityRecord_(operatorIdentityInfo) ||
+      isFormalOperatorIdentityRecord_(legalOperatorInfo);
+    const operatorProbeFailureStage = operatorFormalRecordPresent ? null
+      : (!selectedOperatorIdentityCandidate ? 'operator_probe_candidate_missing'
+        : (operatorIdentityProbe && operatorIdentityProbe.hubProbeAttempted === true
+          ? (operatorIdentityProbe.hubProbeResult !== 'fetched' ? 'hub_fetch_failed'
+            : (operatorIdentityProbe.detailProbeAttempted === true
+              ? (operatorIdentityProbe.detailProbeResult !== 'fetched' ? 'detail_fetch_failed'
+                : (/conflict/i.test(String(operatorIdentityProbe.reason || '')) ? 'detail_conflict' : 'detail_incomplete'))
+              : (/conflict/i.test(String(operatorIdentityProbe.reason || '')) ? 'hub_conflict' : 'detail_candidate_missing')))
+          : (operatorIdentityProbe && operatorIdentityProbe.detailProbeAttempted === true
+            ? (operatorIdentityProbe.detailProbeResult !== 'fetched' ? 'detail_fetch_failed'
+              : (/conflict/i.test(String(operatorIdentityProbe.reason || '')) ? 'detail_conflict' : 'detail_incomplete'))
+            : (operatorIdentityProbe && operatorIdentityProbe.landingProbeResult === 'fetched' && operatorIdentityProbe.firstProbeFormalRecord !== true
+              ? 'hub_candidate_missing'
+              : (operatorIdentityProbe && /conflict/i.test(String(operatorIdentityProbe.reason || ''))
+                ? 'operator_probe_conflict' : 'operator_probe_incomplete')))));
+    const operatorProbeCandidateCount = (Array.isArray(discovered.operatorIdentityAuditCandidates)
+      ? discovered.operatorIdentityAuditCandidates : [])
+      .filter(candidate => evaluateBoundedOperatorIdentityProbeCandidate_(candidate).probeEligible === true).length;
     // Presence-only handoff contract for the GAS light bridge.  It deliberately
     // carries neither company name, address, nor telephone.
     geoSignalsV1.operatorIdentityBridgeProvenanceV1 = {
       version: 'operator_identity_bridge_provenance_v1',
-      formalRecordPresent: !!(operatorIdentityInfo || legalOperatorInfo),
+      producerReached: true,
+      candidateCount: Array.isArray(discovered.operatorIdentityAuditCandidates) ? discovered.operatorIdentityAuditCandidates.length : 0,
+      probeCandidateCount: operatorProbeCandidateCount,
+      completeCandidateCount: operatorFormalRecordPresent ? 1 : 0,
+      failureStage: operatorProbeFailureStage,
+      formalRecordPresent: operatorFormalRecordPresent,
       formalRecordPath: operatorIdentityInfo
+        && isFormalOperatorIdentityRecord_(operatorIdentityInfo)
         ? 'geoSignalsV1.trustSignals.operatorIdentityInfo'
-        : (legalOperatorInfo ? 'geoSignalsV1.trustSignals.legalOperatorInfo' : null),
+        : (legalOperatorInfo && isFormalOperatorIdentityRecord_(legalOperatorInfo)
+          ? 'geoSignalsV1.trustSignals.legalOperatorInfo' : null),
       producerComplete: !!(operatorIdentityProbe && operatorIdentityProbe.observationComplete === true)
     };
     geoSignalsV1.operatorIdentityCandidateAuditV1 = buildOperatorIdentityCandidateAuditV1_(
@@ -11428,7 +11772,27 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       selectedOperatorIdentityCandidate,
       {
         noCandidateReason: operatorIdentityCandidateNoCandidateReason,
-        discoverLinkAudit: discovered.operatorIdentityDiscoverLinkAudit
+        discoverLinkAudit: discovered.operatorIdentityDiscoverLinkAudit,
+        producerReached: true,
+        probeCandidateCount: operatorProbeCandidateCount,
+        completeCandidateCount: operatorFormalRecordPresent ? 1 : 0,
+        formalRecordPresent: operatorFormalRecordPresent,
+        failureStage: operatorProbeFailureStage,
+        probedUrl: operatorIdentityProbe && operatorIdentityProbe.attempted === true ? String(operatorIdentityProbe.sourceUrl || '') : null,
+        firstProbeUrl: operatorIdentityProbe && operatorIdentityProbe.firstProbeUrl,
+        firstProbeResult: operatorIdentityProbe && operatorIdentityProbe.firstProbeResult,
+        landingProbeUrl: operatorIdentityProbe && operatorIdentityProbe.landingProbeUrl,
+        landingProbeResult: operatorIdentityProbe && operatorIdentityProbe.landingProbeResult,
+        hubProbeAttempted: operatorIdentityProbe && operatorIdentityProbe.hubProbeAttempted === true,
+        hubProbeUrl: operatorIdentityProbe && operatorIdentityProbe.hubProbeUrl,
+        hubProbeResult: operatorIdentityProbe && operatorIdentityProbe.hubProbeResult,
+        detailProbeAttempted: operatorIdentityProbe && operatorIdentityProbe.detailProbeAttempted === true,
+        detailProbeUrl: operatorIdentityProbe && operatorIdentityProbe.detailProbeUrl,
+        detailProbeResult: operatorIdentityProbe && operatorIdentityProbe.detailProbeResult,
+        totalOperatorProbeCount: operatorIdentityProbe && operatorIdentityProbe.totalOperatorProbeCount,
+        secondProbeAttempted: operatorIdentityProbe && operatorIdentityProbe.secondProbeAttempted === true,
+        secondProbeUrl: operatorIdentityProbe && operatorIdentityProbe.secondProbeUrl,
+        secondProbeResult: operatorIdentityProbe && operatorIdentityProbe.secondProbeResult
       }
     );
     // This bounded provenance record is intentionally separate from the
@@ -14516,18 +14880,21 @@ function buildServiceContentObservationV2_(entry, candidates, discoveryComplete)
   });
 }
 
-function buildBreadcrumbObservationV2_(entry, subpages, discoveryComplete) {
+function buildBreadcrumbObservationV2_(entry, subpages, discoveryComplete, opts = {}) {
   const pages = Array.isArray(subpages) ? subpages : [];
+  const independentSubpageScope = opts && opts.independentSubpageScope === true;
   const entryComplete = isCoverageObservationV2CompletePage_(entry);
   const completed = pages.filter(isCoverageObservationV2CompletePage_);
-  const complete = entryComplete && discoveryComplete === true && completed.length > 0 && completed.length === pages.length;
+  const complete = independentSubpageScope
+    ? (discoveryComplete === true && completed.length > 0 && completed.length === pages.length)
+    : (entryComplete && discoveryComplete === true && completed.length > 0 && completed.length === pages.length);
   const subpageHasUi = complete ? pages.some(row => row.breadcrumbUi === true) : null;
   return Object.assign(coverageObservationV2Common_({ checked: !!(entry && entry.checked),
     completeness: complete ? 'complete' : ((entry && entry.checked) ? 'partial' : 'unavailable'), limited: !complete,
-    scope: complete ? 'entry_and_hierarchical_subpage' : (entryComplete ? 'entry_only' : 'unknown') }), {
-    hasAnyUi: complete ? (entry.breadcrumbUi === true || subpageHasUi === true) : null,
-    topHasUi: entryComplete ? !!entry.breadcrumbUi : null,
-    subpageHasUi, observedScope: complete ? 'entry_and_hierarchical_subpage' : (entryComplete ? 'entry_only' : 'unknown'),
+    scope: complete ? (independentSubpageScope ? 'independent_hierarchical_subpage' : 'entry_and_hierarchical_subpage') : (entryComplete ? 'entry_only' : 'unknown') }), {
+    hasAnyUi: complete ? (independentSubpageScope ? subpageHasUi === true : (entry.breadcrumbUi === true || subpageHasUi === true)) : null,
+    topHasUi: independentSubpageScope ? null : (entryComplete ? !!entry.breadcrumbUi : null),
+    subpageHasUi, observedScope: complete ? (independentSubpageScope ? 'independent_hierarchical_subpage' : 'entry_and_hierarchical_subpage') : (entryComplete ? 'entry_only' : 'unknown'),
     // This formal count is meaningful only with the formal hierarchical scope:
     // a partly failed candidate batch must not look like a completed subpage
     // observation merely because one candidate happened to render.
@@ -14536,6 +14903,35 @@ function buildBreadcrumbObservationV2_(entry, subpages, discoveryComplete) {
     candidateCount: pages.length,
     legacyUsed: false
   });
+}
+
+function collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin) {
+  const pages = geoSignalsV1 && geoSignalsV1.subpageSignals && Array.isArray(geoSignalsV1.subpageSignals.pages)
+    ? geoSignalsV1.subpageSignals.pages : [];
+  let expectedOrigin = '';
+  try { expectedOrigin = new URL(String(origin || '')).origin; } catch (_) {}
+  const seen = new Set();
+  return pages.reduce((rows, page) => {
+    const url = String(page && (page.finalUrl || page.url) || '');
+    let parsed = null;
+    try { parsed = new URL(url); } catch (_) { return rows; }
+    if (!expectedOrigin || parsed.origin !== expectedOrigin || seen.has(parsed.href)) return rows;
+    // subpageSignals only contains page.ok === true observations from the
+    // bounded coverage fetch.  Its parser has already evaluated this URL, so
+    // it is an independent subpage scope, not an assertion about the framed
+    // entry document or any of its unobserved child frames.
+    seen.add(parsed.href);
+    rows.push({
+      checked: true,
+      attempted: true,
+      renderComplete: true,
+      frameComplete: true,
+      failureKind: null,
+      breadcrumbUi: page && page.hasBreadcrumbUi === true,
+      source: 'coverage_representative_subpage'
+    });
+    return rows;
+  }, []);
 }
 
 function buildHtmlSitemapCandidateDiscoveryV1_(entry, candidates) {
@@ -14644,12 +15040,19 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   const canOpen = context && typeof context.newPage === 'function';
   const faqRows = canOpen ? await observeCoverageObservationV2Candidates_(context, faqUrls) : [];
   const serviceRows = canOpen ? await observeCoverageObservationV2Candidates_(context, serviceUrls) : [];
-  const breadcrumbRows = canOpen ? await observeCoverageObservationV2Candidates_(context, breadcrumbUrls) : [];
+  const directBreadcrumbRows = canOpen ? await observeCoverageObservationV2Candidates_(context, breadcrumbUrls) : [];
+  const reusableBreadcrumbRows = !breadcrumbUrls.length
+    ? collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin)
+    : [];
+  const usingReusableBreadcrumbRows = reusableBreadcrumbRows.length > 0;
+  const breadcrumbRows = usingReusableBreadcrumbRows ? reusableBreadcrumbRows : directBreadcrumbRows;
   const candidateComplete = discoveryComplete && canOpen;
   const observations = {
     faqObservationV2: buildFaqObservationV2_(entry, faqRows, candidateComplete),
     serviceContentObservationV2: buildServiceContentObservationV2_(entry, serviceRows, candidateComplete),
-    breadcrumbObservationV2: buildBreadcrumbObservationV2_(entry, breadcrumbRows, candidateComplete),
+    breadcrumbObservationV2: buildBreadcrumbObservationV2_(entry, breadcrumbRows,
+      usingReusableBreadcrumbRows ? true : candidateComplete,
+      { independentSubpageScope: usingReusableBreadcrumbRows }),
     htmlSitemapCandidateDiscoveryV1: buildHtmlSitemapCandidateDiscoveryV1_(entry, sitemapUrls)
   };
   if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') return observations;
@@ -15590,6 +15993,32 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       };
       const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
       const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
+      // Semantic landmarks are preferred, but many legacy corporate sites use
+      // generic wrappers for their visible global routes.  This collection is
+      // bounded and route-like; it is a link-text observation only and never
+      // grants coverage/operator evidence without the existing page probe.
+      const primaryRouteRe = /(?:会社|企業|運営|概要|事業|サービス|製品|商品|よくある質問|お問い合わせ|問合せ|料金|価格|プラン|\b(?:about|company|corporate|profile|business|service|product|faq|pricing|price|plan|contact|inquiry)\b)/i;
+      const canonicalNavigationLinks = [];
+      const canonicalNavigationSeen = new Set();
+      queryAllDeep('a[href]', { maxNodes: 500 }).forEach((a) => {
+        if (canonicalNavigationLinks.length >= 50 || !a) return;
+        const href = absUrl(a.getAttribute && a.getAttribute('href') || '');
+        const text = clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title'));
+        if (!href || !text) return;
+        let url = null;
+        try { url = new URL(href); } catch (_) { return; }
+        if (url.origin !== location.origin || url.pathname === '/' || /^#/.test(a.getAttribute('href') || '')) return;
+        const style = window.getComputedStyle ? window.getComputedStyle(a) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) return;
+        if (a.getClientRects && a.getClientRects().length === 0) return;
+        const semantic = !!a.closest('nav,[role="navigation"],header,footer,[role="contentinfo"]');
+        if (!semantic && !primaryRouteRe.test(`${text} ${url.pathname}`)) return;
+        url.hash = ''; url.search = '';
+        const key = `${url.origin}${url.pathname.replace(/\/$/, '')}\n${text}`;
+        if (canonicalNavigationSeen.has(key)) return;
+        canonicalNavigationSeen.add(key);
+        canonicalNavigationLinks.push({ text: text.slice(0, 120), href: url.toString(), source: semantic ? 'semantic_navigation' : 'generic_route_navigation' });
+      });
       const ctaIgnoreRe = /^(home|top|menu|close|prev|previous|next|share|facebook|instagram|x|twitter|youtube|line|linkedin|tiktok|ホーム|トップ|メニュー|閉じる|前へ|次へ|共有)$/i;
       const ctaCandidateRe = /(?:お問い合わせ|お問合せ|問い合わせ|相談|資料請求|見積|申し込|申込|購入|詳しく見る|詳細を見る|採用情報|エントリー|contact|inquiry|consult|request|quote|apply|entry|buy|purchase|learn more|read more|details)/i;
       const ctaTextFrom = (el) => {
@@ -16097,6 +16526,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         links: {
           navigationPathObservationsV1,
           navTextsSample: limit(navTexts, 50),
+          canonicalNavigationLinks,
+          canonicalNavigationLinkTexts: canonicalNavigationLinks.map((item) => item.text),
+          canonicalNavigationLinkCount: canonicalNavigationLinks.length,
+          canonicalNavigationLinkObservation: { checked: true, complete: true, sourceScope: 'rendered_dom_visible_same_origin_primary_routes' },
           internalLinksSample: internal.slice(0, 50),
           externalProfileLinksSample: externalProfileItems.slice(0, 10),
           socialLinksSample: externalProfileItems.slice(0, 10),
@@ -17078,6 +17511,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         links: {
           navigationPathObservationsV1: observed.links && observed.links.navigationPathObservationsV1 || null,
           navTextsSample: observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.slice(0, 50) : [],
+          canonicalNavigationLinks: observed.links && Array.isArray(observed.links.canonicalNavigationLinks) ? observed.links.canonicalNavigationLinks.slice(0, 50) : [],
+          canonicalNavigationLinkTexts: observed.links && Array.isArray(observed.links.canonicalNavigationLinkTexts) ? observed.links.canonicalNavigationLinkTexts.slice(0, 50) : [],
+          canonicalNavigationLinkCount: observed.links && Number.isFinite(Number(observed.links.canonicalNavigationLinkCount))
+            ? Number(observed.links.canonicalNavigationLinkCount)
+            : 0,
+          canonicalNavigationLinkObservation: observed.links && observed.links.canonicalNavigationLinkObservation || null,
           internalLinksSample: observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.slice(0, 50) : [],
           externalProfileLinksSample: observed.links && Array.isArray(observed.links.externalProfileLinksSample) ? observed.links.externalProfileLinksSample.slice(0, 10) : [],
           socialLinksSample: observed.links && Array.isArray(observed.links.socialLinksSample) ? observed.links.socialLinksSample.slice(0, 10) : [],
@@ -27089,6 +27528,7 @@ module.exports.__lightBudgetTestHooks = {
   buildFaqObservationV2_,
   buildServiceContentObservationV2_,
   buildBreadcrumbObservationV2_,
+  collectReusableBreadcrumbObservationV2Rows_,
   buildHtmlSitemapCandidateDiscoveryV1_,
   collectCoverageObservationsV2_,
   COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_,
@@ -27119,8 +27559,12 @@ module.exports.__lightBudgetTestHooks = {
   extractOperatorIdentityInfoFromHtml_,
   extractLegalOperatorInfoFromHtml_,
   collectExplicitCompanyProfileDetailLinksFromHtml_,
+  collectExplicitCompanyProfileHubLinksFromHtml_,
   isExternalOperatorRootCandidate_,
   selectExternalOperatorRootCompanyProfileDetailLink_,
+  selectOperatorSecondPageCompanyProfileDetailLink_,
+  selectOperatorCompanyProfileHubLink_,
+  selectOperatorCompanyProfileFollowupV1_,
   operatorIdentityFieldsConflict_,
   buildOperatorIdentityFieldExtractionAuditV1_,
   isObservedCompanyProfileScope_,
@@ -27136,8 +27580,14 @@ module.exports.__lightBudgetTestHooks = {
   collectOfficialExternalOperatorProfileCandidates_,
   selectOperatorIdentityProbeCandidate_,
   normalizeOperatorIdentityInfo_,
+  isFormalOperatorIdentityRecord_,
   attachOperatorIdentityProbeProvenance_,
   buildOperatorIdentityObservationV1_,
+  isGenericRepresentativeRouteCandidate_,
+  addGenericRepresentativeRouteCandidatesFromLinks_,
+  normalizeDiscoverSubpageUrl,
+  addDiscoverSubpageCandidate,
+  discoverSubpageCandidatesLightData_,
   compactSubpageJsonLdObservation_,
   normalizeArticleVisibleDate_,
   pickArticleVisibleDate_,

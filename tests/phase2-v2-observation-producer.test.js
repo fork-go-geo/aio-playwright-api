@@ -49,6 +49,16 @@ check('breadcrumb-mixed-candidates-entry-only', mixedBreadcrumb.observedScope, '
 check('breadcrumb-mixed-candidates-formal-count-is-zero', mixedBreadcrumb.observedSubpageCount, 0);
 check('breadcrumb-mixed-candidates-debug-completed-count', mixedBreadcrumb.completedCandidateCount, 1);
 check('breadcrumb-jsonld-only-is-not-ui-positive', hooks.buildBreadcrumbObservationV2_(complete({ breadcrumbUi:false, hasBreadcrumbJsonLd:true }), [complete({ breadcrumbUi:false, hasBreadcrumbJsonLd:true })], true).hasAnyUi, false);
+const independentBreadcrumb = hooks.buildBreadcrumbObservationV2_(partial('frame_incomplete'), [complete({ breadcrumbUi:false }), complete({ breadcrumbUi:false })], true, { independentSubpageScope:true });
+check('breadcrumb-independent-subpages-ignore-entry-frame-envelope', independentBreadcrumb.completeness, 'complete');
+check('breadcrumb-independent-subpages-scope', independentBreadcrumb.observedScope, 'independent_hierarchical_subpage');
+check('breadcrumb-independent-subpages-complete-absence', independentBreadcrumb.hasAnyUi, false);
+check('breadcrumb-independent-subpages-count', independentBreadcrumb.observedSubpageCount, 2);
+const reusableRows = hooks.collectReusableBreadcrumbObservationV2Rows_({ subpageSignals:{ pages:[
+  { url:'https://fixture.invalid/company/', finalUrl:'https://fixture.invalid/company/', hasBreadcrumbUi:false },
+  { url:'https://other.invalid/company/', finalUrl:'https://other.invalid/company/', hasBreadcrumbUi:true }
+] } }, 'https://fixture.invalid/');
+check('breadcrumb-reuse-only-same-origin-observed-subpages', reusableRows.length, 1);
 
 // Rendered sitemap discovery is transport-only and emits at most five URLs.
 check('sitemap-rendered-link-found', hooks.buildHtmlSitemapCandidateDiscoveryV1_(complete(), [
