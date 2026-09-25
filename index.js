@@ -13493,8 +13493,11 @@ async function collectHtmlContentJsonLdSummaryLight(page) {
     const summary = summarizeJsonLdTextsLight(texts, 'html_content_ldjson_light');
     summary.htmlLength = String(html || '').length;
     summary.htmlContentLdJsonObserved = true;
+    summary.timedOut = false;
+    summary.scanFailed = false;
     return summary;
   } catch (e) {
+    const error = String(e && (e.message || e) || '').slice(0, 180);
     return {
       types: [],
       rawCount: 0,
@@ -13508,9 +13511,49 @@ async function collectHtmlContentJsonLdSummaryLight(page) {
       source: 'html_content_ldjson_light',
       htmlLength: null,
       htmlContentLdJsonObserved: false,
-      error: String(e && (e.message || e) || '').slice(0, 180)
+      timedOut: /timeout/i.test(error),
+      scanFailed: true,
+      error
     };
   }
+}
+
+// JSON-LD absence is authoritative only when both complementary top-page
+// observations completed. A positive from either scope is retained, but a
+// negative is never inferred from an incomplete scope.
+function resolveStructuredDataLightCompletionV1_(renderedStructured, htmlContentJsonLdSummary) {
+  const rendered = renderedStructured && typeof renderedStructured === 'object' ? renderedStructured : {};
+  const html = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary === 'object' ? htmlContentJsonLdSummary : {};
+  const renderedObserved = rendered.renderedDomObserved === true && typeof rendered.hasJsonLd === 'boolean';
+  const htmlObserved = html.htmlContentLdJsonObserved === true && typeof html.hasJsonLd === 'boolean';
+  const renderedTimedOut = rendered.timedOut === true || rendered.scanTimedOut === true;
+  const htmlTimedOut = html.timedOut === true;
+  const renderedFailed = rendered.scanFailed === true || !!rendered.error;
+  const htmlFailed = html.scanFailed === true || !!html.error;
+  // The same inline script is normally visible in both scopes. Keep this as
+  // a de-duplicated failure signal rather than inflating the public count.
+  const parseErrorsCount = Math.max(
+    Math.max(0, Number(rendered.parseErrorsCount || 0) || 0),
+    Math.max(0, Number(html.parseErrorsCount || 0) || 0)
+  );
+  const contradiction = rendered.jsonLdObservationContradiction === true || html.jsonLdObservationContradiction === true;
+  const complete = renderedObserved && htmlObserved && !renderedTimedOut && !htmlTimedOut &&
+    !renderedFailed && !htmlFailed && parseErrorsCount === 0 && !contradiction;
+  const hasJsonLd = rendered.hasJsonLd === true || html.hasJsonLd === true
+    ? true
+    : (renderedObserved && htmlObserved && rendered.hasJsonLd === false && html.hasJsonLd === false ? false : null);
+  return {
+    complete,
+    observationLimited: !complete,
+    hasJsonLd,
+    observationScope: complete ? 'rendered_dom_plus_html_ldjson' : 'rendered_dom_plus_html_ldjson_partial',
+    renderedObserved,
+    htmlObserved,
+    timedOut: renderedTimedOut || htmlTimedOut,
+    scanFailed: renderedFailed || htmlFailed,
+    parseErrorsCount,
+    contradiction
+  };
 }
 
 function extractSchemaTypesFromScriptTextLight(text) {
@@ -17023,9 +17066,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       source: 'html_content_and_same_origin_script_src',
       balancedMode
     });
-    const htmlContentJsonLdSummary = balancedMode
-      ? await collectHtmlContentJsonLdSummaryLight(page)
-      : null;
+    // This collector is a local page-content read, not a second network
+    // request. In light mode it completes the rendered-DOM observation so
+    // JSON-LD absence can be established without weakening its authority.
+    const htmlContentJsonLdSummary = await collectHtmlContentJsonLdSummaryLight(page);
     const scriptSrcJsonLdSummary = balancedMode
       ? await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, shortFastMode
         ? { maxScripts: 3, maxBytesPerScript: 512000 }
@@ -17096,6 +17140,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const scriptSrcParseableCount = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.parseableCount === 'number' ? scriptSrcJsonLdSummary.parseableCount : 0;
     const renderedParseErrorsCount = typeof renderedStructured.parseErrorsCount === 'number' ? renderedStructured.parseErrorsCount : 0;
     const htmlParseErrorsCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseErrorsCount === 'number' ? htmlContentJsonLdSummary.parseErrorsCount : 0;
+    const lightJsonLdCompletion = resolveStructuredDataLightCompletionV1_(renderedStructured, htmlContentJsonLdSummary);
     const entityLinkSignalsLight = mergeEntityLinkSignalsLight_([
       renderedStructured.entityLinkSignals,
       htmlContentJsonLdSummary && htmlContentJsonLdSummary.entityLinkSignals,
@@ -17198,7 +17243,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       excludedFromSeoTypes: mergedJsonLdTypeClass.excludedFromSeoTypes,
       rawCount: balancedMode ? (renderedRawCount + htmlRawCount + scriptSrcCandidateCount) : renderedRawCount,
       parseableCount: balancedMode ? (renderedParseableCount + htmlParseableCount + scriptSrcParseableCount) : renderedParseableCount,
-      hasJsonLd: balancedMode ? pickStructuredBool('hasJsonLd') : (typeof renderedStructured.hasJsonLd === 'boolean' ? renderedStructured.hasJsonLd : null),
+      hasJsonLd: balancedMode ? pickStructuredBool('hasJsonLd') : lightJsonLdCompletion.hasJsonLd,
       hasSeoJsonLd: (balancedMode || renderedRawCount > 0) ? mergedJsonLdTypeClass.hasSeoJsonLd : null,
       hasWebsite: balancedMode ? mergedJsonLdTypeClass.hasWebsite : (observed.structuredData ? observed.structuredData.hasWebsite : null),
       hasOrganization: balancedMode ? mergedJsonLdTypeClass.hasOrganization : (observed.structuredData ? observed.structuredData.hasOrganization : null),
@@ -17212,14 +17257,14 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           ? observed.structuredData.hasProductJsonLd
           : null),
       typeClassificationSource: mergedJsonLdTypeClass.typeClassificationSource,
-      source: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_light' : (observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light'),
+      source: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_light' : 'rendered_dom_plus_html_ldjson_light',
       confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
-      observationLimited: true,
-      observationScope: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_only' : (observed.structuredData && observed.structuredData.observationScope ? observed.structuredData.observationScope : 'rendered_dom_only'),
+      observationLimited: balancedMode ? true : lightJsonLdCompletion.observationLimited,
+      observationScope: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_only' : lightJsonLdCompletion.observationScope,
       renderedDomObserved: observed.structuredData && typeof observed.structuredData.renderedDomObserved === 'boolean' ? observed.structuredData.renderedDomObserved : true,
-      htmlContentLdJsonObserved: balancedMode ? !!(htmlContentJsonLdSummary && htmlContentJsonLdSummary.htmlContentLdJsonObserved) : false,
-      htmlContentRawCount: balancedMode ? htmlRawCount : 0,
-      htmlContentParseableCount: balancedMode ? htmlParseableCount : 0,
+      htmlContentLdJsonObserved: !!(htmlContentJsonLdSummary && htmlContentJsonLdSummary.htmlContentLdJsonObserved),
+      htmlContentRawCount: htmlRawCount,
+      htmlContentParseableCount: htmlParseableCount,
       scriptSrcJsonLdObserved: balancedMode ? !!(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed) : false,
       scriptSrcCandidateCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.sameOriginScriptCount || 0) : 0,
       scriptSrcFetchedCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.fetchedCount || 0) : 0,
@@ -17241,11 +17286,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       // script-src, or microdata observations into this contract.
       structuredDataQualityV1: renderedStructured && renderedStructured.structuredDataQualityV1 || null,
       entityLinkSignals: entityLinkSignalsLight,
-      htmlScanSkipped: true,
+      htmlScanSkipped: false,
       jsScanSkipped: true,
       chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
-      parseErrorsCount: balancedMode ? Math.max(renderedParseErrorsCount, htmlParseErrorsCount) : renderedParseErrorsCount,
-      htmlContentParseErrorsCount: balancedMode ? htmlParseErrorsCount : 0,
+      parseErrorsCount: balancedMode ? Math.max(renderedParseErrorsCount, htmlParseErrorsCount) : lightJsonLdCompletion.parseErrorsCount,
+      htmlContentParseErrorsCount: htmlParseErrorsCount,
       scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null,
       htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
     };
@@ -27576,6 +27621,7 @@ module.exports.__lightBudgetTestHooks = {
   buildStaticFallbackGeoSignalsPayload_,
   mergeTopPageStaticSignalsIntoPayload_,
   collectArticleSignalsFromPageLight_,
+  resolveStructuredDataLightCompletionV1_,
   buildArticleSignalsFromJsonLdAndMeta_,
   buildFreshnessOperationSignalsFromArticleSignals_,
   extractArticleVisibleDateCandidatesFromCheerio_,
