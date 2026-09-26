@@ -16900,13 +16900,21 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
               : (filteredIframeH1.length ? uniqueHeadingTexts(filteredIframeH1, 10) : filteredA11yH1.slice(0, 10))))));
     const mergedH2 = uniqueHeadingTexts(filteredMainH2.concat(filteredAppRootH2).concat(filteredHeroH2).concat(filteredDomH2).concat(filteredShadowH2).concat(filteredIframeH2).concat(filteredA11yH2), 20);
     const mergedH3 = uniqueHeadingTexts(filteredDomH3.concat(filteredShadowH3).concat(filteredA11yH3), 20);
-    const h1Source = filteredMainH1.length ? 'main_dom'
-      : (filteredAppRootH1.length ? 'app_root_dom'
-        : (filteredHeroH1.length ? 'hero_dom'
-          : (filteredDomH1.length ? 'dom'
-            : (filteredShadowH1.length ? 'open_shadow_dom'
-              : (filteredIframeH1.length ? 'iframe_same_origin'
-                : (filteredA11yH1.length ? 'a11y' : 'not_observed'))))));
+    // The rendered-DOM heading query completed successfully when this builder
+    // reaches here. An empty H1 result is therefore a confirmed absence, not
+    // an unavailable observation. Error/redirect documents remain excluded.
+    const renderedDomHeadingObservationComplete = observed.headingCollectionObserved === true &&
+      !browserErrorPageUrl && !finalUrlOriginMismatch;
+    const h1Source = (() => {
+      if (filteredMainH1.length) return 'main_dom';
+      if (filteredAppRootH1.length) return 'app_root_dom';
+      if (filteredHeroH1.length) return 'hero_dom';
+      if (filteredDomH1.length) return 'dom';
+      if (filteredShadowH1.length) return 'open_shadow_dom';
+      if (filteredIframeH1.length) return 'iframe_same_origin';
+      if (filteredA11yH1.length) return 'a11y';
+      return renderedDomHeadingObservationComplete ? 'rendered_dom' : 'not_observed';
+    })();
     const headingSourceParts = [];
     if (filteredDomH1.length || filteredDomH2.length || filteredDomH3.length) headingSourceParts.push('dom');
     if (filteredMainH1.length || filteredMainH2.length) headingSourceParts.push('main_dom');
@@ -16916,7 +16924,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     if (filteredIframeH1.length || filteredIframeH2.length) headingSourceParts.push('iframe_same_origin');
     if (a11yHeadings.observed) headingSourceParts.push('a11y');
     const headingSource = headingSourceParts.length ? Array.from(new Set(headingSourceParts)).join('+') : 'not_observed';
-    const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
+    const headingObservationLimited = !renderedDomHeadingObservationComplete;
     const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(filteredA11yAll), 30);
     const titleTextForCandidate = normalizeHeadingText(observed.title);
     const metaTextForCandidate = normalizeHeadingText(observed.metaDescription);
@@ -17514,9 +17522,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         h1: {
           values: mergedH1.slice(0, 5),
           count: mergedH1.length,
-          observed: domH1.length > 0 || a11yHeadings.observed,
+          observed: renderedDomHeadingObservationComplete,
           source: h1Source,
-          confidence: mergedH1.length ? 'high' : (a11yHeadings.observed ? 'medium' : 'low'),
+          confidence: mergedH1.length ? 'high' : (renderedDomHeadingObservationComplete ? 'medium' : 'low'),
           hasH1: mergedH1.length > 0,
           hasSingleH1: mergedH1.length === 1,
           headingObservationLimited
@@ -18541,13 +18549,18 @@ function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary,
   geoSignalsV1.coverage = geoSignalsV1.coverage || {};
   geoSignalsV1.coverage.semanticElements = geoSignalsV1.coverage.semanticElements || {};
   const observed = geoSignalsV1.observed;
+  // A completed rendered-DOM heading query owns an empty H1 result. Do not
+  // replace it with static fallback data merely because the count is zero.
+  const renderedDomHeadingObservationComplete = observed.headingCollectionObserved === true &&
+    observed.h1 && observed.h1.observed === true &&
+    geoSignalsV1.headings.headingObservationLimited === false;
   // A completed DOM query with an empty value is a valid absence observation.
   // Only replace an unavailable rendered-DOM result with a completed static one.
   if (!(observed.title && observed.title.observed === true) && fg.observed.title && fg.observed.title.observed === true) observed.title = fg.observed.title;
   if (!(observed.metaDescription && observed.metaDescription.observed === true) && fg.observed.metaDescription && fg.observed.metaDescription.observed === true) observed.metaDescription = fg.observed.metaDescription;
-  if (!(observed.h1 && Number(observed.h1.count || 0) > 0) && fg.observed.h1) observed.h1 = fg.observed.h1;
+  if (!renderedDomHeadingObservationComplete && fg.observed.h1) observed.h1 = fg.observed.h1;
   if (!(geoSignalsV1.articleSignals && geoSignalsV1.articleSignals.checked === true) && fg.articleSignals) geoSignalsV1.articleSignals = fg.articleSignals;
-  if (!Number(geoSignalsV1.headings.h1Count || 0) && fg.headings) Object.assign(geoSignalsV1.headings, fg.headings);
+  if (!renderedDomHeadingObservationComplete && !Number(geoSignalsV1.headings.h1Count || 0) && fg.headings) Object.assign(geoSignalsV1.headings, fg.headings);
   if (!Object.prototype.hasOwnProperty.call(geoSignalsV1.landmarks, 'hasMainLandmark') || geoSignalsV1.landmarks.hasMainLandmark == null) Object.assign(geoSignalsV1.landmarks, fg.landmarks);
   ['hasHeaderElement', 'hasNavElement', 'hasFooterElement', 'hasMainElement', 'hasSemanticStructure'].forEach(key => {
     if (!Object.prototype.hasOwnProperty.call(geoSignalsV1.coverage.semanticElements, key) || geoSignalsV1.coverage.semanticElements[key] == null) {
