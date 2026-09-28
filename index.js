@@ -5749,6 +5749,43 @@ function normalizeDiscoverSubpageUrl(rawUrl, origin, opts = {}) {
   return parsed.toString().replace(/\/$/, '');
 }
 
+// Content scope is deliberately narrower than origin.  A diagnosis that starts
+// below the origin evaluates that directory tree as content, while root-level
+// resources (robots, XML sitemap, llms files) and operator evidence retain
+// their own, explicit observation contracts.  Keep this as the one pathname
+// boundary implementation for every content producer.
+function buildContentScopeV1_(entryUrl) {
+  let parsed = null;
+  try { parsed = new URL(String(entryUrl || '')); } catch (_) { return null; }
+  if (!/^https?:$/.test(parsed.protocol)) return null;
+  const pathname = parsed.pathname || '/';
+  const isRoot = pathname === '/';
+  const prefix = isRoot ? '/' : `${pathname.replace(/\/+$/, '')}/`;
+  return {
+    version: 'content_scope_v1',
+    origin: parsed.origin,
+    entryUrl: parsed.toString(),
+    prefix,
+    isRoot
+  };
+}
+
+function isUrlInContentScopeV1_(value, scope) {
+  if (!scope || !scope.origin) return false;
+  let parsed = null;
+  try { parsed = new URL(String(value || ''), scope.origin); } catch (_) { return false; }
+  if (parsed.origin !== scope.origin) return false;
+  if (scope.isRoot === true || scope.prefix === '/') return true;
+  const pathname = parsed.pathname || '/';
+  const withoutTrailingSlash = String(scope.prefix).replace(/\/$/, '');
+  return pathname === withoutTrailingSlash || pathname.indexOf(scope.prefix) === 0;
+}
+
+function filterContentScopeUrlsV1_(values, scope, getUrl) {
+  const picker = typeof getUrl === 'function' ? getUrl : value => value;
+  return (Array.isArray(values) ? values : []).filter(value => isUrlInContentScopeV1_(picker(value), scope));
+}
+
 function discoverSubpageCandidateKey(url) {
   try {
     const u = new URL(String(url || ''));
@@ -6740,13 +6777,15 @@ function normalizeDiscoverTopUrl(rawTopUrl) {
     if (!/^https?:$/.test(parsed.protocol)) throw new Error('unsupported protocol');
     if (isBlockedSubpageJsonLdHost(parsed.hostname)) throw new Error('blocked_private_or_metadata_host');
     parsed.hash = '';
-    return { ok: true, topUrl: parsed.toString(), origin: parsed.origin };
+    const topUrl = parsed.toString();
+    return { ok: true, topUrl, origin: parsed.origin, contentScope: buildContentScopeV1_(topUrl) };
   } catch (e) {
     return { ok: false, error: String(e && (e.message || e) || 'invalid topUrl').slice(0, 160) };
   }
 }
 
 async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts = {}) {
+  const contentScope = opts && opts.contentScope || buildContentScopeV1_(topUrl);
   const normalizedLimit = Math.max(1, Math.min(50, Number(limit || 20) || 20));
   const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, article: 0, genericRoute: 0 };
   const errors = [];
@@ -6761,7 +6800,7 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
     errors,
     Object.assign({}, opts, { operatorIdentityDiscoverLinkAuditSink })
   );
-  const allCandidates = Array.from(candidateMap.values())
+  const allSameOriginCandidates = Array.from(candidateMap.values())
     .map(item => ({
       url: item.url,
       label: item.label || '',
@@ -6771,22 +6810,35 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
       reason: item.reason
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
-  applyCompanyProfileHubCorroboration_(allCandidates);
-  const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
-  const operatorIdentityCandidates = allCandidates
+  applyCompanyProfileHubCorroboration_(allSameOriginCandidates);
+  // Preserve the complete same-origin candidate set only for the bounded
+  // evidence-only operator probe.  All content selection and aggregation uses
+  // the scoped list below, before any page observation can lose its URL.
+  const contentCandidates = filterContentScopeUrlsV1_(allSameOriginCandidates, contentScope, item => item && item.url)
+    .map(item => Object.assign({}, item, { contentScopeUsage:'content', contentScopePrefix:contentScope && contentScope.prefix || '/' }));
+  const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(contentCandidates, { siteMode: opts && opts.siteMode || 'generic' });
+  const operatorIdentityCandidates = allSameOriginCandidates
     .concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : [])
     .filter(candidate => evaluateBoundedOperatorIdentityProbeCandidate_(candidate).probeEligible === true)
     .slice(0, 5);
   emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates);
   return {
-    candidates: allCandidates.slice(0, normalizedLimit),
+    candidates: contentCandidates.slice(0, normalizedLimit),
     roleRepresentativeCandidates,
     operatorIdentityCandidates,
     // Kept in-process only until the light response is assembled. The audit
     // builder bounds it to five metadata-only entries before transport.
-    operatorIdentityAuditCandidates: allCandidates.concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : []),
+    operatorIdentityAuditCandidates: allSameOriginCandidates.concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : []),
     operatorIdentityDiscoverLinkAudit: operatorIdentityDiscoverLinkAuditSink.value || null,
-    totalCandidates: allCandidates.length,
+    totalCandidates: contentCandidates.length,
+    contentScope,
+    contentScopeAudit: {
+      entryUrl: topUrl,
+      prefix: contentScope && contentScope.prefix || '/',
+      isRoot: !!(contentScope && contentScope.isRoot === true),
+      contentCandidateCount: contentCandidates.length,
+      excludedSameOriginCandidateCount: Math.max(0, allSameOriginCandidates.length - contentCandidates.length)
+    },
     sourceSummary,
     errors
   };
@@ -6803,7 +6855,12 @@ function inferHtmlFetchOnlyStaticCandidatePageType_(path) {
 }
 
 function buildHtmlFetchOnlyStaticSubpageCandidates_(topUrl, origin, mode) {
-  const staticPaths = ['/about', '/contact', '/faq', '/guide', '/support', '/terms', '/privacy', '/legal', '/law', '/policies/legal-notice', '/tokushoho'];
+  const contentScope = buildContentScopeV1_(topUrl);
+  const scopeBasePath = contentScope && contentScope.isRoot !== true
+    ? String(contentScope.prefix || '/').replace(/\/$/, '')
+    : '';
+  const staticPaths = ['/about', '/contact', '/faq', '/guide', '/support', '/terms', '/privacy', '/legal', '/law', '/policies/legal-notice', '/tokushoho']
+    .map(path => `${scopeBasePath}${path}`);
   const source = mode === 'scopedPlaywright'
     ? 'scoped-playwright-static-candidate'
     : 'html-fetch-only-static-candidate';
@@ -6820,13 +6877,17 @@ function buildHtmlFetchOnlyStaticSubpageCandidates_(topUrl, origin, mode) {
         sources: [source],
         score: scoreDiscoverSubpageCandidate(url, 'nav', [source]),
         reason: 'html fetch only static candidate',
-        candidateOnly: true
+        candidateOnly: true,
+        contentScopeUsage: 'content',
+        contentScopePrefix: contentScope && contentScope.prefix || '/'
       };
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter(candidate => isUrlInContentScopeV1_(candidate.url, contentScope));
   return {
     candidates,
     totalCandidates: candidates.length,
+    contentScope,
     sourceSummary: {
       sitemap: 0,
       htmlSitemap: 0,
@@ -7984,8 +8045,9 @@ function buildSubpageCardConnectionMatrixAudit_(coverageSignals) {
 }
 
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
-  const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
-  const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
+  const contentScope = payload && payload.contentScope || buildContentScopeV1_(payload && payload.topUrl);
+  const candidates = filterContentScopeUrlsV1_(payload && payload.candidates, contentScope, candidate => candidate && candidate.url);
+  const observations = filterContentScopeUrlsV1_(payload && payload.observations, contentScope, page => page && (page.finalUrl || page.url));
   const candidateByUrl = new Map();
   candidates.forEach(candidate => {
     if (!candidate || !candidate.url) return;
@@ -8530,8 +8592,9 @@ function attachContactDestination_(geoSignalsV1, contactDestination) {
 }
 
 function buildSubpageSignalsV1FromSubpageObservation_(payload) {
-  const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
-  const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
+  const contentScope = payload && payload.contentScope || buildContentScopeV1_(payload && payload.topUrl);
+  const observations = filterContentScopeUrlsV1_(payload && payload.observations, contentScope, page => page && (page.finalUrl || page.url));
+  const candidates = filterContentScopeUrlsV1_(payload && payload.candidates, contentScope, candidate => candidate && candidate.url);
   const candidateByUrl = new Map();
   candidates.forEach(candidate => {
     if (!candidate || !candidate.url) return;
@@ -10811,6 +10874,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
     }
+    // Bounded provenance for consumers and debug output.  This does not alter
+    // root-level site signals; it documents the scope applied to content pages.
+    geoSignalsV1.contentScopeV1 = normalized.contentScope || buildContentScopeV1_(topUrl);
     // coverage は core DOM の後段補助観測。残予算が少なければ core response を
     // 守るために丸ごと skip し、partial core response を失敗扱いにはしない。
     if (lightBudget && getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESERVE_MS) < 1200) {
@@ -11307,6 +11373,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const playwrightObserved = playwrightCandidates.length && playwrightTimeoutMs
       ? await observeSubpageJsonLdLightUrls_(playwrightCandidates.map(candidate => candidate.url), {
           siteMode,
+          contentScope: normalized.contentScope,
           timeout: playwrightTimeoutMs,
           concurrency: reuseContextForObserve ? 1 : 3,
           context: opts && opts.context,
@@ -11452,6 +11519,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const payload = {
       topUrl: normalized.topUrl,
       origin: normalized.origin,
+      contentScope: normalized.contentScope,
       siteMode,
       candidateSummary: {
         sourceSummary: discovered.sourceSummary,
@@ -12045,7 +12113,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
 
 async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const started = Date.now();
-  const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
+  const requestedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
+  const contentScope = opts && opts.contentScope || buildContentScopeV1_(requestedUrls[0]);
+  const normalizedUrls = filterContentScopeUrlsV1_(requestedUrls, contentScope).slice(0, 20);
   const siteMode = normalizeSubpageJsonLdText(opts.siteMode || 'generic').toLowerCase() || 'generic';
   const timeout = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
   const reuseContext = !!(opts && opts.context);
@@ -12584,6 +12654,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
   const urls = selectedCandidates.map(candidate => candidate.url);
   const observed = await observeSubpageJsonLdLightUrls_(urls, {
     siteMode,
+    contentScope: normalized.contentScope,
     timeout: req.body && req.body.timeout,
     concurrency: 3
   });
@@ -12604,6 +12675,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     mode: 'discoverAndObserveSubpagesLight',
     topUrl: normalized.topUrl,
     origin: normalized.origin,
+    contentScope: normalized.contentScope,
     siteMode,
     limit,
     candidateSummary: {
@@ -14785,7 +14857,7 @@ function isCoverageObservationV2CompletePage_(page) {
   return !!(page && page.checked === true && page.renderComplete === true && page.frameComplete === true && !page.failureKind);
 }
 
-function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
+function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount, contentScope) {
   const target = String(kind || '');
   const include = target === 'faq'
     ? /(?:faq|q\s*&\s*a|qanda|よくある質問|質問|サポート|support|help)/i
@@ -14807,6 +14879,7 @@ function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
     const item = raw && typeof raw === 'object' ? raw : {};
     const url = normalizeCoverageObservationV2Url_(origin, item.href);
     if (!url || seen.has(url)) continue;
+    if (!isUrlInContentScopeV1_(url, contentScope || buildContentScopeV1_(origin))) continue;
     const text = `${item.text || ''} ${item.aria || ''} ${item.title || ''} ${item.href || ''}`;
     if (!include.test(text) || exclude.test(text)) continue;
     const candidate = new URL(url);
@@ -14929,7 +15002,7 @@ function buildBreadcrumbObservationV2_(entry, subpages, discoveryComplete, opts 
   });
 }
 
-function collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin) {
+function collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin, contentScope) {
   const pages = geoSignalsV1 && geoSignalsV1.subpageSignals && Array.isArray(geoSignalsV1.subpageSignals.pages)
     ? geoSignalsV1.subpageSignals.pages : [];
   let expectedOrigin = '';
@@ -14939,7 +15012,7 @@ function collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin) {
     const url = String(page && (page.finalUrl || page.url) || '');
     let parsed = null;
     try { parsed = new URL(url); } catch (_) { return rows; }
-    if (!expectedOrigin || parsed.origin !== expectedOrigin || seen.has(parsed.href)) return rows;
+    if (!expectedOrigin || parsed.origin !== expectedOrigin || !isUrlInContentScopeV1_(parsed.href, contentScope || buildContentScopeV1_(origin)) || seen.has(parsed.href)) return rows;
     // subpageSignals only contains page.ok === true observations from the
     // bounded coverage fetch.  Its parser has already evaluated this URL, so
     // it is an independent subpage scope, not an assertion about the framed
@@ -15053,20 +15126,21 @@ async function observeCoverageObservationV2Candidates_(context, urls) {
 async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, context) {
   let origin = '';
   try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
+  const contentScope = buildContentScopeV1_(pageUrl);
   const entry = await readCoverageObservationV2Page_(page);
   entry.faqLinkObserved = entry.faqLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasFaqLink === true || geoSignalsV1.coverage.hasFaqNav === true));
   entry.serviceLinkObserved = entry.serviceLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasServicePageLink === true || geoSignalsV1.coverage.hasServiceNav === true));
   const discoveryComplete = isCoverageObservationV2CompletePage_(entry) && !!origin;
-  const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.faqLinks || entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_) : [];
-  const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.serviceLinks || entry.links, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
-  const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
-  const sitemapUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
+  const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.faqLinks || entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_, contentScope) : [];
+  const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.serviceLinks || entry.links, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_, contentScope) : [];
+  const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_, contentScope) : [];
+  const sitemapUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_, contentScope) : [];
   const canOpen = context && typeof context.newPage === 'function';
   const faqRows = canOpen ? await observeCoverageObservationV2Candidates_(context, faqUrls) : [];
   const serviceRows = canOpen ? await observeCoverageObservationV2Candidates_(context, serviceUrls) : [];
   const directBreadcrumbRows = canOpen ? await observeCoverageObservationV2Candidates_(context, breadcrumbUrls) : [];
   const reusableBreadcrumbRows = !breadcrumbUrls.length
-    ? collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin)
+    ? collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin, contentScope)
     : [];
   const usingReusableBreadcrumbRows = reusableBreadcrumbRows.length > 0;
   const breadcrumbRows = usingReusableBreadcrumbRows ? reusableBreadcrumbRows : directBreadcrumbRows;
@@ -27610,6 +27684,9 @@ module.exports.__lightBudgetTestHooks = {
   isGenericRepresentativeRouteCandidate_,
   addGenericRepresentativeRouteCandidatesFromLinks_,
   normalizeDiscoverSubpageUrl,
+  buildContentScopeV1_,
+  isUrlInContentScopeV1_,
+  filterContentScopeUrlsV1_,
   addDiscoverSubpageCandidate,
   discoverSubpageCandidatesLightData_,
   compactSubpageJsonLdObservation_,
