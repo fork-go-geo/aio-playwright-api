@@ -19828,7 +19828,22 @@ app.post('/scrape-auth', async (req, res) => {
       subpageObservationMode: String(request.subpageObservationMode || '')
     };
     console.log('[AUTH_SCRAPE][ENTER]', JSON.stringify({ origin: executionAuth.authOrigin, signalsMode: query.signalsMode }));
-    return await scrapeOnce({ query }, res, null, { executionAuth, authenticatedRun: true });
+    // Keep authenticated light requests on the exact same budget, queue, and
+    // setup-retry path as GET /scrape. Authentication remains execution-only.
+    const requestStartedAt = Date.now();
+    const requestedSignalsMode = String(query.signalsMode || '').toLowerCase();
+    const requestedResponseMode = String(query.responseMode || '').toLowerCase();
+    const lightBudget = requestedSignalsMode === 'light' || requestedResponseMode === 'signals-first' || requestedResponseMode === 'signalsfirst'
+      ? createLightRequestBudget_(requestStartedAt)
+      : null;
+    const authenticatedRequest = { query };
+    return await enqueueLightScrapeWithDeadline_(queue, authenticatedRequest, res, lightBudget, () => (
+      lightBudget
+        ? runLightScrapeWithSetupRetry_(authenticatedRequest, res, lightBudget, (attemptOptions) => (
+          scrapeOnce(authenticatedRequest, res, lightBudget, Object.assign({}, attemptOptions, { executionAuth, authenticatedRun: true }))
+        ))
+        : scrapeOnce(authenticatedRequest, res, lightBudget, { executionAuth, authenticatedRun: true })
+    ));
   } catch (error) {
     const code = error && AUTH_ERROR_CODES.has(error.code) ? error.code : 'AUTH_INVALID_INPUT';
     return safeAuthFailureResponse_(res, code);
