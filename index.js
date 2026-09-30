@@ -23276,6 +23276,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           gotoResponsePresent: !!resp
         });
       }
+      // Auth failures already carry a safe, caller-visible code. Do not turn
+      // them into a generic light-budget failure before the auth-safe catch
+      // can return that code to the authenticated caller.
+      if (err && AUTH_ERROR_CODES.has(err.code)) throw err;
       if (signalsFirstLight && isLightTopGotoTimeoutError_(err)) {
         lightBudget.gotoFallback.gotoTimedOut = true;
         lightBudget.gotoFallback.domFallbackAttempted = true;
