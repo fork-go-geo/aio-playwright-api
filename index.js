@@ -161,6 +161,64 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 app.use(express.json({ limit: '64kb' }));
 
+// Execution-only Basic authentication.  This object must never be merged into
+// a scrape payload, response, cache entry, or diagnostic log.
+const AUTH_ERROR_CODES = new Set(['AUTH_HTTPS_REQUIRED', 'AUTH_FAILED', 'AUTH_REDIRECT_OUT_OF_SCOPE', 'AUTH_INVALID_INPUT']);
+function authError_(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+function originForAuth_(value) {
+  try { return new URL(String(value || '')).origin; } catch (_) { return ''; }
+}
+function parseExecutionAuth_(request, executionAuth) {
+  const input = executionAuth && typeof executionAuth === 'object' ? executionAuth : null;
+  if (!input || input.kind !== 'basic') return null;
+  const target = new URL(String(request && request.url || ''));
+  if (target.protocol !== 'https:') throw authError_('AUTH_HTTPS_REQUIRED');
+  const authOrigin = originForAuth_(input.authOrigin);
+  if (!authOrigin || authOrigin !== target.origin) throw authError_('AUTH_INVALID_INPUT');
+  const username = typeof input.username === 'string' ? input.username : '';
+  const password = typeof input.password === 'string' ? input.password : '';
+  if (!username || !password || username.includes(':') || /[\r\n]/.test(username) || /[\r\n]/.test(password) || username.length > 512 || password.length > 4096) {
+    throw authError_('AUTH_INVALID_INPUT');
+  }
+  return { kind: 'basic', username, password, authOrigin };
+}
+function authHeadersForUrl_(url, executionAuth) {
+  if (!executionAuth || originForAuth_(url) !== executionAuth.authOrigin) return {};
+  return { Authorization: 'Basic ' + Buffer.from(`${executionAuth.username}:${executionAuth.password}`, 'utf8').toString('base64') };
+}
+function assertAuthenticatedFinalOrigin_(url, executionAuth) {
+  if (executionAuth && originForAuth_(url) !== executionAuth.authOrigin) throw authError_('AUTH_REDIRECT_OUT_OF_SCOPE');
+}
+// Native fetch does not inherit Playwright context credentials. Redirects are
+// intentionally followed one hop at a time so a header is never forwarded.
+async function fetchWithExecutionAuth_(url, options = {}, executionAuth) {
+  // Preserve the pre-existing fetch behavior for ordinary diagnostics.
+  if (!executionAuth) return fetch(url, Object.assign({}, options, { redirect: 'follow' }));
+  let current = String(url || '');
+  let credentialsAllowed = true;
+  const maxRedirects = 5;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const headers = Object.assign({}, options.headers || {}, credentialsAllowed ? authHeadersForUrl_(current, executionAuth) : {});
+    const response = await fetch(current, Object.assign({}, options, { headers, redirect: 'manual' }));
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const location = response.headers && response.headers.get && response.headers.get('location');
+    if (!location || hop === maxRedirects) return response;
+    const next = new URL(location, current);
+    // Do not turn an HTTP hop into a credentialed HTTPS request. This applies
+    // to native robots/sitemap/static-fetch chains as well as direct helpers.
+    if (new URL(current).protocol !== 'https:' || next.protocol !== 'https:') credentialsAllowed = false;
+    current = next.toString();
+  }
+  throw new Error('redirect_limit');
+}
+function safeAuthFailureResponse_(res, code) {
+  return res.status(code === 'AUTH_FAILED' ? 401 : 400).json({ ok: false, code, error: code });
+}
+
 function logSfMemory(label) {
   try {
     const m = process.memoryUsage();
@@ -6430,19 +6488,18 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
   return fetchSubpageWithTrailingSlashRetry_(url, retryUrl => fetchSubpagePlaywrightScopedLightOnce_(retryUrl, opts));
 }
 
-async function fetchDiscoverSubpageText(url, timeoutMs = 8000) {
+async function fetchDiscoverSubpageText(url, timeoutMs = 8000, executionAuth = null) {
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithExecutionAuth_(url, {
       method: 'GET',
-      redirect: 'follow',
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'application/xml,text/xml,text/html,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       }
-    });
+    }, executionAuth);
     const status = response && typeof response.status === 'number' ? response.status : null;
     if (!response || !response.ok) return { ok: false, status, text: '', finalUrl: response && response.url || url };
     const text = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
@@ -6469,10 +6526,10 @@ function parseDiscoverSitemapXml(xml) {
   return { sitemapLocs, urlLocs };
 }
 
-async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors) {
+async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors, opts = {}) {
   const roots = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'].map(path => origin.replace(/\/$/, '') + path);
   for (const sitemapUrl of roots) {
-    const rootRes = await fetchDiscoverSubpageText(sitemapUrl, 8000);
+    const rootRes = await fetchDiscoverSubpageText(sitemapUrl, 8000, opts.executionAuth || null);
     if (!rootRes.ok) {
       errors.push({ source: 'sitemap', message: `${sitemapUrl}: ${rootRes.status || rootRes.error || 'fetch_failed'}` });
       continue;
@@ -6492,7 +6549,7 @@ async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSumm
         } catch (_) {
           continue;
         }
-        const childRes = await fetchDiscoverSubpageText(childUrl, 8000);
+        const childRes = await fetchDiscoverSubpageText(childUrl, 8000, opts.executionAuth || null);
         if (!childRes.ok) {
           errors.push({ source: 'sitemap', message: `${childUrl}: ${childRes.status || childRes.error || 'fetch_failed'}` });
           continue;
@@ -6671,7 +6728,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
         '--no-default-browser-check'
       ]
     });
-    context = await browser.newContext({
+    const contextOptions = {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       serviceWorkers: 'allow',
       viewport: { width: 1366, height: 900 },
@@ -6679,7 +6736,9 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo',
       ignoreHTTPSErrors: true
-    });
+    };
+    if (opts.executionAuth) contextOptions.httpCredentials = { username:opts.executionAuth.username, password:opts.executionAuth.password, origin:opts.executionAuth.authOrigin };
+    context = await browser.newContext(contextOptions);
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -6687,6 +6746,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     page.setDefaultNavigationTimeout(15000);
     page.setDefaultTimeout(15000);
     await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    if (opts.executionAuth) assertAuthenticatedFinalOrigin_(page.url(), opts.executionAuth);
     await collectBalancedHydrationMetrics(page, 2500, { shortFastMode: false }).catch(() => null);
     const topLinks = await collectDiscoverLinksFromPage(page);
     if (Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
@@ -6751,7 +6811,7 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
   const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, article: 0, genericRoute: 0 };
   const errors = [];
   const candidateMap = new Map();
-  await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
+  await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors, opts);
   const operatorIdentityDiscoverLinkAuditSink = {};
   const officialExternalOperatorProfileCandidates = await collectDiscoverFallbackCandidates(
     topUrl,
@@ -10941,7 +11001,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : 'htmlFetchOnly'
         )
       : await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 20, {
-          siteMode,
+        siteMode,
+        executionAuth: opts.executionAuth || null,
           page: opts && opts.page,
           context: opts && opts.context,
           reuseBrowser: reusePageForDiscover || reuseContextForObserve
@@ -14425,7 +14486,7 @@ function buildAiPolicyTrustSignalV1_(origin, observations = {}) {
   };
 }
 
-async function collectAiPolicyTrustSignalV1_(pageUrl, timeoutMs = 1500) {
+async function collectAiPolicyTrustSignalV1_(pageUrl, timeoutMs = 1500, executionAuth = null) {
   let origin = '';
   try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
   if (!origin || typeof fetch !== 'function') {
@@ -14435,12 +14496,11 @@ async function collectAiPolicyTrustSignalV1_(pageUrl, timeoutMs = 1500) {
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
-      const response = await fetch(url, {
+      const response = await fetchWithExecutionAuth_(url, {
         method: 'GET',
-        redirect: 'follow',
         signal: controller ? controller.signal : undefined,
         headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
-      });
+      }, executionAuth);
       const status = response && typeof response.status === 'number' ? response.status : null;
       const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
       const text = response && response.ok ? String(await response.text() || '').slice(0, 120000) : '';
@@ -14551,7 +14611,7 @@ function buildHtmlSitemapCoverageSignalV1_(origin, observations = [], options = 
   };
 }
 
-async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 1500) {
+async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 1500, executionAuth = null) {
   let origin = '';
   try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
   if (!origin || typeof fetch !== 'function') return buildHtmlSitemapCoverageSignalV1_('', []);
@@ -14567,7 +14627,7 @@ async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 15
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
-      const response = await fetch(url, { method:'GET', redirect:'follow', signal:controller ? controller.signal : undefined, headers:{ Accept:'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', 'User-Agent':'geo-unified-observer-html-sitemap/1.0' } });
+      const response = await fetchWithExecutionAuth_(url, { method:'GET', signal:controller ? controller.signal : undefined, headers:{ Accept:'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', 'User-Agent':'geo-unified-observer-html-sitemap/1.0' } }, executionAuth);
       const status = response && typeof response.status === 'number' ? response.status : null;
       const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
       const text = response && response.ok ? String(await response.text() || '').slice(0, 500000) : '';
@@ -18313,15 +18373,14 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
     if (parentSignal && typeof parentSignal.addEventListener === 'function') parentSignal.addEventListener('abort', abortFromParent, { once: true });
     timeoutId = controller ? setTimeout(() => { try { controller.abort(); } catch (_) {} }, timeoutMs) : null;
     let response = null;
-    response = await fetch(url, {
+    response = await fetchWithExecutionAuth_(url, {
       method: 'GET',
-      redirect: 'follow',
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       }
-    });
+    }, opts.executionAuth || null);
     result.status = response && typeof response.status === 'number' ? response.status : null;
     result.finalUrl = response && response.url ? response.url : String(url || '');
     // Fetch exposes a reliable "no redirect" result, but not an exact count
@@ -19749,6 +19808,33 @@ app.get('/scrape', async (req, res) => {
   ));
 });
 
+// Authenticated runs deliberately use a separate POST contract.  Do not log
+// req.body here: it contains execution-only secrets.
+app.post('/scrape-auth', async (req, res) => {
+  let executionAuth = null;
+  let request = null;
+  try {
+    request = req && req.body && req.body.request && typeof req.body.request === 'object' ? req.body.request : null;
+    executionAuth = parseExecutionAuth_(request, req && req.body && req.body.executionAuth);
+    if (!executionAuth) throw authError_('AUTH_INVALID_INPUT');
+    // Only explicitly allowed, non-secret request fields enter the legacy
+    // scraper. This keeps the original POST body out of all generic traces.
+    const query = {
+      url: String(request.url || ''),
+      nocache: '1',
+      signalsMode: String(request.signalsMode || 'light'),
+      responseMode: String(request.responseMode || ''),
+      siteMode: String(request.siteMode || 'generic'),
+      subpageObservationMode: String(request.subpageObservationMode || '')
+    };
+    console.log('[AUTH_SCRAPE][ENTER]', JSON.stringify({ origin: executionAuth.authOrigin, signalsMode: query.signalsMode }));
+    return await scrapeOnce({ query }, res, null, { executionAuth, authenticatedRun: true });
+  } catch (error) {
+    const code = error && AUTH_ERROR_CODES.has(error.code) ? error.code : 'AUTH_INVALID_INPUT';
+    return safeAuthFailureResponse_(res, code);
+  }
+});
+
 function buildBalancedShortResponsePayload(fullPayload) {
   const trimmedFields = [];
   const str = (value, max, path) => {
@@ -20098,6 +20184,8 @@ function buildBalancedShortResponsePayload(fullPayload) {
 
 async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   const urlToFetch = req.query.url;
+  const executionAuth = scrapeOptions && scrapeOptions.executionAuth || null;
+  const authenticatedRun = !!(scrapeOptions && scrapeOptions.authenticatedRun && executionAuth);
 
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
@@ -20195,7 +20283,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
 
   // --- CACHE CHECK (early return) ---
   try {
-    if (!noCache) {
+    if (!noCache && !authenticatedRun) {
       const cached = cacheGet(urlToFetch);
       if (cached && cached.json) {
         const payload = JSON.parse(JSON.stringify(cached.json));
@@ -20334,8 +20422,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       const __timingTopPageStaticFetchStart = Date.now();
       topPageStaticFetchResult = signalsFirstLight
       ? await runLightBudgetStage_(lightBudget, 'top_static_fetch', 20000,
-          (timeoutMs) => fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode, timeoutMs, signal: lightAttempt && lightAttempt.controller && lightAttempt.controller.signal }))
-        : await fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode });
+          (timeoutMs) => fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode, timeoutMs, signal: lightAttempt && lightAttempt.controller && lightAttempt.controller.signal, executionAuth }))
+        : await fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode, executionAuth });
       if (signalsFirstLight) {
         lightBudget.topPageStaticFetchTraceV1 = Object.assign(
           { requestId: lightBudget.requestId },
@@ -20390,7 +20478,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     });
 
     const __timingPageReadyStart = Date.now();
-    const createContext = () => browser.newContext({
+    const contextOptions = {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
                  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
                  'Chrome/122.0.0.0 Safari/537.36',
@@ -20399,7 +20487,13 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       javaScriptEnabled: true,
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo'
-    });
+    };
+    if (authenticatedRun) contextOptions.httpCredentials = {
+      username: executionAuth.username,
+      password: executionAuth.password,
+      origin: executionAuth.authOrigin
+    };
+    const createContext = () => browser.newContext(contextOptions);
     context = signalsFirstLight
       ? await runLightBudgetStage_(lightBudget, 'browser_context', 15000, createContext, {
           onLateResolve: (lateContext) => closeLatePlaywrightResource_(lateContext, 'context')
@@ -20796,6 +20890,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           domContentLoaded = true;
         }
         finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+        if (authenticatedRun) assertAuthenticatedFinalOrigin_(finalUrl, executionAuth);
         status = resp && typeof resp.status === 'function' ? resp.status() : null;
         return {
           status,
@@ -23148,6 +23243,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     let resp;
     try {
       resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
+      if (authenticatedRun) assertAuthenticatedFinalOrigin_(page && typeof page.url === 'function' ? page.url() : urlToFetch, executionAuth);
+      if (authenticatedRun && resp && typeof resp.status === 'function' && [401, 403].includes(resp.status())) throw authError_('AUTH_FAILED');
       if (signalsFirstLight) {
         markLightMainFrameGotoTrace_(lightBudget, page, {
           gotoOutcome: 'success',
@@ -23196,7 +23293,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     });
     logSfMemory('after_goto');
     if (probeMode === 'jsonldresourcetap') {
-      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+    const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+    if (authenticatedRun) assertAuthenticatedFinalOrigin_(finalUrl, executionAuth);
       const status = resp && typeof resp.status === 'function' ? resp.status() : null;
       logSf('JSONLD_RESOURCE_TAP_PROBE_ENTER', {
         url: String(urlToFetch || '').slice(0, 180),
@@ -24021,11 +24119,11 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         retryAttempted: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1,
         retrySucceeded: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1
       });
-      attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch));
+      attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch, 1500, executionAuth));
       // attachCoverageSignalsToGeoSignalsLight_ rebuilds coverageSignals below.
       // Retain this completed Cloud Run observation and re-attach it afterwards
       // so both the coverage and coverageSignals authority paths survive.
-      const htmlSitemapCoverageSignal = await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page);
+      const htmlSitemapCoverageSignal = await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page, 1500, executionAuth);
       attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, htmlSitemapCoverageSignal);
       if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'build_geo_signals_end');
       if (signalsFirstLight) {
@@ -24111,6 +24209,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         debugHeavySite,
         debugHeavySiteStartedAt,
         lightBudget: signalsFirstLight ? lightBudget : null
+        ,executionAuth
       });
       attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, htmlSitemapCoverageSignal);
       // V2 is a separate producer-only observation. It runs after the legacy
@@ -24620,8 +24719,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       logSf('SIGNALS_ONLY_EARLY_BEFORE_GEO_SIGNALS');
       logSfMemory('signals_only_early_before_geo_signals');
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
-      attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch));
-      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page));
+      attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch, 1500, executionAuth));
+      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page, 1500, executionAuth));
       logSf('SIGNALS_ONLY_EARLY_AFTER_GEO_SIGNALS', {
         hasGeoSignals: !!geoSignalsV1,
         error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -26927,8 +27026,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   logSf('BEFORE_GEO_SIGNALS');
   logSfMemory('before_geo_signals');
   const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch, { siteMode });
-  attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(urlToFetch));
-  attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(urlToFetch, page));
+  attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(urlToFetch, 1500, executionAuth));
+  attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(urlToFetch, page, 1500, executionAuth));
   logSf('AFTER_GEO_SIGNALS', {
     hasGeoSignals: !!geoSignalsV1,
     error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -27185,7 +27284,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   addScrapeSpan('response_payload_build', __timingResponsePayloadStart);
 
   // --- CACHE SET（成功時のみ保存）
-  try { if (!noCache) cacheSet(urlToFetch, out); } catch(_) {}
+  try { if (!noCache && !authenticatedRun) cacheSet(urlToFetch, out); } catch(_) {}
 
   out.debug = out.debug || {};
   if (noCache) out.debug.cache = { hit: false, nocache: true };
@@ -27249,6 +27348,12 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   return res.status(200).json(out);
 
   } catch (err) {
+    // Authenticated runs must never enter generic error logging, fallback, or
+    // response paths. Keep the full error/request context execution-local.
+    if (authenticatedRun && !res.headersSent) {
+      const authCode = err && AUTH_ERROR_CODES.has(err.code) ? err.code : 'AUTH_FAILED';
+      return safeAuthFailureResponse_(res, authCode);
+    }
     logSf('SCRAPE_CATCH', {
       name: err && err.name ? String(err.name).slice(0, 80) : '',
       message: err && err.message ? String(err.message).slice(0, 240) : String(err).slice(0, 240)
@@ -27594,6 +27699,11 @@ if (require.main === module) {
 }
 
 module.exports.__lightBudgetTestHooks = {
+  app,
+  parseExecutionAuth_,
+  authHeadersForUrl_,
+  fetchWithExecutionAuth_,
+  originForAuth_,
   buildAiPolicyTrustSignalV1_,
   buildHtmlSitemapCoverageSignalV1_,
   attachHtmlSitemapCoverageSignalToGeoSignalsV1_,
