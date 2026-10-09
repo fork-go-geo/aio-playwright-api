@@ -290,7 +290,9 @@ const externalInfo = extractOperatorIdentityInfoFromHtml_(
   { highConfidenceCompanyProfile: true }
 );
 assert.strictEqual(externalInfo.hasOperatorInfo, true);
-const externalRecord = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(externalInfo, 'company_profile'), externalOperatorCandidates[0]);
+const externalRecord = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(externalInfo, 'company_profile', {
+  relationEvidence: hooks.buildExplicitOperatorIdentityRelationEvidenceV1_(externalOperatorCandidates[0])
+}), externalOperatorCandidates[0]);
 assert.strictEqual(externalRecord.authority, 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1');
 assert.strictEqual(externalRecord.provenance.relation, 'explicit_external_operator_profile_link');
 assert.strictEqual(externalRecord.provenance.relationLabel, '運営会社');

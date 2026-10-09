@@ -68,6 +68,17 @@ const conflictResult = resolve([distributedName, distributedNap, conflicting]);
 assert.equal(conflictResult.record, null);
 assert.equal(conflictResult.reason, 'company_profile_field_conflict');
 
+// This aggregate is not a bounded hub/detail chain. It represents separate
+// observed profile records, so same-name records with inconsistent addresses
+// remain fail-closed rather than being merged as alternate offices.
+const sameNameDifferentAddress = observedProfile('https://example.test/about_site/other-office/', `
+  <title>当サイトについて</title><h1>当サイトについて</h1>
+  <table><tr><th>運営会社</th><td>Example株式会社</td></tr>
+  <tr><th>所在地</th><td>〒200-0002 架空県架空市2-2</td></tr></table>`);
+const sameNameAddressConflict = resolve([nameAddress, sameNameDifferentAddress]);
+assert.equal(sameNameAddressConflict.record, null);
+assert.equal(sameNameAddressConflict.reason, 'company_profile_field_conflict');
+
 // Covez-equivalent: a same-origin "about this site" scope carries the named
 // operator on one existing page and NAP fields on another existing page.
 assert.equal(distributedResult.record.companyName, 'Example株式会社');
@@ -84,6 +95,7 @@ console.log(JSON.stringify({
     companyNameAddressWithoutTelephoneAccepted: !!nameAddressResult.record,
     associationNameAddressWithoutTelephoneAccepted: !!associationResult.record,
     sourceConflictRejected: conflictResult.record === null,
+    independentSameNameAddressConflictRejected: sameNameAddressConflict.record === null,
     normalExistingProfileRegression: !!fullResult.record,
     covezEquivalent: !!distributedResult.record,
   }

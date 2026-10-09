@@ -4,6 +4,11 @@
 
 // === scoring config (ADD) ===
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const dns = require('node:dns');
+const http = require('node:http');
+const https = require('node:https');
+const net = require('node:net');
+const crypto = require('node:crypto');
 const WEIGHTS5 = {
   dataStructure: 35,       // データ構造
   expressionClarity: 20,   // 表現の明確さ
@@ -3347,8 +3352,8 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
   };
   // A service site can explicitly identify a separate corporate domain as its
   // operator.  This narrow candidate is created only from its own rendered
-  // nav/footer link with an operator relation label; arbitrary external links
-  // never reach this branch or the profile fetcher.
+  // navigation, footer, or an explicitly labelled in-page operator relation;
+  // arbitrary external links never reach this branch or the profile fetcher.
   if (external) {
     const sourceOrigin = String(candidate.operatorRelationSourceOrigin || '');
     let candidateOrigin = '';
@@ -3357,7 +3362,8 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
     result.labelMatched = explicitOperatorRelation;
     if (!sourceOrigin || !candidateOrigin || candidateOrigin === sourceOrigin) result.rejectionReasons.push('external_origin_not_distinct');
     if (!explicitOperatorRelation) result.rejectionReasons.push('external_operator_relation_label_missing');
-    if (!hasHumanNavigationCorroboration) result.rejectionReasons.push('nav_footer_corroboration_missing');
+    const hasExplicitRenderedRelation = hasHumanNavigationCorroboration || sources.includes('explicit_body_operator_relation');
+    if (!hasExplicitRenderedRelation) result.rejectionReasons.push('explicit_operator_relation_context_missing');
     result.highConfidenceEligible = result.rejectionReasons.length === 0;
     return result;
   }
@@ -3393,22 +3399,46 @@ function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
     return Object.assign({}, strict, {
       probeEligible: true,
       probeTier: 'strict_corroborated',
-      probeSourceType: 'company_profile'
+      probeSourceType: 'company_profile',
+      // An explicitly qualified same-origin company page may hand off once
+      // to HTTPS corporate infrastructure. The fetcher revalidates the
+      // redirect target and keeps all later redirects same-origin there.
+      allowExplicitExternalCompanyRedirect: candidate && candidate.officialExternalOperatorProfile !== true
     });
   }
   const sourceTypes = Array.from(new Set(strict.sources));
   const humanNavigation = sourceTypes.includes('nav') || sourceTypes.includes('footer');
-  const explicitCompanyOrOperatorLabel = isOrganizationInformationContext_(strict.url, strict.label);
+  const explicitSameOriginCompanyRelation = candidate &&
+    candidate.officialSameOriginOperatorProfile === true &&
+    sourceTypes.includes('explicit_body_company_profile_relation');
+  // Keep the bounded same-origin `Operator` link contract that existed before
+  // canonical-site-context inference was centralized. This is only a fetch
+  // permission on a rendered nav/footer link; the fetched page must still
+  // yield the existing formal company-profile record before it is positive.
+  const explicitCompanyOrOperatorLabel = isOrganizationInformationContext_(strict.url, strict.label) || /\boperator\b/i.test(strict.label);
   const explicitLegalLink = isLegalOperatorCandidateText_(strict.label) || isLegalOperatorCandidatePath_(strict.url);
   // External destinations retain their existing explicit-relation gate.  A
   // same-origin human-facing label may use this limited fallback because the
   // page's structured fields, not the link, decide positivity.
   const sameOriginHumanCandidate = candidate && candidate.officialExternalOperatorProfile !== true && humanNavigation;
+  // This is the same bounded fetch permission as a rendered nav/footer
+  // company link, but for a direct, explicitly-labelled same-origin relation
+  // captured from page body. The relation collector already verifies origin
+  // and company-profile context; page fields still decide formal positivity.
+  if (explicitSameOriginCompanyRelation && explicitCompanyOrOperatorLabel) {
+    return Object.assign({}, strict, {
+      probeEligible: true,
+      probeTier: 'explicit_same_origin_company_profile_relation',
+      probeSourceType: 'company_profile',
+      allowExplicitExternalCompanyRedirect: true
+    });
+  }
   if (sameOriginHumanCandidate && explicitCompanyOrOperatorLabel) {
     return Object.assign({}, strict, {
       probeEligible: true,
       probeTier: 'human_labeled_company_profile',
-      probeSourceType: 'company_profile'
+      probeSourceType: 'company_profile',
+      allowExplicitExternalCompanyRedirect: true
     });
   }
   if (sameOriginHumanCandidate && explicitLegalLink) {
@@ -3449,15 +3479,177 @@ function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
   });
 }
 
+// This audit key is intentionally per-response and never transports either
+// the key material or a URL. It lets one no-save response join candidate,
+// relation, and probe records without providing a reversible URL identifier.
+function createOperatorIdentityCandidateAuditKeyerV1_(secret) {
+  const key = secret || crypto.randomBytes(32);
+  return value => `opidc_${crypto.createHmac('sha256', key)
+    .update(String(value || ''))
+    .digest('base64url')
+    .slice(0, 22)}`;
+}
+
+function operatorIdentityRelationAuditV1_(candidate, candidateKey, opts = {}) {
+  const sameOrigin = !!(candidate && candidate.officialSameOriginOperatorProfile === true &&
+    candidate.operatorRelationSource === 'explicit_body_company_profile_relation');
+  const external = !!(candidate && candidate.officialExternalOperatorProfile === true &&
+    ['explicit_body_operator_relation', 'nav', 'footer'].includes(String(candidate.operatorRelationSource || '')));
+  const relationKind = sameOrigin ? 'explicit_same_origin_company_profile_relation'
+    : (external ? 'explicit_external_operator_relation' : null);
+  const label = normalizeSubpageJsonLdText(candidate && (candidate.operatorRelationLabel || candidate.operatorRelationAnchorLabel || candidate.label) || '');
+  const sourceOrigin = String(candidate && candidate.operatorRelationSourceOrigin || '').trim();
+  const candidateUrl = String(candidate && candidate.url || '').trim();
+  let reason = null;
+  if (!relationKind) reason = 'relation_not_explicit_candidate';
+  else if (!label) reason = 'relation_label_missing';
+  else if (!sourceOrigin) reason = 'relation_source_origin_missing';
+  else if (!candidateUrl) reason = 'relation_candidate_url_missing';
+  else {
+    try {
+      const source = new URL(sourceOrigin);
+      const target = new URL(candidateUrl);
+      if (source.protocol !== 'https:' || target.protocol !== 'https:') reason = 'relation_non_https';
+      else if (sameOrigin && source.origin !== target.origin) reason = 'same_origin_relation_origin_mismatch';
+      else if (external && source.origin === target.origin) reason = 'external_relation_origin_not_distinct';
+    } catch (_) { reason = 'relation_url_invalid'; }
+  }
+  const evidence = reason ? null : buildExplicitOperatorIdentityRelationEvidenceV1_(candidate);
+  if (!reason && !evidence) reason = 'relation_evidence_unavailable';
+  const selectedRole = opts.selectedForProbe === true ? 'primary'
+    : (opts.selectedForFallback === true ? 'fallback' : 'not_selected');
+  return {
+    candidateKey,
+    sameOrigin: relationKind ? sameOrigin : null,
+    relationKind,
+    relationSourceType: relationKind ? String(candidate.operatorRelationSource || '') : null,
+    relationEvidenceEligible: !!evidence,
+    relationEvidenceReason: evidence ? 'ready' : reason,
+    priorityLane: opts.priorityLane === true,
+    selectedRole,
+    provenanceCandidateUrlMatch: opts.provenanceCandidateUrlMatch === true ? true
+      : (opts.provenanceCandidateUrlMatch === false ? false : null)
+  };
+}
+
+function safeOperatorIdentityDebugUrlProjectionV1_(value) {
+  try {
+    const parsed = value instanceof URL ? value : new URL(String(value || ''));
+    if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password || !parsed.hostname) return null;
+    const path = parsed.pathname || '/';
+    return {
+      scheme: parsed.protocol.slice(0, -1),
+      host: parsed.hostname.toLowerCase(),
+      port: parsed.port || null,
+      path,
+      trailingSlash: path.endsWith('/'),
+      queryPresent: !!parsed.search,
+      hashPresent: !!parsed.hash
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeOperatorIdentityDebugUrlProjectionV1_(value) {
+  const item = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!item || !['http', 'https'].includes(String(item.scheme || '').toLowerCase())) return null;
+  const host = String(item.host || '').trim().toLowerCase();
+  const path = String(item.path || '');
+  const port = item.port == null || item.port === '' ? null : String(item.port);
+  if (!host || /[\s@/?#]/.test(host) || !/^\/[^?#]*$/.test(path) || (port !== null && !/^\d{1,5}$/.test(port))) return null;
+  return {
+    scheme: String(item.scheme).toLowerCase(),
+    host,
+    port,
+    path,
+    trailingSlash: item.trailingSlash === true,
+    queryPresent: item.queryPresent === true,
+    hashPresent: item.hashPresent === true
+  };
+}
+
+function buildOperatorIdentityProbeAuditContextV1_(candidate, sourceType, page, rawIdentity, normalizedIdentity, opts = {}) {
+  const fetchResult = page && page.ok === true ? 'fetched' : 'fetch_failed';
+  const errorCode = fetchResult === 'fetched' ? null : normalizeOperatorIdentityProbeErrorCodeV1_(page);
+  const relation = operatorIdentityRelationAuditV1_(candidate, null);
+  let formalizationReason = null;
+  if (fetchResult !== 'fetched') formalizationReason = errorCode || 'fetch_failed';
+  else if (!rawIdentity) formalizationReason = 'identity_record_missing';
+  else if (rawIdentity.conflict === true) formalizationReason = 'conflict';
+  else if (sourceType === 'legal') {
+    if (!String(rawIdentity.companyName || rawIdentity.operatorName || '').trim()) formalizationReason = 'company_name_missing';
+    else if (rawIdentity.hasAddress !== true || rawIdentity.hasTelephone !== true) formalizationReason = 'legal_required_tuple_incomplete';
+  } else {
+    if (!String(rawIdentity.companyName || rawIdentity.operatorName || '').trim()) formalizationReason = 'company_name_missing';
+    else if (rawIdentity.observed !== true) formalizationReason = 'company_profile_not_observed';
+    else if (!relation.relationEvidenceEligible) formalizationReason = relation.relationEvidenceReason;
+  }
+  if (!formalizationReason && normalizedIdentity) formalizationReason = 'formal_record_generated';
+  if (!formalizationReason) formalizationReason = 'formal_record_incomplete';
+  const redirect = page && page.redirectAuditV1 && typeof page.redirectAuditV1 === 'object'
+    ? {
+      downgrade: page.redirectAuditV1.downgrade === true,
+      hop: Number.isInteger(page.redirectAuditV1.hop) ? page.redirectAuditV1.hop : null,
+      fromScheme: page.redirectAuditV1.fromScheme === 'https' ? 'https' : null,
+      toScheme: page.redirectAuditV1.toScheme === 'http' ? 'http' : null
+    } : null;
+  const noSaveRedirectDebug = opts && opts.operatorIdentityNoSaveRedirectDebug === true;
+  if (noSaveRedirectDebug && redirect) {
+    redirect.firstRedirectHttpStatus = Number.isInteger(page.redirectAuditV1.firstRedirectHttpStatus)
+      ? page.redirectAuditV1.firstRedirectHttpStatus : null;
+    redirect.location = normalizeOperatorIdentityDebugUrlProjectionV1_(page.redirectAuditV1.location);
+  }
+  const context = {
+    candidate,
+    probeTier: String(candidate && candidate.operatorIdentityProbeTier || ''),
+    probeSourceType: sourceType === 'legal' ? 'legal' : 'company_profile',
+    fetchResult,
+    errorCode,
+    redirect,
+    formalRecordGenerated: !!normalizedIdentity,
+    formalizationReason
+  };
+  if (noSaveRedirectDebug) {
+    context.noSaveRedirectDebugV1 = {
+      safeFetchStart: safeOperatorIdentityDebugUrlProjectionV1_(candidate && candidate.url)
+    };
+  }
+  return context;
+}
+
 function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCandidate, opts = {}) {
   const mode = String(siteMode || '').toLowerCase();
-  const entries = (Array.isArray(candidates) ? candidates : []).map(candidate => {
+  const rawCandidates = Array.isArray(candidates) ? candidates : [];
+  const candidateKey = createOperatorIdentityCandidateAuditKeyerV1_(opts.candidateAuditSecret);
+  const priorityLaneUrls = new Set(Array.isArray(opts.selectionPriorityLaneCandidateUrls)
+    ? opts.selectionPriorityLaneCandidateUrls.map(value => String(value || '')) : []);
+  const auditCandidates = Array.isArray(opts.selectionAuditCandidates)
+    ? opts.selectionAuditCandidates
+    : rawCandidates.slice(0, OPERATOR_IDENTITY_PRESELECTION_INPUT_MAX_V1_);
+  const entries = auditCandidates.map(candidate => {
     const evaluation = evaluateHighConfidenceCompanyProfileCandidate_(candidate);
     const sourceTypes = Array.from(new Set(evaluation.sources)).sort();
     const titleHint = normalizeSubpageJsonLdText(candidate && (candidate.titleHint || candidate.pageTitle || '') || '');
     const headingHint = normalizeSubpageJsonLdText(candidate && (candidate.headingHint || candidate.h1 || '') || '');
+    const url = String(evaluation.url || '');
+    const selectedForProbe = String(selectedCandidate && selectedCandidate.url || '') === url;
+    const selectedForFallback = String(opts && opts.fallbackCandidate && opts.fallbackCandidate.url || '') === url;
+    const key = candidateKey(url);
+    const priorityLane = priorityLaneUrls.has(String(candidate && candidate.url || ''));
+    const relation = operatorIdentityRelationAuditV1_(candidate, key, {
+      selectedForProbe,
+      selectedForFallback,
+      priorityLane
+    });
+    const selectionDisposition = selectedForProbe ? 'selected_primary'
+      : (selectedForFallback ? 'selected_fallback'
+        : (evaluateBoundedOperatorIdentityProbeCandidate_(candidate).probeEligible !== true ? 'ineligible'
+          : (priorityLane ? 'ranked_below_probe_limit' : 'priority_lane_not_retained')));
     return {
-      url: String(evaluation.url || '').slice(0, 500),
+      candidateKey: key,
+      // Deliberately do not transport a URL in the no-save audit. The
+      // response-local candidateKey is the only join key for this candidate.
       normalizedPath: String(evaluation.path || '').slice(0, 300),
       anchorLabel: String(evaluation.label || '').slice(0, 180),
       titleHintPresent: !!titleHint,
@@ -3481,15 +3673,61 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
       probeSourceType: evaluateBoundedOperatorIdentityProbeCandidate_(candidate).probeSourceType,
       score: Number(candidate && candidate.score || 0),
       rejectionReasons: evaluation.rejectionReasons.slice(0, 5),
-      selectedForProbe: String(selectedCandidate && selectedCandidate.url || '') === String(evaluation.url || '')
+      priorityLane,
+      selectedForProbe,
+      selectedForFallback,
+      selectionDisposition,
+      relation
     };
   });
-  // Always retain eligible candidates first, so a selected candidate remains
-  // inspectable even when higher-scored rejected discovery candidates exist.
-  const bounded = entries.filter(item => item.highConfidenceEligible)
-    .concat(entries.filter(item => !item.highConfidenceEligible))
+  // Always retain selected primary/fallback candidates first, including the
+  // bounded generic-route lane, so a failed primary cannot disappear from
+  // audit when a fallback was attempted.
+  const selectedEntries = entries.filter(item => item.selectedForProbe || item.selectedForFallback);
+  const remainingEntries = entries.filter(item => !item.selectedForProbe && !item.selectedForFallback);
+  const bounded = selectedEntries
+    .concat(remainingEntries.filter(item => item.highConfidenceEligible))
+    .concat(remainingEntries.filter(item => !item.highConfidenceEligible))
     .slice(0, 5);
   const selected = bounded.find(item => item.selectedForProbe) || null;
+  const entryByKey = new Map(entries.map(item => [item.candidateKey, item]));
+  const probeLinkage = (context, role) => {
+    if (!context || !context.candidate) return null;
+    const contextCandidateKey = candidateKey(String(context.candidate.url || ''));
+    const item = entryByKey.get(contextCandidateKey);
+    const relation = item && item.relation ? item.relation : operatorIdentityRelationAuditV1_(context.candidate, candidateKey(String(context.candidate.url || '')), {
+      selectedForProbe: role === 'primary', selectedForFallback: role === 'fallback',
+      priorityLane: priorityLaneUrls.has(String(context.candidate.url || ''))
+    });
+    const linkage = {
+      role,
+      candidateKey: relation.candidateKey,
+      probeTier: context.probeTier || null,
+      probeSourceType: context.probeSourceType || null,
+      relationSourceType: relation.relationSourceType,
+      relationEvidenceEligible: relation.relationEvidenceEligible,
+      relationEvidenceReason: relation.relationEvidenceReason,
+      provenanceCandidateUrlMatch: context.formalRecordGenerated === true ? true : null,
+      fetchResult: context.fetchResult || null,
+      errorCode: context.errorCode || null,
+      redirect: context.redirect || null,
+      formalRecordGenerated: context.formalRecordGenerated === true,
+      formalizationReason: context.formalizationReason || null
+    };
+    if (opts.operatorIdentityNoSaveRedirectDebug === true && context.noSaveRedirectDebugV1) {
+      linkage.noSaveRedirectDebugV1 = context.noSaveRedirectDebugV1;
+    }
+    return linkage;
+  };
+  const companyProfileCandidates = entries.filter(item => item.pathMatched || item.labelMatched ||
+    (item.relation && item.relation.relationKind)).slice(0, 5).map(item => ({
+      candidateKey: item.candidateKey,
+      discovery: 'discovered_in_bounded_evaluation_window',
+      eligibility: item.boundedProbeEligible ? 'eligible' : 'ineligible',
+      priorityLane: item.priorityLane,
+      selectionDisposition: item.selectionDisposition,
+      rejectionReasons: item.rejectionReasons.slice(0, 3)
+    }));
   const probeCandidateCount = entries.filter(item => item.boundedProbeEligible === true).length;
   const discover = opts && opts.discoverLinkAudit && typeof opts.discoverLinkAudit === 'object'
     ? opts.discoverLinkAudit : null;
@@ -3497,7 +3735,7 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
     version: 'operator_identity_candidate_audit_v1',
     siteMode: mode || null,
     producerReached: opts.producerReached === true ? true : null,
-    candidateCount: typeof opts.candidateCount === 'number' ? Math.max(0, opts.candidateCount) : entries.length,
+    candidateCount: typeof opts.candidateCount === 'number' ? Math.max(0, opts.candidateCount) : rawCandidates.length,
     probeCandidateCount: typeof opts.probeCandidateCount === 'number' ? Math.max(0, opts.probeCandidateCount) : probeCandidateCount,
     completeCandidateCount: typeof opts.completeCandidateCount === 'number' ? Math.max(0, opts.completeCandidateCount) : null,
     failureStage: typeof opts.failureStage === 'string' ? opts.failureStage : null,
@@ -3509,31 +3747,94 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
     operatorRelationSample: discover && Array.isArray(discover.operatorRelationSample)
       ? discover.operatorRelationSample.slice(0, 3) : [],
     candidates: bounded,
+    companyProfileCandidates,
+    companyProfileCandidateAuditTruncated: entries.filter(item => item.pathMatched || item.labelMatched ||
+      (item.relation && item.relation.relationKind)).length > companyProfileCandidates.length,
+    relationCandidates: entries.filter(item => item.relation && item.relation.relationKind)
+      .slice(0, 2).map(item => item.relation),
+    probeLinkage: {
+      primary: probeLinkage(opts.primaryProbeContext, 'primary'),
+      fallback: probeLinkage(opts.fallbackProbeContext, 'fallback')
+    },
     selection: {
-      selectedCandidateUrl: selected ? selected.url : null,
+      selectionStrategy: typeof opts.selectionStrategy === 'string' ? opts.selectionStrategy : null,
+      selectionInputCandidateCount: typeof opts.selectionInputCandidateCount === 'number' ? Math.max(0, opts.selectionInputCandidateCount) : null,
+      selectionPreselectionInputCount: typeof opts.selectionPreselectionInputCount === 'number' ? Math.max(0, opts.selectionPreselectionInputCount) : null,
+      selectionPriorityLaneScanCount: typeof opts.selectionPriorityLaneScanCount === 'number' ? Math.max(0, opts.selectionPriorityLaneScanCount) : null,
+      selectionPriorityLaneRetainedCount: typeof opts.selectionPriorityLaneRetainedCount === 'number' ? Math.max(0, opts.selectionPriorityLaneRetainedCount) : null,
+      selectionNormalizedCandidateCount: typeof opts.selectionNormalizedCandidateCount === 'number' ? Math.max(0, opts.selectionNormalizedCandidateCount) : null,
+      selectionEligibilityEvaluationCount: typeof opts.selectionEligibilityEvaluationCount === 'number' ? Math.max(0, opts.selectionEligibilityEvaluationCount) : null,
+      selectionEligibleCandidateCount: typeof opts.selectionEligibleCandidateCount === 'number' ? Math.max(0, opts.selectionEligibleCandidateCount) : null,
+      selectedCandidateKey: selected ? selected.candidateKey : null,
       selectedCandidateScore: selected ? selected.score : null,
       selectedCandidateSources: selected ? selected.sources : null,
       selectedCandidateLabel: selected ? selected.anchorLabel : null,
       selectedCandidateProbeTier: selected ? selected.probeTier : null,
       selectedCandidateSourceType: selected ? selected.probeSourceType : null,
-      probedUrl: typeof opts.probedUrl === 'string' ? opts.probedUrl : null,
-      firstProbeUrl: typeof opts.firstProbeUrl === 'string' ? opts.firstProbeUrl : null,
+      probedCandidateKey: typeof opts.probedUrl === 'string' ? candidateKey(opts.probedUrl) : null,
+      firstProbeCandidateKey: typeof opts.firstProbeUrl === 'string' ? candidateKey(opts.firstProbeUrl) : null,
       firstProbeResult: typeof opts.firstProbeResult === 'string' ? opts.firstProbeResult : null,
-      landingProbeUrl: typeof opts.landingProbeUrl === 'string' ? opts.landingProbeUrl : null,
+      landingProbeCandidateKey: typeof opts.landingProbeUrl === 'string' ? candidateKey(opts.landingProbeUrl) : null,
       landingProbeResult: typeof opts.landingProbeResult === 'string' ? opts.landingProbeResult : null,
+      // These are deliberately fixed, value-free classifications.  Do not
+      // transport the underlying error: it can include a URL, host, or a
+      // lower-level transport message.
+      landingProbeErrorCode: typeof opts.landingProbeErrorCode === 'string' ? opts.landingProbeErrorCode : null,
+      // A fallback is a second independently pre-qualified landing only.  It
+      // is value-free in transport and never replaces the primary result.
+      fallbackProbeAttempted: opts.fallbackProbeAttempted === true,
+      fallbackProbeResult: typeof opts.fallbackProbeResult === 'string' ? opts.fallbackProbeResult : null,
+      fallbackProbeErrorCode: typeof opts.fallbackProbeErrorCode === 'string' ? opts.fallbackProbeErrorCode : null,
+      fallbackSelectionReason: typeof opts.fallbackSelectionReason === 'string' ? opts.fallbackSelectionReason : null,
       hubProbeAttempted: opts.hubProbeAttempted === true,
-      hubProbeUrl: typeof opts.hubProbeUrl === 'string' ? opts.hubProbeUrl : null,
+      hubProbeCandidateKey: typeof opts.hubProbeUrl === 'string' ? candidateKey(opts.hubProbeUrl) : null,
       hubProbeResult: typeof opts.hubProbeResult === 'string' ? opts.hubProbeResult : null,
+      hubProbeErrorCode: typeof opts.hubProbeErrorCode === 'string' ? opts.hubProbeErrorCode : null,
       detailProbeAttempted: opts.detailProbeAttempted === true,
-      detailProbeUrl: typeof opts.detailProbeUrl === 'string' ? opts.detailProbeUrl : null,
+      detailProbeCandidateKey: typeof opts.detailProbeUrl === 'string' ? candidateKey(opts.detailProbeUrl) : null,
       detailProbeResult: typeof opts.detailProbeResult === 'string' ? opts.detailProbeResult : null,
+      detailProbeErrorCode: typeof opts.detailProbeErrorCode === 'string' ? opts.detailProbeErrorCode : null,
       totalOperatorProbeCount: typeof opts.totalOperatorProbeCount === 'number' ? Math.max(0, opts.totalOperatorProbeCount) : null,
       secondProbeAttempted: opts.secondProbeAttempted === true,
-      secondProbeUrl: typeof opts.secondProbeUrl === 'string' ? opts.secondProbeUrl : null,
+      secondProbeCandidateKey: typeof opts.secondProbeUrl === 'string' ? candidateKey(opts.secondProbeUrl) : null,
       secondProbeResult: typeof opts.secondProbeResult === 'string' ? opts.secondProbeResult : null,
       noCandidateReason: selected ? null : (opts.noCandidateReason || (mode === 'corporate' || mode === 'generic' ? 'no_high_confidence_candidate' : 'site_mode_not_applicable'))
     }
   };
+}
+
+// A bounded diagnostic projection for the operator-identity probe.  The
+// fetch result intentionally keeps its detailed error for local control flow,
+// but that text must never cross the producer boundary: it may include a URL,
+// hostname, IP address, or transport-library message.  This classifier emits
+// only a closed, value-free vocabulary and has no effect on fetch behaviour.
+function normalizeOperatorIdentityProbeErrorCodeV1_(page) {
+  if (!page || page.ok === true) return null;
+  const error = String(page.error || '');
+  const stage = String(page.errorStage || '').toLowerCase();
+  // `buildFetchError` prefixes URL-bearing clauses.  Remove those clauses
+  // before classification so a hostname/path cannot accidentally influence a
+  // reason code (and so this helper never needs to retain it).
+  const nonUrlError = error.replace(/(?:^|\s\|\s)(?:url|finalUrl)=[^|]*/gi, '');
+  const haystack = `${stage}\n${nonUrlError}`.toLowerCase();
+  if (stage === 'budget' || /overall_budget_exhausted|budget_exhausted/.test(haystack)) return 'budget_exhausted';
+  if (stage === 'timeout' || /(?:^|[^a-z])timeout|aborterror/.test(haystack)) return 'timeout';
+  if (/redirect_https_downgrade/.test(haystack)) return 'redirect_https_downgrade';
+  if (/redirect_origin_mismatch/.test(haystack)) return 'redirect_origin_mismatch';
+  if (/redirect_limit/.test(haystack)) return 'redirect_limit_exceeded';
+  if (/unsupported_content_type/.test(haystack)) return 'content_type_rejected';
+  if (/html_body_too_large/.test(haystack)) return 'body_limit_exceeded';
+  if (/dns_no_public_address|blocked_private_or_metadata_host|ssrf_blocked_host/.test(haystack)) return 'dns_no_public_address';
+  if (/eai_again|enotfound|getaddrinfo|dns/.test(haystack)) return 'dns_failure';
+  if (/tls|ssl|certificate|cert_|eproto/.test(haystack)) return 'tls_error';
+  const statusMatch = haystack.match(/(?:http\s+|status=)([1-5]\d\d)\b/);
+  if (statusMatch) {
+    const status = Number(statusMatch[1]);
+    if (status >= 400 && status < 500) return 'http_4xx';
+    if (status >= 500 && status < 600) return 'http_5xx';
+  }
+  if (/econn|ehost|enet|socket|connection|connect /.test(haystack)) return 'connection_error';
+  return 'unknown_fetch_error';
 }
 
 function buildOperatorIdentityDiscoverLinkAuditV1_(links, origin) {
@@ -3757,6 +4058,19 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       const match = text.match(/〒?\s?\d{3}[-‐‑‒–—]?\d{4}\s*(?:北海道|東京都|(?:京都|大阪)府|..県).{0,80}/);
       return normalizeSubpageJsonLdText(match ? match[0] : text).slice(0, 160);
     };
+    const hasJapaneseAddressEvidence = value => /(?:〒?\s?\d{3}[-‐‑‒–—]?\d{4}|北海道|東京都|(?:京都|大阪)府|..県)/.test(normalizeSubpageJsonLdText(value));
+    // Company profiles sometimes put a headquarters address directly in a
+    // heading rather than a table/dl label-value pair. Keep this narrow:
+    // accept only an explicit address heading and only when the same visible
+    // line contains a Japanese address marker. Bare address-like prose and
+    // generic access/store headings remain ineligible.
+    const inlineAddressFromHeading = value => {
+      const text = normalizeSubpageJsonLdText(value);
+      const match = text.match(/^(本社所在地|本社事務所|所在地|住所|本社)\s*(?:[：:]\s*|\s+)(.+)$/);
+      if (!match) return { value: '', label: '' };
+      const address = extractJapaneseAddress(match[2]);
+      return hasJapaneseAddressEvidence(address) ? { value: address, label: match[1] } : { value: '', label: '' };
+    };
     const cleanOperatorName = value => {
       const text = cutAt(stripLeadingLabel(value, 'operator'), operatorStopRe).split('||')[0] || '';
       return normalizeSubpageJsonLdText(text).slice(0, 80);
@@ -3782,7 +4096,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     });
     const bodyClone = $('body').clone();
     bodyClone.find('script,style,noscript,svg').remove();
-    bodyClone.find('br,p,div,li,tr,dt,dd,th,td,section,article').append('\n');
+    bodyClone.find('br,p,div,li,tr,dt,dd,th,td,section,article,h1,h2,h3,h4,h5,h6').append('\n');
     const visibleLines = bodyClone.text()
       .split(/\n+/)
       .map(line => normalizeSubpageJsonLdText(line))
@@ -3799,6 +4113,10 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       }
       for (let i = 0; i < visibleLines.length; i++) {
         const line = visibleLines[i];
+        if (kind === 'address') {
+          const inlineAddress = inlineAddressFromHeading(line);
+          if (inlineAddress.value) return inlineAddress;
+        }
         const label = canonicalLabel(line, kind);
         if (!label || !labelRe.test(line)) continue;
         const afterLabel = normalizeSubpageJsonLdText(line.replace(new RegExp(`^.*?${label}\\s*[：:：]?\\s*`), ''));
@@ -3961,6 +4279,26 @@ function collectExplicitCompanyProfileDetailLinksFromHtml_(html, rootUrl) {
     if (!path || /\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|7z|jpe?g|png|gif|webp|svg|mp[34]|avi|mov|css|js)(?:$|\/)/i.test(path)) return false;
     return true;
   };
+  // A fetched corporate hub sometimes carries an unlabelled but structurally
+  // explicit child detail route (for example, /corporate/outline.html). This
+  // is deliberately narrower than generic path discovery: it stays on HTTPS,
+  // the same origin, under the hub's company/corporate/about route, and may
+  // nominate only one direct profile-shaped child. The detail's formal fields
+  // and relation evidence still decide whether an identity record is usable.
+  const isBoundedCompanyHubDetailPath = target => {
+    if (!target || target.protocol !== 'https:' || target.origin !== root.origin) return false;
+    const parts = pathname => String(pathname || '/').split('/').filter(Boolean);
+    const rootParts = parts(root.pathname);
+    const targetParts = parts(target.pathname);
+    const companyIndex = rootParts.findIndex(part => /^(?:company|corporate|about)(?:\.(?:html?|htm))?$/i.test(part));
+    if (companyIndex < 0 || targetParts.length !== companyIndex + 2) return false;
+    if (rootParts.slice(0, companyIndex).join('/') !== targetParts.slice(0, companyIndex).join('/')) return false;
+    const rootSection = rootParts[companyIndex].replace(/\.(?:html?|htm)$/i, '').toLowerCase();
+    const targetSection = targetParts[companyIndex].replace(/\.(?:html?|htm)$/i, '').toLowerCase();
+    if (rootSection !== targetSection) return false;
+    const detail = targetParts[companyIndex + 1].replace(/\.(?:html?|htm)$/i, '').toLowerCase();
+    return /^(?:profile|overview|outline|company[-_]?profile|company[-_]?info(?:rmation)?|organization)$/.test(detail);
+  };
   const profileLabelScore = label => {
     const normalized = normalizeSubpageJsonLdText(label).toLowerCase();
     // A native formal-profile label is the strongest signal. This matters on
@@ -3978,17 +4316,19 @@ function collectExplicitCompanyProfileDetailLinksFromHtml_(html, rootUrl) {
       const label = normalizeSubpageJsonLdText([
         $(el).text(), $(el).attr('aria-label'), $(el).attr('title')
       ].filter(Boolean).join(' '));
-      if (!isExplicitProfileLabel(label)) return;
       let target;
       try { target = new URL(String($(el).attr('href') || ''), root); } catch (_) { return; }
       if (!isSafeHtmlTarget(target)) return;
+      const explicitLabel = isExplicitProfileLabel(label);
+      const boundedHubDetailPath = !explicitLabel && isBoundedCompanyHubDetailPath(target);
+      if (!explicitLabel && !boundedHubDetailPath) return;
       target.hash = '';
       if (target.pathname === root.pathname && !target.search) return;
       out.push({
         url: target.toString(),
         label: label.slice(0, 80),
-        source: 'explicit_company_profile_link',
-        score: profileLabelScore(label)
+        source: explicitLabel ? 'explicit_company_profile_link' : 'bounded_company_hub_detail_path',
+        score: explicitLabel ? profileLabelScore(label) : 1
       });
     });
   } catch (_) {}
@@ -4059,7 +4399,10 @@ function selectExternalOperatorRootCompanyProfileDetailLink_(operatorPage, candi
 }
 
 function selectOperatorSecondPageCompanyProfileDetailLink_(operatorPage, candidate, firstIdentity) {
-  if (!operatorPage || operatorPage.ok !== true || !candidate || candidate.officialExternalOperatorProfile === true) return null;
+  const recoveredExternalRelation = !!(operatorPage && operatorPage.redirectAuditV1 &&
+    operatorPage.redirectAuditV1.httpsRecovery && operatorPage.redirectAuditV1.httpsRecovery.accepted === true);
+  if (!operatorPage || operatorPage.ok !== true || !candidate ||
+    (candidate.officialExternalOperatorProfile === true && !recoveredExternalRelation)) return null;
   if (candidate.operatorIdentityProbeSourceType !== 'company_profile') return null;
   if (!firstIdentity || firstIdentity.hasOperatorInfo === true || firstIdentity.conflict === true) return null;
   const links = Array.isArray(operatorPage.companyProfileDetailLinks)
@@ -4075,7 +4418,10 @@ function selectOperatorSecondPageCompanyProfileDetailLink_(operatorPage, candida
 }
 
 function selectOperatorCompanyProfileHubLink_(operatorPage, candidate, firstIdentity) {
-  if (!operatorPage || operatorPage.ok !== true || !candidate || candidate.officialExternalOperatorProfile === true) return null;
+  const recoveredExternalRelation = !!(operatorPage && operatorPage.redirectAuditV1 &&
+    operatorPage.redirectAuditV1.httpsRecovery && operatorPage.redirectAuditV1.httpsRecovery.accepted === true);
+  if (!operatorPage || operatorPage.ok !== true || !candidate ||
+    (candidate.officialExternalOperatorProfile === true && !recoveredExternalRelation)) return null;
   if (candidate.operatorIdentityProbeSourceType !== 'company_profile') return null;
   if (!firstIdentity || firstIdentity.hasOperatorInfo === true || firstIdentity.conflict === true) return null;
   const links = Array.isArray(operatorPage.companyProfileHubLinks) ? operatorPage.companyProfileHubLinks : [];
@@ -4096,13 +4442,32 @@ function selectOperatorCompanyProfileFollowupV1_(operatorPage, candidate, firstI
   return detail ? { role: 'detail', link: detail } : null;
 }
 
-function operatorIdentityFieldsConflict_(rootInfo, detailInfo) {
+// Company-profile pages reached through one bounded hub/detail chain can
+// legitimately describe different offices or contact desks of the same legal
+// operator. Under the operator-identity contract, those are disclosure
+// differences, not evidence that the operator relation itself is false.
+//
+// Keep the classifications separate: only a conflicting legal name blocks the
+// identity record here. Independent observed-company-profile aggregation
+// continues to fail closed on all conflicting fields, so this does not merge
+// records discovered from different candidates or scopes.
+function classifyOperatorIdentityFieldConflictsV1_(rootInfo, detailInfo) {
   const normalize = value => normalizeSubpageJsonLdText(value || '').toLowerCase();
-  return ['companyName', 'address', 'telephone'].some(field => {
+  const differs = field => {
     const rootValue = normalize(rootInfo && (rootInfo[field] || (field === 'companyName' && rootInfo.operatorName)));
     const detailValue = normalize(detailInfo && (detailInfo[field] || (field === 'companyName' && detailInfo.operatorName)));
     return !!rootValue && !!detailValue && rootValue !== detailValue;
-  });
+  };
+  const disclosureFields = ['address', 'telephone'].filter(differs);
+  return {
+    identityConflict: differs('companyName'),
+    disclosureConflict: disclosureFields.length > 0,
+    disclosureFields
+  };
+}
+
+function operatorIdentityFieldsConflict_(rootInfo, detailInfo) {
+  return classifyOperatorIdentityFieldConflictsV1_(rootInfo, detailInfo).identityConflict;
 }
 
 // Bounded, value-free explanation of the existing company-profile extractor.
@@ -4905,6 +5270,183 @@ async function fetchSubpageWithTrailingSlashRetry_(url, fetchOnce) {
   });
 }
 
+const SUBPAGE_HTML_MAX_BYTES_V1_ = 2 * 1024 * 1024;
+const SUBPAGE_HTML_MAX_REDIRECTS_V1_ = 3;
+
+function normalizeComparableIpAddressV1_(value) {
+  let address = String(value || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  const mapped = address.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) address = mapped[1];
+  // WHATWG URL canonicalization commonly rewrites ::ffff:127.0.0.1 as
+  // ::ffff:7f00:1. Convert both mapped and compatible hexadecimal tails so
+  // private IPv4 policy cannot be bypassed through IPv6 spelling variants.
+  const hexMapped = address.match(/^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (hexMapped) {
+    const packed = ((parseInt(hexMapped[1], 16) << 16) | parseInt(hexMapped[2], 16)) >>> 0;
+    address = [packed >>> 24, (packed >>> 16) & 255, (packed >>> 8) & 255, packed & 255].join('.');
+  }
+  return address;
+}
+
+function isBlockedSubpageIpAddressV1_(value) {
+  const address = normalizeComparableIpAddressV1_(value);
+  const family = net.isIP(address);
+  if (!family) return true;
+  if (family === 4) {
+    const parts = address.split('.').map(Number);
+    const a = parts[0];
+    const b = parts[1];
+    return a === 0 || a === 10 || a === 100 && b >= 64 && b <= 127 || a === 127 ||
+      a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 ||
+      a === 198 && (b === 18 || b === 19) || a >= 224;
+  }
+  if (address === '::' || address === '::1') return true;
+  if (/^(?:fc|fd)/i.test(address) || /^fe[89ab]/i.test(address)) return true;
+  // IPv4-mapped IPv6 was normalized above. Reject the remaining IPv4-compatible
+  // forms as well; they can otherwise represent loopback/private IPv4 ranges.
+  const compatible = address.match(/^::(\d+\.\d+\.\d+\.\d+)$/i);
+  return !!(compatible && isBlockedSubpageIpAddressV1_(compatible[1]));
+}
+
+function validateSafeSubpageFetchUrlV1_(value) {
+  let parsed;
+  try { parsed = new URL(String(value || '')); } catch (_) { return { ok: false, reason: 'url_invalid', url: null }; }
+  if (!/^https?:$/.test(parsed.protocol)) return { ok: false, reason: 'url_protocol_invalid', url: parsed };
+  if (parsed.username || parsed.password) return { ok: false, reason: 'url_userinfo_forbidden', url: parsed };
+  if (!parsed.hostname || isBlockedSubpageJsonLdHost(parsed.hostname)) {
+    return { ok: false, reason: 'blocked_private_or_metadata_host', url: parsed };
+  }
+  const literal = normalizeComparableIpAddressV1_(parsed.hostname);
+  if (net.isIP(literal) && isBlockedSubpageIpAddressV1_(literal)) {
+    return { ok: false, reason: 'blocked_private_or_metadata_host', url: parsed };
+  }
+  return { ok: true, reason: null, url: parsed };
+}
+
+function responseHeaderValueV1_(headers, name) {
+  if (!headers) return '';
+  if (typeof headers.get === 'function') return String(headers.get(name) || '');
+  const wanted = String(name || '').toLowerCase();
+  const key = Object.keys(headers).find(item => String(item).toLowerCase() === wanted);
+  const value = key ? headers[key] : '';
+  return Array.isArray(value) ? String(value[0] || '') : String(value || '');
+}
+
+function dnsLookupAllV1_(hostname, lookupImpl) {
+  const lookup = typeof lookupImpl === 'function' ? lookupImpl : dns.lookup;
+  return new Promise((resolve, reject) => {
+    lookup(hostname, { all: true, verbatim: true }, (err, addresses) => {
+      if (err) return reject(err);
+      resolve(Array.isArray(addresses) ? addresses : []);
+    });
+  });
+}
+
+async function resolveValidatedSubpageAddressV1_(hostname, opts = {}) {
+  const normalizedHost = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!normalizedHost || isBlockedSubpageJsonLdHost(normalizedHost)) {
+    const error = new Error('blocked_private_or_metadata_host'); error.code = 'SSRF_BLOCKED_HOST'; throw error;
+  }
+  if (net.isIP(normalizedHost)) {
+    if (isBlockedSubpageIpAddressV1_(normalizedHost)) {
+      const error = new Error('blocked_private_or_metadata_host'); error.code = 'SSRF_BLOCKED_IP'; throw error;
+    }
+    return { address: normalizedHost, family: net.isIP(normalizedHost) };
+  }
+  const records = await dnsLookupAllV1_(normalizedHost, opts.dnsLookup);
+  const approved = records.find(record => record && !isBlockedSubpageIpAddressV1_(record.address));
+  if (!approved) {
+    const error = new Error('dns_no_public_address'); error.code = 'SSRF_DNS_NO_PUBLIC_ADDRESS'; throw error;
+  }
+  return { address: normalizeComparableIpAddressV1_(approved.address), family: Number(approved.family) || net.isIP(approved.address) };
+}
+
+// This request intentionally uses a custom DNS lookup. Node's http(s) client
+// connects to the address returned by this callback, rather than resolving the
+// hostname again. The observed peer is checked before its body is consumed.
+async function requestValidatedSubpageHtmlV1_(target, opts = {}) {
+  const parsed = target instanceof URL ? target : new URL(String(target || ''));
+  const approved = await resolveValidatedSubpageAddressV1_(parsed.hostname, opts);
+  const requestModule = parsed.protocol === 'https:' ? https : http;
+  const signal = opts.signal;
+  const maxBytes = Number(opts.maxBytes || SUBPAGE_HTML_MAX_BYTES_V1_);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let req = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', abort);
+      fn(value);
+    };
+    const abort = () => {
+      const error = new Error('request_aborted'); error.name = 'AbortError';
+      try { if (req) req.destroy(error); } catch (_) {}
+      finish(reject, error);
+    };
+    if (signal && signal.aborted) return abort();
+    const safeLookup = (lookupHost, _lookupOptions, callback) => {
+      if (String(lookupHost || '').trim().toLowerCase() !== String(parsed.hostname || '').trim().toLowerCase()) {
+        const error = new Error('lookup_hostname_mismatch'); error.code = 'SSRF_LOOKUP_HOST_MISMATCH'; callback(error); return;
+      }
+      // Node 20+ can request all:true when auto-select-family is enabled,
+      // while Node 18 commonly uses the scalar lookup callback shape. Both
+      // forms expose only the already-approved address.
+      if (_lookupOptions && _lookupOptions.all === true) callback(null, [{ address: approved.address, family: approved.family }]);
+      else callback(null, approved.address, approved.family);
+    };
+    try {
+      req = requestModule.request({
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || undefined,
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        method: 'GET',
+        agent: false,
+        lookup: safeLookup,
+        headers: Object.assign({
+          'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Connection': 'close'
+        }, opts.headers || {})
+      }, response => {
+        const peer = normalizeComparableIpAddressV1_(response && response.socket && response.socket.remoteAddress);
+        if (!peer || peer !== normalizeComparableIpAddressV1_(approved.address)) {
+          const error = new Error('connected_peer_mismatch'); error.code = 'SSRF_CONNECTED_PEER_MISMATCH';
+          try { response.resume(); } catch (_) {}
+          return finish(reject, error);
+        }
+        const chunks = [];
+        let size = 0;
+        response.on('data', chunk => {
+          const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += part.length;
+          if (size > maxBytes) {
+            const error = new Error('html_body_too_large'); error.code = 'HTML_BODY_TOO_LARGE';
+            try { response.destroy(error); } catch (_) {}
+            return finish(reject, error);
+          }
+          chunks.push(part);
+        });
+        response.once('error', error => finish(reject, error));
+        response.once('end', () => finish(resolve, {
+          status: Number(response.statusCode || 0),
+          ok: Number(response.statusCode || 0) >= 200 && Number(response.statusCode || 0) < 300,
+          headers: response.headers || {},
+          text: Buffer.concat(chunks).toString('utf8'),
+          finalUrl: parsed.toString(),
+          peerAddress: peer
+        }));
+      });
+      req.once('error', error => finish(reject, error));
+      if (signal && typeof signal.addEventListener === 'function') signal.addEventListener('abort', abort, { once: true });
+      req.end();
+    } catch (error) {
+      finish(reject, error);
+    }
+  });
+}
+
 async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
   const timeoutMs = Math.max(0, Number(opts && opts.timeoutMs || 0));
   const controller = timeoutMs > 0 && typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -4919,115 +5461,160 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
       if (value === null || value === undefined || value === '') return;
       parts.push(`${key}=${String(value).slice(0, limit || 160)}`);
     };
-    add('stage', stage, 40);
-    add('url', url, 180);
-    add('name', error && error.name, 80);
-    add('message', error && error.message, 180);
-    add('code', error && error.code, 80);
-    add('causeName', cause && cause.name, 80);
-    add('causeCode', cause && cause.code, 80);
-    add('causeMessage', cause && cause.message, 180);
-    add('reason', meta && meta.reason, 120);
-    add('status', meta && meta.status, 40);
-    if (meta && typeof meta.redirected === 'boolean') add('redirected', meta.redirected, 20);
-    add('finalUrl', meta && meta.finalUrl, 180);
+    add('stage', stage, 40); add('url', url, 180); add('name', error && error.name, 80);
+    add('message', error && error.message, 180); add('code', error && error.code, 80);
+    add('causeName', cause && cause.name, 80); add('causeCode', cause && cause.code, 80);
+    add('causeMessage', cause && cause.message, 180); add('reason', meta && meta.reason, 120);
+    add('status', meta && meta.status, 40); add('finalUrl', meta && meta.finalUrl, 180);
     return (parts.join(' | ') || 'html_fetch_failed').slice(0, 700);
   };
-  const emptyHtmlFetchResult = (finalUrl, status, error, errorStage) => ({
-    url,
-    finalUrl: finalUrl || url,
-    status: typeof status === 'number' ? status : null,
-    ok: false,
-    pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
-    title: '',
-    canonical: '',
-    h1Count: 0,
-    h1Texts: [],
-    jsonldTypes: [],
-    hasBreadcrumbJsonLd: false,
-    hasBreadcrumbUi: false,
-    hasNavElement: null,
-    navObservationComplete: false,
-    error,
-    errorStage,
-    observationSource: 'html-fetch-light',
-    observationMethod: 'html_fetch_light'
+  const emptyHtmlFetchResult = (finalUrl, status, error, errorStage, redirectAuditV1) => ({
+    url, finalUrl: finalUrl || url, status: typeof status === 'number' ? status : null, ok: false,
+    pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []), title: '', canonical: '', h1Count: 0,
+    h1Texts: [], jsonldTypes: [], hasBreadcrumbJsonLd: false, hasBreadcrumbUi: false, hasNavElement: null,
+    navObservationComplete: false, error, errorStage,
+    redirectAuditV1: redirectAuditV1 && typeof redirectAuditV1 === 'object' ? redirectAuditV1 : null,
+    observationSource: 'html-fetch-light', observationMethod: 'html_fetch_light'
   });
   try {
-    const initialUrl = new URL(String(url || ''));
-    if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) {
-      return emptyHtmlFetchResult(url, null, 'blocked_private_or_metadata_host', 'precheck');
-    }
-    let response = null;
-    try {
-      const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : fetch;
-      response = await fetchImpl(url, {
-        method: 'GET',
-        redirect: 'follow',
-        headers: {
-          'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        },
-        signal: controller ? controller.signal : undefined
-      });
-    } catch (e) {
-      const timedOut = !!(controller && controller.signal && controller.signal.aborted);
-      return emptyHtmlFetchResult(url, null, buildFetchError(timedOut ? 'timeout' : 'fetch', e), timedOut ? 'timeout' : 'fetch');
-    }
-    const status = response && typeof response.status === 'number' ? response.status : null;
-    const finalUrl = response && response.url ? response.url : url;
-    const responseMeta = {
-      status,
-      redirected: !!(response && response.redirected),
-      finalUrl
-    };
-    let finalParsed = null;
-    try { finalParsed = new URL(String(finalUrl || '')); } catch (_) {}
-    if (finalParsed && finalParsed.origin !== initialUrl.origin) {
-      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, {
-        reason: 'redirect_origin_mismatch'
-      })), 'fetch');
-    }
-    if (!response || !response.ok) {
-      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, {
-        reason: status ? `HTTP ${status}` : 'fetch_failed'
-      })), 'fetch');
-    }
-    const contentType = String(response.headers && response.headers.get && response.headers.get('content-type') || '');
-    if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) {
-      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, {
-        reason: `unsupported_content_type:${contentType.slice(0, 80)}`
-      })), 'fetch');
-    }
-    let html = '';
-    try {
-      html = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
-    } catch (e) {
-      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('response_text', e, responseMeta), 'response_text');
-    }
-    // 一部の同一オリジン問い合わせページは HTTP redirect ではなく meta refresh を使う。
-    // 標準パスの軽量確認では同一オリジンかつ1回だけ追従し、外部遷移はしない。
-    try {
-      const refresh = cheerio.load(html)('meta[http-equiv="refresh" i]').first().attr('content') || '';
-      const match = String(refresh).match(/url\s*=\s*([^;]+)/i);
-      if (match && Number(opts._metaRefreshDepth || 0) < 1) {
-        const target = new URL(String(match[1] || '').trim().replace(/^['"]|['"]$/g, ''), finalUrl || url);
-        if (target.origin === initialUrl.origin && target.toString() !== String(finalUrl || url)) {
-          return fetchSubpageHtmlLightOnce_(target.toString(), Object.assign({}, opts, { _metaRefreshDepth: Number(opts._metaRefreshDepth || 0) + 1 }));
+    const initialCheck = validateSafeSubpageFetchUrlV1_(url);
+    if (!initialCheck.ok) return emptyHtmlFetchResult(url, null, initialCheck.reason, 'precheck');
+    const initialUrl = initialCheck.url;
+    let currentUrl = initialUrl;
+    let redirects = 0;
+    let usedExplicitExternalCompanyRedirect = false;
+    let httpsRecoveryAuditV1 = null;
+    const recoverExplicitOperatorHttpsDowngrade = (target, status) => {
+      // Never follow HTTP. This accepts only the first downgrade emitted by a
+      // relation-backed HTTPS landing, then asks the existing safe requester
+      // to independently validate and fetch the HTTPS form of that *same*
+      // host/path. Non-default ports, credentials and cross-host redirects
+      // remain fail-closed.
+      if (opts.allowExplicitOperatorHttpsDowngradeRecovery !== true || redirects !== 0 ||
+        initialUrl.protocol !== 'https:' || currentUrl.protocol !== 'https:' ||
+        currentUrl.origin !== initialUrl.origin || target.protocol !== 'http:' ||
+        target.hostname.toLowerCase() !== currentUrl.hostname.toLowerCase() ||
+        target.username || target.password ||
+        !['', '443'].includes(initialUrl.port) || !['', '443'].includes(currentUrl.port) ||
+        !['', '80'].includes(target.port)) return null;
+      const recovered = new URL(target.toString());
+      recovered.protocol = 'https:';
+      // HTTP's implicit/explicit :80 is not a valid HTTPS service port. The
+      // original HTTPS candidate therefore supplies the only allowed port.
+      recovered.port = currentUrl.port;
+      recovered.username = '';
+      recovered.password = '';
+      recovered.hash = '';
+      const recoveredCheck = validateSafeSubpageFetchUrlV1_(recovered);
+      if (!recoveredCheck.ok || recoveredCheck.url.origin !== initialUrl.origin) return null;
+      httpsRecoveryAuditV1 = {
+        downgrade: true,
+        hop: redirects + 1,
+        fromScheme: 'https',
+        toScheme: 'http',
+        httpsRecovery: {
+          attempted: true,
+          accepted: true,
+          redirectStatus: status,
+          reason: 'explicit_relation_same_host_https_recovery'
         }
+      };
+      return recoveredCheck.url;
+    };
+    const activeSignal = controller ? controller.signal : parentSignal;
+    while (true) {
+      const currentCheck = validateSafeSubpageFetchUrlV1_(currentUrl);
+      if (!currentCheck.ok) return emptyHtmlFetchResult(currentUrl.toString(), null, currentCheck.reason, 'precheck');
+      let response;
+      try {
+        if (typeof opts.fetchImpl === 'function') {
+          // Test-only transport seam: production always uses the validated
+          // Node socket path above. URL validation still runs before this seam.
+          response = await opts.fetchImpl(currentUrl.toString(), {
+            method: 'GET', redirect: 'manual', headers: { 'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8' },
+            signal: activeSignal
+          });
+        } else {
+          response = await requestValidatedSubpageHtmlV1_(currentUrl, {
+            signal: activeSignal,
+            dnsLookup: opts.dnsLookup
+          });
+        }
+      } catch (error) {
+        const timedOut = !!(controller && controller.signal && controller.signal.aborted);
+        return emptyHtmlFetchResult(currentUrl.toString(), null, buildFetchError(timedOut ? 'timeout' : 'fetch', error), timedOut ? 'timeout' : 'fetch');
       }
-    } catch (_) {}
-    try {
-      return Object.assign(parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode, opts), {
-        observationSource: 'html-fetch-light',
-        observationMethod: 'html_fetch_light',
-        errorStage: null
-      });
-    } catch (e) {
-      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('parse', e, responseMeta), 'parse');
+      const status = response && typeof response.status === 'number' ? response.status : null;
+      const location = responseHeaderValueV1_(response && response.headers, 'location');
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        if (!location) return emptyHtmlFetchResult(currentUrl.toString(), status, buildFetchError('fetch', null, { reason: 'redirect_location_missing', status, finalUrl: currentUrl }), 'fetch');
+        if (redirects >= SUBPAGE_HTML_MAX_REDIRECTS_V1_) return emptyHtmlFetchResult(currentUrl.toString(), status, buildFetchError('fetch', null, { reason: 'redirect_limit', status, finalUrl: currentUrl }), 'fetch');
+        let target;
+        try { target = new URL(location, currentUrl); } catch (_) { return emptyHtmlFetchResult(currentUrl.toString(), status, 'redirect_location_invalid', 'fetch'); }
+        const targetCheck = validateSafeSubpageFetchUrlV1_(target);
+        if (!targetCheck.ok) return emptyHtmlFetchResult(target.toString(), status, targetCheck.reason, 'precheck');
+        if (currentUrl.protocol === 'https:' && target.protocol !== 'https:') {
+          const recovered = recoverExplicitOperatorHttpsDowngrade(target, status);
+          if (recovered) {
+            currentUrl = recovered;
+            redirects += 1;
+            continue;
+          }
+          const redirectAuditV1 = {
+            downgrade: true,
+            hop: redirects + 1,
+            fromScheme: 'https',
+            toScheme: 'http'
+          };
+          // This projection is available only to the authenticated GAS
+          // explicit no-save debug request. It never includes the raw
+          // Location header, query values, credentials, or response body.
+          if (opts.operatorIdentityNoSaveRedirectDebug === true) {
+            redirectAuditV1.firstRedirectHttpStatus = status;
+            redirectAuditV1.location = safeOperatorIdentityDebugUrlProjectionV1_(target);
+          }
+          return emptyHtmlFetchResult(target.toString(), status, 'redirect_https_downgrade', 'fetch', redirectAuditV1);
+        }
+        if (target.origin !== currentUrl.origin) {
+          // A selected same-origin company profile can point at a separately
+          // hosted corporate profile. Permit one HTTPS origin handoff only
+          // when its caller has already passed the bounded company-candidate
+          // gate. Every target remains URL/DNS/socket validated above; later
+          // redirects stay within the reached corporate origin.
+          const permitExplicitCorporateHandoff = opts.allowExplicitExternalCompanyRedirect === true &&
+            usedExplicitExternalCompanyRedirect === false && currentUrl.origin === initialUrl.origin &&
+            currentUrl.protocol === 'https:' && target.protocol === 'https:';
+          if (!permitExplicitCorporateHandoff) return emptyHtmlFetchResult(target.toString(), status, 'redirect_origin_mismatch', 'fetch');
+          usedExplicitExternalCompanyRedirect = true;
+        }
+        currentUrl = target;
+        redirects += 1;
+        continue;
+      }
+      const finalUrl = currentUrl.toString();
+      const responseMeta = { status, finalUrl };
+      if (!response || !response.ok) return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, { reason: status ? `HTTP ${status}` : 'fetch_failed' })), 'fetch');
+      const contentType = responseHeaderValueV1_(response.headers, 'content-type');
+      if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, { reason: `unsupported_content_type:${contentType.slice(0, 80)}` })), 'fetch');
+      let html = '';
+      try { html = String(typeof response.text === 'function' ? await response.text() : response.text || ''); } catch (error) { return emptyHtmlFetchResult(finalUrl, status, buildFetchError('response_text', error, responseMeta), 'response_text'); }
+      if (Buffer.byteLength(html, 'utf8') > SUBPAGE_HTML_MAX_BYTES_V1_) return emptyHtmlFetchResult(finalUrl, status, 'html_body_too_large', 'fetch');
+      try {
+        const refresh = cheerio.load(html)('meta[http-equiv="refresh" i]').first().attr('content') || '';
+        const match = String(refresh).match(/url\s*=\s*([^;]+)/i);
+        if (match && Number(opts._metaRefreshDepth || 0) < 1) {
+          const target = new URL(String(match[1] || '').trim().replace(/^['"]|['"]$/g, ''), finalUrl);
+          if (target.origin === initialUrl.origin && target.toString() !== finalUrl) return fetchSubpageHtmlLightOnce_(target.toString(), Object.assign({}, opts, { _metaRefreshDepth: Number(opts._metaRefreshDepth || 0) + 1 }));
+        }
+      } catch (_) {}
+      try { return Object.assign(parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode, opts), {
+        observationSource: 'html-fetch-light', observationMethod: 'html_fetch_light', errorStage: null,
+        redirectAuditV1: httpsRecoveryAuditV1
+      }); }
+      catch (error) { return emptyHtmlFetchResult(finalUrl, status, buildFetchError('parse', error, responseMeta), 'parse'); }
     }
-  } catch (e) {
-    return emptyHtmlFetchResult(url, null, buildFetchError('fetch', e), 'fetch');
+  } catch (error) {
+    return emptyHtmlFetchResult(url, null, buildFetchError('fetch', error), 'fetch');
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
     if (parentSignal && typeof parentSignal.removeEventListener === 'function') parentSignal.removeEventListener('abort', abortFromParent);
@@ -5804,7 +6391,12 @@ function normalizeDiscoverSubpageUrl(rawUrl, origin, opts = {}) {
   if (/\.(?:jpe?g|png|gif|webp|svg|ico|pdf|css|js|zip|csv|xlsx?|docx?|pptx?|xml)(?:$|\/)/i.test(lowerPath)) return null;
   if (/\/(?:wp-json|feed)(?:\/|$)/i.test(lowerPath)) return null;
   if (!opts.allowCategory && /\/(?:tag|category|author|page)\//i.test(lowerPath)) return null;
-  return parsed.toString().replace(/\/$/, '');
+  // Keep the discovered URL's trailing slash for the eventual network
+  // request.  `/company` and `/company/` are distinct HTTP resources: a
+  // server may redirect only the former, including to an unsafe scheme.
+  // Candidate identity/deduplication remains slash-insensitive in
+  // `discoverSubpageCandidateKey`, so this does not widen discovery.
+  return parsed.toString();
 }
 
 function discoverSubpageCandidateKey(url) {
@@ -5934,9 +6526,9 @@ function addGenericRepresentativeRouteCandidatesFromLinks_(links, origin, candid
 }
 
 // Keep external operator candidates out of the ordinary coverage crawl. They
-// may be observed only when the analysed site itself labels a nav/footer link
-// as its operating company (or equivalent). This deliberately reuses the
-// rendered navigation link collection and the existing profile-probe gate.
+// may be observed only when the analysed site itself explicitly labels the
+// link as its operating company (or equivalent). This deliberately reuses the
+// rendered-link collection and the existing profile-probe gate.
 function collectOfficialExternalOperatorProfileCandidates_(links, origin) {
   const out = [];
   const seen = new Set();
@@ -5993,8 +6585,62 @@ function collectOfficialExternalOperatorProfileCandidates_(links, origin) {
       operatorRelationSourceOrigin: sourceOrigin
     });
   };
+  (Array.isArray(links && links.operatorRelationLinks) ? links.operatorRelationLinks : []).forEach(link => add(link, 'explicit_body_operator_relation'));
   (Array.isArray(links && links.navLinks) ? links.navLinks : []).forEach(link => add(link, 'nav'));
   (Array.isArray(links && links.footerLinks) ? links.footerLinks : []).forEach(link => add(link, 'footer'));
+  // Some sites put their sole official operator relation in the page body
+  // rather than global navigation.  The same explicit-label/group-heading
+  // gate applies, so this is not a general external-link crawl.
+  (Array.isArray(links && links.allLinks) ? links.allLinks : []).forEach(link => add(link, 'explicit_body_operator_relation'));
+  return out;
+}
+
+// A rendered in-page "operating company" relation can also point to a
+// same-origin company-profile page.  Ordinary body links remain outside the
+// operator probe: this accepts only an explicit relation label (or its compact
+// rendered group heading), a company-profile context, and the analysed origin.
+// It is kept outside the coverage candidate map so a large sitemap cannot
+// suppress the bounded, directly-labelled operator route.
+function collectOfficialSameOriginOperatorProfileCandidates_(links, origin) {
+  const out = [];
+  const seen = new Set();
+  const sourceOrigin = String(origin || '');
+  const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
+  const groupRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|\bcompany\b|corporate\s+(?:info|information|profile)/i;
+  const add = raw => {
+    if (out.length >= 2 || !raw || !sourceOrigin) return;
+    const anchorLabel = normalizeSubpageJsonLdText([raw.text, raw.ariaLabel, raw.title].filter(Boolean).join(' '));
+    const groupHeading = normalizeSubpageJsonLdText(raw.groupHeading || raw.nearbyLabel || '');
+    const anchorHasRelation = relationRe.test(anchorLabel);
+    const groupHasRelation = groupRelationRe.test(groupHeading);
+    const relationLabel = anchorHasRelation ? anchorLabel : groupHeading;
+    if ((!anchorHasRelation && !groupHasRelation) || !anchorLabel) return;
+    const url = normalizeDiscoverSubpageUrl(raw.href || raw.url || '', sourceOrigin, { allowCategory: false });
+    if (!url || !isOrganizationInformationContext_(url, relationLabel)) return;
+    let candidateOrigin = '';
+    try { candidateOrigin = new URL(url).origin; } catch (_) { return; }
+    if (!candidateOrigin || candidateOrigin !== sourceOrigin) return;
+    const key = discoverSubpageCandidateKey(url);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      url,
+      label: relationLabel.slice(0, 120),
+      source: 'explicit_body_company_profile_relation',
+      sources: ['explicit_body_company_profile_relation'],
+      score: 95,
+      reason: groupHeading && !anchorHasRelation
+        ? 'explicit_same_origin_company_profile_relation_from_rendered_group_heading'
+        : 'explicit_same_origin_company_profile_relation_from_rendered_link',
+      officialSameOriginOperatorProfile: true,
+      operatorRelationLabel: relationLabel.slice(0, 120),
+      operatorRelationAnchorLabel: anchorLabel.slice(0, 120),
+      operatorRelationSource: 'explicit_body_company_profile_relation',
+      operatorRelationSourceOrigin: sourceOrigin
+    });
+  };
+  (Array.isArray(links && links.operatorRelationLinks) ? links.operatorRelationLinks : []).forEach(add);
+  (Array.isArray(links && links.allLinks) ? links.allLinks : []).forEach(add);
   return out;
 }
 
@@ -6571,7 +7217,7 @@ async function collectDiscoverLinksFromPage(page) {
     const queryAllDeep = (selector, opts = {}) => {
       const out = [];
       const seen = new Set();
-      const maxNodes = Math.max(1, Math.min(600, Number(opts.maxNodes || 300)));
+      const maxNodes = Math.max(1, Math.min(2048, Number(opts.maxNodes || 300)));
       const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 5)));
       const walk = (root, depth = 0) => {
         if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
@@ -6623,6 +7269,29 @@ async function collectDiscoverLinksFromPage(page) {
       groupHeading: groupHeadingFor(a)
     });
     const allLinks = queryAllDeep('a[href]', { maxNodes: 500 }).map(linkFrom).filter(x => x.href);
+    // Preserve a tiny, explicitly-labelled operator/company relation pool
+    // before the ordinary all-link cap is applied. This is a bounded metadata
+    // scan of already-rendered DOM only; it neither fetches URLs nor widens
+    // coverage discovery. Its entries are later subject to the same origin,
+    // candidate-eligibility, safe-fetch, and formal-field contracts.
+    const operatorRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
+    const operatorRelationSeen = new Set();
+    const operatorRelationLinks = queryAllDeep('a[href]', { maxNodes: 2048 })
+      .map(linkFrom)
+      .filter(link => {
+        if (!operatorRelationRe.test(`${link.text || ''} ${link.ariaLabel || ''} ${link.title || ''} ${link.groupHeading || ''}`)) return false;
+        let key = String(link.href || '');
+        try {
+          const parsed = new URL(key);
+          parsed.hash = '';
+          parsed.search = '';
+          key = parsed.toString().replace(/\/$/, '');
+        } catch (_) {}
+        if (!key || operatorRelationSeen.has(key)) return false;
+        operatorRelationSeen.add(key);
+        return true;
+      })
+      .slice(0, 2);
     const htmlSitemapLinks = allLinks.filter(x => /sitemap|site-map|サイトマップ/i.test(`${x.href} ${x.text}`)).slice(0, 5);
     const navLinks = queryAllDeep('nav a[href],[role="navigation"] a[href],header a[href]', { maxNodes: 250 }).map(linkFrom).filter(x => x.href).slice(0, 200);
     const semanticFooterAnchors = queryAllDeep('footer a[href],[role="contentinfo"] a[href]', { maxNodes: 200 });
@@ -6640,8 +7309,8 @@ async function collectDiscoverLinksFromPage(page) {
       footerAnchors.push(anchor);
     });
     const footerLinks = footerAnchors.map(linkFrom).filter(x => x.href);
-    return { allLinks: allLinks.slice(0, 500), htmlSitemapLinks, navLinks, footerLinks };
-  }).catch(() => ({ htmlSitemapLinks: [], navLinks: [], footerLinks: [] }));
+    return { allLinks: allLinks.slice(0, 500), operatorRelationLinks, htmlSitemapLinks, navLinks, footerLinks };
+  }).catch(() => ({ allLinks: [], operatorRelationLinks: [], htmlSitemapLinks: [], navLinks: [], footerLinks: [] }));
 }
 
 async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts = {}) {
@@ -6705,7 +7374,8 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       }
       logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
       if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
-      return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin);
+      return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin)
+        .concat(collectOfficialSameOriginOperatorProfileCandidates_(navFooterLinks, origin));
     } catch (e) {
       errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
     }
@@ -6782,7 +7452,8 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     }
     logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
     if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
-    return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin);
+    return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin)
+      .concat(collectOfficialSameOriginOperatorProfileCandidates_(navFooterLinks, origin));
   } catch (e) {
     errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
   } finally {
@@ -6833,18 +7504,37 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
   applyCompanyProfileHubCorroboration_(allCandidates);
   const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
-  const operatorIdentityCandidates = allCandidates
-    .concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : [])
-    .filter(candidate => evaluateBoundedOperatorIdentityProbeCandidate_(candidate).probeEligible === true)
-    .slice(0, 5);
+  const officialOperatorCandidates = Array.isArray(officialExternalOperatorProfileCandidates)
+    ? officialExternalOperatorProfileCandidates : [];
+  const sameOriginOfficialCandidates = officialOperatorCandidates
+    .filter(candidate => candidate && candidate.officialSameOriginOperatorProfile === true);
+  const otherOfficialCandidates = officialOperatorCandidates
+    .filter(candidate => !candidate || candidate.officialSameOriginOperatorProfile !== true);
+  // The direct same-origin relation is a replacement inside the existing
+  // metadata window, not a wider candidate search. Preserve the ordinary
+  // candidate count by displacing only its lowest-ranked tail entries.
+  const sameOriginKeys = new Set(sameOriginOfficialCandidates
+    .map(candidate => discoverSubpageCandidateKey(String(candidate && candidate.url || '')))
+    .filter(Boolean));
+  const ordinaryOperatorCandidates = allCandidates
+    .filter(candidate => !sameOriginKeys.has(discoverSubpageCandidateKey(String(candidate && candidate.url || ''))))
+    .slice(0, Math.max(0, allCandidates.length - sameOriginOfficialCandidates.length));
+  const operatorIdentityAuditCandidates = otherOfficialCandidates
+    .concat(sameOriginOfficialCandidates, ordinaryOperatorCandidates);
+  const operatorIdentitySelectionPlan = buildOperatorIdentityProbeSelectionPlan_(
+    operatorIdentityAuditCandidates,
+    opts && opts.siteMode,
+    2
+  );
   emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates);
   return {
     candidates: allCandidates.slice(0, normalizedLimit),
     roleRepresentativeCandidates,
-    operatorIdentityCandidates,
+    operatorIdentityCandidates: operatorIdentitySelectionPlan.selected,
+    operatorIdentitySelectionPlan,
     // Kept in-process only until the light response is assembled. The audit
     // builder bounds it to five metadata-only entries before transport.
-    operatorIdentityAuditCandidates: allCandidates.concat(Array.isArray(officialExternalOperatorProfileCandidates) ? officialExternalOperatorProfileCandidates : []),
+    operatorIdentityAuditCandidates,
     operatorIdentityDiscoverLinkAudit: operatorIdentityDiscoverLinkAuditSink.value || null,
     totalCandidates: allCandidates.length,
     sourceSummary,
@@ -10511,18 +11201,53 @@ function pickBestLegalOperatorInfo_(pages) {
   };
 }
 
-function normalizeOperatorIdentityInfo_(info, sourceType) {
-  if (!info || typeof info !== 'object' || info.hasOperatorInfo !== true) return null;
+function buildExplicitOperatorIdentityRelationEvidenceV1_(candidate) {
+  if (!candidate || typeof candidate !== 'object') return null;
+  const sameOrigin = candidate.officialSameOriginOperatorProfile === true &&
+    candidate.operatorRelationSource === 'explicit_body_company_profile_relation';
+  const external = candidate.officialExternalOperatorProfile === true &&
+    ['explicit_body_operator_relation', 'nav', 'footer'].includes(String(candidate.operatorRelationSource || ''));
+  if (!sameOrigin && !external) return null;
+  const label = normalizeSubpageJsonLdText(candidate.operatorRelationLabel || candidate.operatorRelationAnchorLabel || candidate.label).slice(0, 160);
+  const sourceOrigin = String(candidate.operatorRelationSourceOrigin || '').trim();
+  const candidateUrl = String(candidate.url || '').trim();
+  if (!label || !sourceOrigin || !candidateUrl) return null;
+  try {
+    const source = new URL(sourceOrigin);
+    const target = new URL(candidateUrl);
+    if (source.protocol !== 'https:' || target.protocol !== 'https:') return null;
+    if (sameOrigin && source.origin !== target.origin) return null;
+    if (external && source.origin === target.origin) return null;
+  } catch (_) { return null; }
+  return {
+    version: 'operator_identity_relation_evidence_v1',
+    kind: sameOrigin ? 'explicit_same_origin_company_profile_relation' : 'explicit_external_operator_relation',
+    explicit: true,
+    currentRun: true,
+    relationLabel: label,
+    relationSource: String(candidate.operatorRelationSource || ''),
+    relationSourceOrigin: sourceOrigin,
+    candidateSourceUrl: candidateUrl
+  };
+}
+
+function normalizeOperatorIdentityInfo_(info, sourceType, opts = {}) {
+  if (!info || typeof info !== 'object') return null;
   const companyName = normalizeSubpageJsonLdText(info.companyName || info.operatorName).slice(0, 120);
   const address = normalizeSubpageJsonLdText(info.address).slice(0, 160);
   const telephone = normalizeSubpageJsonLdText(info.telephone).slice(0, 60);
   const type = sourceType === 'company_profile' ? 'company_profile' : 'legal';
-  // Legal notices keep their historical acceptance contract. A selected,
-  // high-confidence company profile proves the named organization with its
-  // explicit name + address; telephone is optional supporting evidence.
+  const relationEvidence = type === 'company_profile' && info.observed === true && info.conflict !== true && opts.relationEvidence &&
+    opts.relationEvidence.explicit === true && opts.relationEvidence.currentRun === true
+    ? opts.relationEvidence : null;
+  // Legal notices keep their historical acceptance contract. A company
+  // profile, however, identifies the analysed brand only through a bounded,
+  // explicit current-run operating-company relation; address and telephone
+  // remain NAP/contact disclosure evidence.
   const hasOperatorInfo = type === 'company_profile'
-    ? (!!companyName && !!address)
+    ? (!!companyName && !!relationEvidence)
     : (!!address && !!telephone);
+  if (!hasOperatorInfo) return null;
   return {
     observed: info.observed === true,
     observationComplete: true,
@@ -10539,7 +11264,8 @@ function normalizeOperatorIdentityInfo_(info, sourceType) {
     extractionMethod: String(info.extractionMethod || 'html_text'),
     evidenceLabels: Array.isArray(info.evidenceLabels) ? info.evidenceLabels.slice(0, 10) : [],
     authority: String(info.authority || 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1'),
-    provenance: info.provenance && typeof info.provenance === 'object' ? info.provenance : null
+    provenance: info.provenance && typeof info.provenance === 'object' ? info.provenance : null,
+    identityEvidenceV1: relationEvidence
   };
 }
 
@@ -10549,7 +11275,11 @@ function isFormalOperatorIdentityRecord_(info) {
 
 function attachOperatorIdentityProbeProvenance_(identity, candidate) {
   if (!identity || typeof identity !== 'object') return identity;
-  const external = candidate && candidate.officialExternalOperatorProfile === true;
+  let redirectedExternal = false;
+  try {
+    redirectedExternal = candidate && candidate.operatorIdentityAllowExplicitExternalCompanyRedirect === true &&
+      new URL(String(candidate.url || '')).origin !== new URL(String(identity.sourceUrl || '')).origin;
+  } catch (_) {}
   const sourceType = candidate && candidate.operatorIdentityProbeSourceType === 'legal' ? 'legal' : 'company_profile';
   const sourceUrl = String(candidate && candidate.url || identity.sourceUrl || '');
   const provenance = {
@@ -10559,10 +11289,15 @@ function attachOperatorIdentityProbeProvenance_(identity, candidate) {
     candidateSource: String(candidate && candidate.operatorRelationSource || candidate && candidate.source || ''),
     relationLabel: String(candidate && candidate.operatorRelationLabel || candidate && candidate.label || ''),
     relationSourceOrigin: String(candidate && candidate.operatorRelationSourceOrigin || ''),
-    relation: external ? 'explicit_external_operator_profile_link' : (sourceType === 'legal' ? 'same_origin_legal_operator_candidate' : 'same_origin_company_profile_candidate')
+    relation: candidate && candidate.officialExternalOperatorProfile === true
+      ? 'explicit_external_operator_profile_link'
+      : (redirectedExternal
+        ? 'explicit_same_origin_company_profile_https_redirect'
+        : (sourceType === 'legal' ? 'same_origin_legal_operator_candidate' : 'same_origin_company_profile_candidate'))
   };
   identity.authority = 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1';
   identity.provenance = provenance;
+  if (!identity.identityEvidenceV1) identity.identityEvidenceV1 = buildExplicitOperatorIdentityRelationEvidenceV1_(candidate);
   return identity;
 }
 
@@ -10574,12 +11309,12 @@ function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdent
   const info = operatorIdentityInfo && typeof operatorIdentityInfo === 'object' ? operatorIdentityInfo : null;
   const probe = operatorIdentityProbe && typeof operatorIdentityProbe === 'object' ? operatorIdentityProbe : {};
   const mode = String(opts.siteMode || '').toLowerCase();
-  const applicable = mode === 'corporate' || mode === 'generic' || mode === 'saas';
+  const applicable = mode === 'corporate' || mode === 'generic' || mode === 'saas' || mode === 'shop_facility';
   const candidateCount = Array.isArray(opts.candidates) ? opts.candidates.length : 0;
   const selectedCount = probe.attempted === true ? 1 : 0;
   const conflict = /conflict/i.test(String(probe.reason || ''));
   const complete = !!(info && info.hasOperatorInfo === true &&
-    info.hasCompanyName === true && info.hasAddress === true && !conflict);
+    info.hasCompanyName === true && !conflict);
   const observed = !!(info && info.observed === true) || probe.attempted === true;
   const sourcePath = (() => {
     try {
@@ -10612,7 +11347,7 @@ function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdent
       failed: probe.attempted === true && probe.observationComplete !== true ? ['company_profile'] : []
     },
     scopeComplete: probe.observationComplete === true,
-    strongEvidenceCount: complete ? (info && info.hasTelephone === true ? 3 : 2) : 0,
+    strongEvidenceCount: complete ? (info && info.hasAddress === true ? (info.hasTelephone === true ? 3 : 2) : 1) : 0,
     evidence: sourcePath ? [{
       type: 'company_profile',
       role: 'operator_identity_probe',
@@ -10700,13 +11435,66 @@ function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
   };
 }
 
-function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
+const OPERATOR_IDENTITY_PRESELECTION_INPUT_MAX_V1_ = 240;
+const OPERATOR_IDENTITY_PRESELECTION_EVALUATION_MAX_V1_ = 80;
+const OPERATOR_IDENTITY_PRIORITY_LANE_SCAN_MAX_V1_ = 2048;
+const OPERATOR_IDENTITY_PRIORITY_LANE_RETAIN_MAX_V1_ = 24;
+
+function operatorIdentityCandidatePreselectionRank_(candidate, originalIndex) {
+  const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
+  const label = normalizeSubpageJsonLdText(candidate && (candidate.label || candidate.text || candidate.ariaLabel || candidate.title) || '');
+  const sources = Array.from(new Set(Array.isArray(candidate && candidate.sources)
+    ? candidate.sources.map(value => String(value || ''))
+    : (candidate && candidate.source ? [String(candidate.source)] : [])));
+  const hasHumanNavigation = sources.includes('nav') || sources.includes('footer');
+  const hasSitemap = sources.includes('sitemap') || sources.includes('htmlSitemap');
+  const explicitProfileOrOperator = isOrganizationInformationContext_(url, label) ||
+    /\boperator\b/i.test(label) || isLegalOperatorCandidateText_(label) || isLegalOperatorCandidatePath_(url);
+  const externalRelation = candidate && candidate.officialExternalOperatorProfile === true;
+  const sameOriginRelation = candidate && candidate.officialSameOriginOperatorProfile === true;
+  const semanticHub = candidate && candidate.companyProfileHubCorroborated === true;
+  return [externalRelation ? 1 : 0, sameOriginRelation ? 1 : 0,
+    (hasHumanNavigation && hasSitemap) || semanticHub ? 1 : 0,
+    explicitProfileOrOperator ? 1 : 0, hasHumanNavigation ? 1 : 0,
+    Number(candidate && candidate.score || 0), -Math.max(0, Number(originalIndex) || 0)];
+}
+
+function compareOperatorIdentityPreselectionRank_(left, right) {
+  const a = Array.isArray(left) ? left : [];
+  const b = Array.isArray(right) ? right : [];
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = Number(b[index] || 0) - Number(a[index] || 0);
+    if (delta) return delta;
+  }
+  return 0;
+}
+
+function isOperatorIdentityPriorityLaneCandidate_(candidate) {
+  if (!candidate || typeof candidate !== 'object') return false;
+  if (candidate.officialExternalOperatorProfile === true || candidate.officialSameOriginOperatorProfile === true) return true;
+  const url = String(candidate.finalUrl || candidate.url || candidate.href || '');
+  const label = normalizeSubpageJsonLdText(candidate.label || candidate.text || candidate.ariaLabel || candidate.title || '');
+  const sources = Array.from(new Set(Array.isArray(candidate.sources)
+    ? candidate.sources.map(value => String(value || ''))
+    : (candidate.source ? [String(candidate.source)] : [])));
+  return (sources.includes('nav') || sources.includes('footer')) &&
+    (isOrganizationInformationContext_(url, label) || /\boperator\b/i.test(label) ||
+      isLegalOperatorCandidateText_(label) || isLegalOperatorCandidatePath_(url));
+}
+
+function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandidates = 2) {
   // A SaaS service may publish its legal operator on the same company/profile
-  // page as a corporate site.  At most one page is fetched.  Strictly
-  // corroborated candidates retain priority; the bounded human-label lane is
-  // used only when strict discovery found none.
+  // page as a corporate site. Strictly corroborated candidates retain priority,
+  // except for a bounded, directly-labelled same-origin operator relation.
+  // The second result is only a fallback after the first landing fails.
   const mode = String(siteMode || '').toLowerCase();
-  if (mode !== 'corporate' && mode !== 'generic' && mode !== 'saas') return null;
+  // Shop/facility sites use the same bounded, explicitly-labelled operator
+  // candidate contract as corporate/service sites.  Their representative
+  // coverage plan is different, but it is not an identity authority and must
+  // not be the only way to reach a formal operating-company record.
+  const input = Array.isArray(candidates) ? candidates : [];
+  const plan = { version: 'operator_identity_probe_selection_v1', strategy: 'bounded_metadata_priority_before_eligibility_v1', inputCandidateCount: input.length, preselectionInputCount: 0, priorityLaneScanCount: 0, priorityLaneRetainedCount: 0, normalizedCandidateCount: 0, eligibilityEvaluationCount: 0, eligibleCandidateCount: 0, selected: [] };
+  if (mode !== 'corporate' && mode !== 'generic' && mode !== 'saas' && mode !== 'shop_facility') return plan;
   const profilePathSpecificity = candidate => {
     const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
     const path = (() => {
@@ -10727,21 +11515,81 @@ function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
     if (new RegExp('\\/(?:profile|overview|outline|company-info)' + detailSuffix, 'i').test(path)) return 1;
     return 0;
   };
-  const evaluated = (Array.isArray(candidates) ? candidates : []).slice(0, 80)
-    .map(candidate => ({ candidate, evaluation: evaluateBoundedOperatorIdentityProbeCandidate_(candidate) }))
+  const boundedInput = input.slice(0, OPERATOR_IDENTITY_PRESELECTION_INPUT_MAX_V1_);
+  plan.preselectionInputCount = boundedInput.length;
+  const priorityScan = input.slice(0, OPERATOR_IDENTITY_PRIORITY_LANE_SCAN_MAX_V1_);
+  plan.priorityLaneScanCount = priorityScan.length;
+  const priorityLane = priorityScan.map((candidate, originalIndex) => ({ candidate, originalIndex,
+    preselectionRank: operatorIdentityCandidatePreselectionRank_(candidate, originalIndex) }))
+    .filter(item => isOperatorIdentityPriorityLaneCandidate_(item.candidate))
+    .sort((left, right) => compareOperatorIdentityPreselectionRank_(left.preselectionRank, right.preselectionRank))
+    .slice(0, OPERATOR_IDENTITY_PRIORITY_LANE_RETAIN_MAX_V1_);
+  plan.priorityLaneRetainedCount = priorityLane.length;
+  const normalizedByUrl = new Map();
+  priorityLane.concat(boundedInput.map((candidate, originalIndex) => ({ candidate, originalIndex,
+    preselectionRank: operatorIdentityCandidatePreselectionRank_(candidate, originalIndex) }))).forEach(item => {
+    const url = String(item.candidate && (item.candidate.finalUrl || item.candidate.url || item.candidate.href || '') || '');
+    const key = discoverSubpageCandidateKey(url);
+    if (!url || !key) return;
+    const prior = normalizedByUrl.get(key);
+    if (!prior || compareOperatorIdentityPreselectionRank_(item.preselectionRank, prior.preselectionRank) < 0) normalizedByUrl.set(key, item);
+  });
+  const normalized = Array.from(normalizedByUrl.values()).sort((left, right) =>
+    compareOperatorIdentityPreselectionRank_(left.preselectionRank, right.preselectionRank));
+  plan.normalizedCandidateCount = normalized.length;
+  const evaluationInput = normalized.slice(0, OPERATOR_IDENTITY_PRESELECTION_EVALUATION_MAX_V1_);
+  plan.auditCandidates = evaluationInput.map(item => item.candidate);
+  plan.eligibilityEvaluationCount = evaluationInput.length;
+  const evaluated = evaluationInput
+    .map(item => ({ candidate: item.candidate, evaluation: evaluateBoundedOperatorIdentityProbeCandidate_(item.candidate) }))
     .filter(item => item.evaluation.probeEligible === true);
+  plan.eligibleCandidateCount = evaluated.length;
   const rank = item => {
+    // Preserve the established external-relation ordering. Only the newly
+    // captured same-origin direct relation needs a bounded preference over
+    // generic strict routes that may be unreachable.
+    const officialRelationRank = item.candidate && item.candidate.officialSameOriginOperatorProfile === true ? 1 : 0;
     const tierRank = item.evaluation.probeTier === 'strict_corroborated' ? 2 : 1;
-    return [tierRank, profilePathSpecificity(item.candidate), Number(item.candidate && item.candidate.score || 0)];
+    return [officialRelationRank, tierRank, profilePathSpecificity(item.candidate), Number(item.candidate && item.candidate.score || 0)];
   };
-  const selected = evaluated.slice().sort((a, b) => {
+  // This is a ranking boundary, not an expansion of discovery. Reuse the
+  // discovery key so query strings, fragments, and trailing-slash variants do
+  // not consume the bounded fallback slot as the same page.
+  const seenUrls = new Set();
+  plan.selected = evaluated.slice().sort((a, b) => {
     const left = rank(a), right = rank(b);
-    return (right[0] - left[0]) || (right[1] - left[1]) || (right[2] - left[2]);
-  })[0];
-  return selected ? Object.assign({}, selected.candidate, {
-    operatorIdentityProbeTier: selected.evaluation.probeTier,
-    operatorIdentityProbeSourceType: selected.evaluation.probeSourceType
-  }) : null;
+    return (right[0] - left[0]) || (right[1] - left[1]) || (right[2] - left[2]) || (right[3] - left[3]);
+  }).filter(item => {
+    const url = String(item && item.candidate && (item.candidate.finalUrl || item.candidate.url || item.candidate.href || '') || '');
+    const key = discoverSubpageCandidateKey(url);
+    if (!url || !key || seenUrls.has(key)) return false;
+    seenUrls.add(key);
+    return true;
+  }).slice(0, Math.max(1, Math.min(2, Number(maxCandidates) || 2))).map(item => Object.assign({}, item.candidate, {
+    operatorIdentityProbeTier: item.evaluation.probeTier,
+    operatorIdentityProbeSourceType: item.evaluation.probeSourceType,
+    operatorIdentityAllowExplicitExternalCompanyRedirect: item.evaluation.allowExplicitExternalCompanyRedirect === true
+  }));
+  // Internal-only wiring for the bounded audit projection. These raw URLs are
+  // never returned; buildOperatorIdentityCandidateAuditV1_ replaces them with
+  // response-local HMAC keys before transport.
+  plan.auditPriorityLaneCandidateUrls = priorityLane.map(item => String(item.candidate && item.candidate.url || ''));
+  return plan;
+}
+
+function selectOperatorIdentityProbeCandidates_(candidates, siteMode, maxCandidates = 2) {
+  return buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandidates).selected;
+}
+
+function selectOperatorIdentityProbeCandidate_(candidates, siteMode) {
+  return selectOperatorIdentityProbeCandidates_(candidates, siteMode, 1)[0] || null;
+}
+
+function canAttemptOperatorIdentityFallbackV1_(landingPage, fallbackCandidate) {
+  if (!fallbackCandidate || !fallbackCandidate.url || !landingPage || landingPage.ok === true) return false;
+  // The shared light budget remains authoritative. Do not schedule another
+  // request when it has already rejected the primary before fetch.
+  return normalizeOperatorIdentityProbeErrorCodeV1_(landingPage) !== 'budget_exhausted';
 }
 
 function pickBestContactSignals_(pages) {
@@ -10753,6 +11601,31 @@ function pickBestContactSignals_(pages) {
   return {
     hasPhone: true,
     telephone: normalizeSubpageJsonLdText(best.telephone).slice(0, 60)
+  };
+}
+
+function retainSafeStaticFormalCoverageEvidence_(staticPage, candidate) {
+  if (!staticPage || staticPage.ok !== true || !candidate) return null;
+  const candidateKey = discoverSubpageCandidateKey(candidate && candidate.url || '');
+  const staticKey = discoverSubpageCandidateKey(staticPage && staticPage.url || '');
+  if (!candidateKey || candidateKey !== staticKey) return null;
+  const sourceMatchesPage = record => {
+    if (!record || record.observed !== true || record.hasOperatorInfo !== true) return false;
+    const sourceKey = discoverSubpageCandidateKey(record.sourceUrl || '');
+    const pageKey = discoverSubpageCandidateKey(staticPage.finalUrl || staticPage.url || '');
+    return !!sourceKey && sourceKey === pageKey;
+  };
+  const operatorIdentityInfo = sourceMatchesPage(staticPage.operatorIdentityInfo)
+    ? Object.assign({}, staticPage.operatorIdentityInfo) : null;
+  const legalOperatorInfo = sourceMatchesPage(staticPage.legalOperatorInfo)
+    ? Object.assign({}, staticPage.legalOperatorInfo) : null;
+  if (!operatorIdentityInfo && !legalOperatorInfo) return null;
+  return {
+    url: String(staticPage.url || ''), finalUrl: String(staticPage.finalUrl || staticPage.url || ''),
+    status: Number(staticPage.status || 0) || null, ok: true,
+    operatorIdentityInfo, legalOperatorInfo,
+    observationMethod: 'html_fetch_light_formal_evidence_retained',
+    observationSource: 'safe_static_coverage_same_run'
   };
 }
 
@@ -11162,6 +12035,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         {
           noCandidateReason: 'candidate_selection_empty',
           discoverLinkAudit: discovered.operatorIdentityDiscoverLinkAudit,
+          selectionPriorityLaneCandidateUrls: discovered.operatorIdentitySelectionPlan && discovered.operatorIdentitySelectionPlan.auditPriorityLaneCandidateUrls,
           producerReached: true,
           candidateCount: 0,
           completeCandidateCount: 0,
@@ -11402,6 +12276,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     scopedFallbackPages.forEach(page => {
       if (page && page.url) scopedFallbackByUrl.set(String(page.url), page);
     });
+    const retainedFormalEvidencePages = [];
     const observed = {
       pages: selectedCandidates.map((candidate, index) => {
         if (scopedPlaywrightSubpageObservation) {
@@ -11425,7 +12300,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         const htmlPage = htmlPages[index];
         const playwrightPage = playwrightByUrl.get(String(candidate && candidate.url || ''));
         const scopedFallbackPage = scopedFallbackByUrl.get(String(candidate && candidate.url || ''));
-        if (playwrightPage && playwrightPage.ok === true) return playwrightPage;
+        if (playwrightPage && playwrightPage.ok === true) {
+          const retained = retainSafeStaticFormalCoverageEvidence_(htmlPage, candidate);
+          if (retained) retainedFormalEvidencePages.push(retained);
+          return playwrightPage;
+        }
         if (scopedFallbackPage && scopedFallbackPage.ok === true) return Object.assign({}, scopedFallbackPage, {
           observationMethod: 'playwright_scoped_light',
           observationSource: 'playwright-scoped-light-after-html-fetch-tls-ssl-failure',
@@ -11500,6 +12379,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+    const operatorIdentityObservations = observations.concat(
+      retainedFormalEvidencePages.map(page => compactSubpageJsonLdObservation_(page))
+    );
     attachContactDestination_(geoSignalsV1, await resolveContactDestinationLight_(normalized.origin, observations, hasContactCandidate, {
       siteMode,
       context: opts && opts.context
@@ -11558,11 +12440,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
       candidates: discovered.candidates
     }));
-    let legalOperatorInfo = pickBestLegalOperatorInfo_(observations);
-    const observedCompanyProfileIdentity = buildOperatorIdentityInfoFromObservedCompanyProfiles_(observations);
+    let legalOperatorInfo = pickBestLegalOperatorInfo_(operatorIdentityObservations);
+    const observedCompanyProfileIdentity = buildOperatorIdentityInfoFromObservedCompanyProfiles_(operatorIdentityObservations);
+    // Reused coverage pages do not carry an explicit analysed-brand-to-company
+    // relation. Keep their result for diagnosis, but never use it to bypass
+    // the bounded relation-backed identity probe.
     let operatorIdentityInfo = legalOperatorInfo && legalOperatorInfo.hasOperatorInfo === true
       ? normalizeOperatorIdentityInfo_(legalOperatorInfo, 'legal')
-      : (observedCompanyProfileIdentity.record || null);
+      : null;
     let operatorIdentityProbe = {
       attempted: false,
       observationComplete: false,
@@ -11577,12 +12462,23 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     // This probe is intentionally outside the normal representative-page plan:
     // it never changes maxObserve=2 or displaces business/contact observation.
     let selectedOperatorIdentityCandidate = null;
+    let selectedOperatorIdentityFallbackCandidate = null;
+    let operatorIdentityPrimaryProbeAuditContext = null;
+    let operatorIdentityFallbackProbeAuditContext = null;
     let operatorIdentityCandidateNoCandidateReason = null;
+    const operatorSelectionPlan = discovered.operatorIdentitySelectionPlan &&
+      discovered.operatorIdentitySelectionPlan.version === 'operator_identity_probe_selection_v1'
+      ? discovered.operatorIdentitySelectionPlan
+      : buildOperatorIdentityProbeSelectionPlan_(discovered.operatorIdentityAuditCandidates, siteMode, 2);
     if (!operatorIdentityInfo && observedCompanyProfileIdentity.reason.indexOf('conflict') < 0) {
-      const operatorCandidate = selectOperatorIdentityProbeCandidate_(discovered.operatorIdentityAuditCandidates, siteMode);
+      const operatorCandidates = operatorSelectionPlan.selected;
+      const operatorCandidate = operatorCandidates[0] || null;
       if (operatorCandidate) {
         selectedOperatorIdentityCandidate = operatorCandidate;
         const operatorProbeSourceType = operatorCandidate.operatorIdentityProbeSourceType === 'legal' ? 'legal' : 'company_profile';
+        const operatorRelationEvidence = buildExplicitOperatorIdentityRelationEvidenceV1_(operatorCandidate);
+        const allowExplicitOperatorHttpsDowngradeRecovery = !!(operatorRelationEvidence &&
+          operatorRelationEvidence.kind === 'explicit_external_operator_relation');
         operatorIdentityProbe = {
           attempted: true,
           observationComplete: false,
@@ -11591,12 +12487,19 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           reason: String(operatorCandidate.operatorIdentityProbeTier || 'strict_corroborated'),
           landingProbeUrl: String(operatorCandidate.url || ''),
           landingProbeResult: 'pending',
+          landingProbeErrorCode: null,
+          fallbackProbeAttempted: false,
+          fallbackProbeResult: null,
+          fallbackProbeErrorCode: null,
+          fallbackSelectionReason: null,
           hubProbeAttempted: false,
           hubProbeUrl: null,
           hubProbeResult: null,
+          hubProbeErrorCode: null,
           detailProbeAttempted: false,
           detailProbeUrl: null,
           detailProbeResult: null,
+          detailProbeErrorCode: null,
           totalOperatorProbeCount: 0,
           // Compatibility fields retained for existing debug consumers.
           firstProbeUrl: String(operatorCandidate.url || ''),
@@ -11615,8 +12518,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           operatorIdentitySourceType: operatorProbeSourceType === 'company_profile' ? 'company_profile' : undefined,
           operatorIdentitySelectedHub: operatorProbeSourceType === 'company_profile',
           highConfidenceCompanyProfile: true,
+          allowExplicitExternalCompanyRedirect: operatorCandidate.operatorIdentityAllowExplicitExternalCompanyRedirect === true,
+          allowExplicitOperatorHttpsDowngradeRecovery,
+          operatorIdentityNoSaveRedirectDebug: opts.operatorIdentityNoSaveRedirectDebug === true,
           collectOperatorSecondPageCompanyProfileLink: operatorProbeSourceType === 'company_profile' &&
-            operatorCandidate.officialExternalOperatorProfile !== true
+            (operatorCandidate.officialExternalOperatorProfile !== true || allowExplicitOperatorHttpsDowngradeRecovery)
         });
         const operatorPage = operatorProbeResult && Array.isArray(operatorProbeResult.pages) ? operatorProbeResult.pages[0] : null;
         operatorIdentityProbe.totalOperatorProbeCount = 1;
@@ -11626,12 +12532,18 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           : String(operatorPage && operatorPage.error || `${operatorProbeSourceType}_fetch_failed`);
         operatorIdentityProbe.firstProbeResult = operatorPage && operatorPage.ok === true ? 'fetched' : 'fetch_failed';
         operatorIdentityProbe.landingProbeResult = operatorIdentityProbe.firstProbeResult;
-      const rawOperatorIdentity = operatorPage && (operatorProbeSourceType === 'legal'
+        operatorIdentityProbe.landingProbeErrorCode = normalizeOperatorIdentityProbeErrorCodeV1_(operatorPage);
+      let rawOperatorIdentity = operatorPage && (operatorProbeSourceType === 'legal'
         ? operatorPage.legalOperatorInfo
         : operatorPage.operatorIdentityInfo);
       operatorIdentityProbe.firstProbeFormalRecord = rawOperatorIdentity && rawOperatorIdentity.hasOperatorInfo === true;
       if (rawOperatorIdentity) {
-      const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(rawOperatorIdentity, operatorProbeSourceType);
+      const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(rawOperatorIdentity, operatorProbeSourceType, {
+        relationEvidence: buildExplicitOperatorIdentityRelationEvidenceV1_(operatorCandidate)
+      });
+      operatorIdentityPrimaryProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+        operatorCandidate, operatorProbeSourceType, operatorPage, rawOperatorIdentity, normalizedOperatorIdentity, opts
+      );
       if (normalizedOperatorIdentity) {
           normalizedOperatorIdentity.operatorIdentityFieldExtractionAuditV1 = rawOperatorIdentity.operatorIdentityFieldExtractionAuditV1 || null;
           const formalRecord = attachOperatorIdentityProbeProvenance_(normalizedOperatorIdentity, operatorCandidate);
@@ -11658,6 +12570,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           };
         }
       } else if (operatorPage) {
+          operatorIdentityPrimaryProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+            operatorCandidate, operatorProbeSourceType, operatorPage, null, null, opts
+          );
           operatorIdentityInfo = {
             observed: false,
             observationComplete: operatorIdentityProbe.observationComplete,
@@ -11669,6 +12584,100 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             extractionMethod: 'html_text',
             evidenceLabels: []
           };
+        }
+        if (!operatorIdentityPrimaryProbeAuditContext) {
+          operatorIdentityPrimaryProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+            operatorCandidate, operatorProbeSourceType, operatorPage, rawOperatorIdentity, null, opts
+          );
+        }
+        // A failed landing has no trustworthy page scope from which to
+        // discover a hub/detail link.  We may therefore use only one already
+        // ranked, independently eligible *landing* as a fallback.  It uses
+        // the same safe fetcher and never enables a second traversal, keeping
+        // the historical maximum of three operator requests intact.
+        const fallbackCandidate = operatorCandidates[1] || null;
+        if (canAttemptOperatorIdentityFallbackV1_(operatorPage, fallbackCandidate)) {
+          selectedOperatorIdentityFallbackCandidate = fallbackCandidate;
+          const fallbackSourceType = fallbackCandidate.operatorIdentityProbeSourceType === 'legal' ? 'legal' : 'company_profile';
+          operatorIdentityProbe.fallbackProbeAttempted = true;
+          operatorIdentityProbe.fallbackSelectionReason = 'safe_alternate_candidate_after_landing_fetch_failed';
+          const fallbackProbeResult = await fetchSubpageHtmlLightUrls_([fallbackCandidate.url], {
+            siteMode,
+            lightBudget,
+            htmlFetchTimeoutMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS : 4000,
+            reserveMs: lightBudget ? LIGHT_RESPONSE_CLEANUP_RESERVE_MS : undefined,
+            minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
+            operatorIdentitySourceType: fallbackSourceType === 'company_profile' ? 'company_profile' : undefined,
+            operatorIdentitySelectedHub: fallbackSourceType === 'company_profile',
+            highConfidenceCompanyProfile: true,
+            allowExplicitExternalCompanyRedirect: fallbackCandidate.operatorIdentityAllowExplicitExternalCompanyRedirect === true,
+            operatorIdentityNoSaveRedirectDebug: opts.operatorIdentityNoSaveRedirectDebug === true,
+            collectOperatorSecondPageCompanyProfileLink: false
+          });
+          const fallbackPage = fallbackProbeResult && Array.isArray(fallbackProbeResult.pages) ? fallbackProbeResult.pages[0] : null;
+          operatorIdentityProbe.totalOperatorProbeCount += 1;
+          operatorIdentityProbe.fallbackProbeResult = fallbackPage && fallbackPage.ok === true ? 'fetched' : 'fetch_failed';
+          operatorIdentityProbe.fallbackProbeErrorCode = normalizeOperatorIdentityProbeErrorCodeV1_(fallbackPage);
+          operatorIdentityProbe.observationComplete = !!(fallbackPage && fallbackPage.ok === true);
+          operatorIdentityProbe.sourceUrl = String(fallbackPage && fallbackPage.finalUrl || fallbackCandidate.url || operatorIdentityProbe.sourceUrl || '');
+          operatorIdentityProbe.reason = fallbackPage && fallbackPage.ok === true
+            ? `fallback_${fallbackSourceType}_fetched`
+            : String(fallbackPage && fallbackPage.error || `fallback_${fallbackSourceType}_fetch_failed`);
+          rawOperatorIdentity = fallbackPage && (fallbackSourceType === 'legal'
+            ? fallbackPage.legalOperatorInfo
+            : fallbackPage.operatorIdentityInfo);
+          if (rawOperatorIdentity) {
+            const normalizedFallbackIdentity = normalizeOperatorIdentityInfo_(rawOperatorIdentity, fallbackSourceType, {
+              relationEvidence: buildExplicitOperatorIdentityRelationEvidenceV1_(fallbackCandidate)
+            });
+            operatorIdentityFallbackProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+              fallbackCandidate, fallbackSourceType, fallbackPage, rawOperatorIdentity, normalizedFallbackIdentity, opts
+            );
+            if (normalizedFallbackIdentity) {
+              normalizedFallbackIdentity.operatorIdentityFieldExtractionAuditV1 = rawOperatorIdentity.operatorIdentityFieldExtractionAuditV1 || null;
+              const fallbackFormalRecord = attachOperatorIdentityProbeProvenance_(normalizedFallbackIdentity, fallbackCandidate);
+              fallbackFormalRecord.observationComplete = operatorIdentityProbe.observationComplete;
+              if (fallbackSourceType === 'legal') legalOperatorInfo = fallbackFormalRecord;
+              else operatorIdentityInfo = fallbackFormalRecord;
+            } else {
+              operatorIdentityInfo = {
+                observed: rawOperatorIdentity.observed === true,
+                observationComplete: operatorIdentityProbe.observationComplete,
+                sourceType: fallbackSourceType,
+                sourceUrl: operatorIdentityProbe.sourceUrl,
+                companyName: String(rawOperatorIdentity.companyName || rawOperatorIdentity.operatorName || ''),
+                address: String(rawOperatorIdentity.address || ''),
+                telephone: String(rawOperatorIdentity.telephone || ''),
+                hasCompanyName: rawOperatorIdentity.hasCompanyName === true,
+                hasAddress: rawOperatorIdentity.hasAddress === true,
+                hasTelephone: rawOperatorIdentity.hasTelephone === true,
+                hasOperatorInfo: false,
+                extractionMethod: String(rawOperatorIdentity.extractionMethod || 'html_text'),
+                evidenceLabels: Array.isArray(rawOperatorIdentity.evidenceLabels) ? rawOperatorIdentity.evidenceLabels.slice(0, 10) : [],
+                operatorIdentityFieldExtractionAuditV1: rawOperatorIdentity.operatorIdentityFieldExtractionAuditV1 || null,
+                provenance: { reason: 'required_fields_missing' }
+              };
+            }
+          } else if (fallbackPage) {
+            operatorIdentityFallbackProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+              fallbackCandidate, fallbackSourceType, fallbackPage, null, null, opts
+            );
+            operatorIdentityInfo = {
+              observed: false,
+              observationComplete: operatorIdentityProbe.observationComplete,
+              sourceType: fallbackSourceType,
+              sourceUrl: operatorIdentityProbe.sourceUrl,
+              companyName: '', address: '', telephone: '',
+              hasCompanyName: false, hasAddress: false, hasTelephone: false,
+              hasOperatorInfo: false,
+              extractionMethod: 'html_text',
+              evidenceLabels: []
+            };
+          } else {
+            operatorIdentityFallbackProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+              fallbackCandidate, fallbackSourceType, null, null, null, opts
+            );
+          }
         }
         // Operator identity has its own bounded traversal budget. A landing
         // can use one explicit company-information hub, which can in turn
@@ -11702,7 +12711,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             };
             return { identity, outcome: 'conflict' };
           }
-          const normalized = identity && normalizeOperatorIdentityInfo_(identity, 'company_profile');
+          const normalized = identity && normalizeOperatorIdentityInfo_(identity, 'company_profile', {
+            relationEvidence: buildExplicitOperatorIdentityRelationEvidenceV1_(operatorCandidate)
+          });
           if (normalized) {
             normalized.operatorIdentityFieldExtractionAuditV1 = identity.operatorIdentityFieldExtractionAuditV1 || null;
             const formalRecord = attachOperatorIdentityProbeProvenance_(normalized, operatorCandidate);
@@ -11726,9 +12737,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           } : operatorIdentityInfo;
           return { identity: identity || { observed: false, hasOperatorInfo: false, conflict: false }, outcome: 'incomplete' };
         };
-        const landingFollowup = selectOperatorCompanyProfileFollowupV1_(
-          operatorPage, operatorCandidate, incompleteIdentity
-        );
+        const landingFollowup = operatorIdentityProbe.fallbackProbeAttempted === true
+          ? null
+          : selectOperatorCompanyProfileFollowupV1_(operatorPage, operatorCandidate, incompleteIdentity);
         const hubLink = landingFollowup && landingFollowup.role === 'hub' ? landingFollowup.link : null;
         const directDetailLink = landingFollowup && landingFollowup.role === 'detail' ? landingFollowup.link : null;
         if (hubLink && hubLink.url) {
@@ -11737,6 +12748,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           const hubPage = await fetchCompanyProfilePage(hubLink.url, true);
           operatorIdentityProbe.totalOperatorProbeCount += 1;
           operatorIdentityProbe.hubProbeResult = hubPage && hubPage.ok === true ? 'fetched' : 'fetch_failed';
+          operatorIdentityProbe.hubProbeErrorCode = normalizeOperatorIdentityProbeErrorCodeV1_(hubPage);
           operatorIdentityProbe.sourceUrl = String(hubLink.url || operatorIdentityProbe.sourceUrl || '');
           operatorIdentityProbe.observationComplete = !!(hubPage && hubPage.ok === true);
           if (!hubPage || hubPage.ok !== true) {
@@ -11755,6 +12767,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
                 const detailPage = await fetchCompanyProfilePage(detailLink.url, false);
                 operatorIdentityProbe.totalOperatorProbeCount += 1;
                 operatorIdentityProbe.detailProbeResult = detailPage && detailPage.ok === true ? 'fetched' : 'fetch_failed';
+                operatorIdentityProbe.detailProbeErrorCode = normalizeOperatorIdentityProbeErrorCodeV1_(detailPage);
                 operatorIdentityProbe.sourceUrl = String(detailLink.url || operatorIdentityProbe.sourceUrl || '');
                 operatorIdentityProbe.observationComplete = !!(detailPage && detailPage.ok === true);
                 if (!detailPage || detailPage.ok !== true) {
@@ -11777,6 +12790,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           const detailPage = await fetchCompanyProfilePage(directDetailLink.url, false);
           operatorIdentityProbe.totalOperatorProbeCount += 1;
           operatorIdentityProbe.detailProbeResult = detailPage && detailPage.ok === true ? 'fetched' : 'fetch_failed';
+          operatorIdentityProbe.detailProbeErrorCode = normalizeOperatorIdentityProbeErrorCodeV1_(detailPage);
           operatorIdentityProbe.secondProbeResult = operatorIdentityProbe.detailProbeResult;
           operatorIdentityProbe.sourceUrl = String(directDetailLink.url || operatorIdentityProbe.sourceUrl || '');
           operatorIdentityProbe.observationComplete = !!(detailPage && detailPage.ok === true);
@@ -11789,7 +12803,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           }
         }
       } else {
-        operatorIdentityCandidateNoCandidateReason = (String(siteMode || '').toLowerCase() === 'corporate' || String(siteMode || '').toLowerCase() === 'generic' || String(siteMode || '').toLowerCase() === 'saas')
+        operatorIdentityCandidateNoCandidateReason = (String(siteMode || '').toLowerCase() === 'corporate' || String(siteMode || '').toLowerCase() === 'generic' || String(siteMode || '').toLowerCase() === 'saas' || String(siteMode || '').toLowerCase() === 'shop_facility')
           ? 'no_high_confidence_candidate'
           : 'site_mode_not_applicable';
       }
@@ -11831,9 +12845,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
               ? 'hub_candidate_missing'
               : (operatorIdentityProbe && /conflict/i.test(String(operatorIdentityProbe.reason || ''))
                 ? 'operator_probe_conflict' : 'operator_probe_incomplete')))));
-    const operatorProbeCandidateCount = (Array.isArray(discovered.operatorIdentityAuditCandidates)
-      ? discovered.operatorIdentityAuditCandidates : [])
-      .filter(candidate => evaluateBoundedOperatorIdentityProbeCandidate_(candidate).probeEligible === true).length;
+    const operatorProbeCandidateCount = operatorSelectionPlan
+      ? operatorSelectionPlan.eligibleCandidateCount : 0;
     // Presence-only handoff contract for the GAS light bridge.  It deliberately
     // carries neither company name, address, nor telephone.
     geoSignalsV1.operatorIdentityBridgeProvenanceV1 = {
@@ -11857,8 +12870,23 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       selectedOperatorIdentityCandidate,
       {
         noCandidateReason: operatorIdentityCandidateNoCandidateReason,
+        fallbackCandidate: selectedOperatorIdentityFallbackCandidate,
+        primaryProbeContext: operatorIdentityPrimaryProbeAuditContext,
+        fallbackProbeContext: operatorIdentityFallbackProbeAuditContext,
         discoverLinkAudit: discovered.operatorIdentityDiscoverLinkAudit,
         producerReached: true,
+        candidateCount: Array.isArray(discovered.operatorIdentityAuditCandidates) ? discovered.operatorIdentityAuditCandidates.length : 0,
+        selectionStrategy: operatorSelectionPlan && operatorSelectionPlan.strategy,
+        selectionInputCandidateCount: operatorSelectionPlan && operatorSelectionPlan.inputCandidateCount,
+        selectionPreselectionInputCount: operatorSelectionPlan && operatorSelectionPlan.preselectionInputCount,
+        selectionPriorityLaneScanCount: operatorSelectionPlan && operatorSelectionPlan.priorityLaneScanCount,
+        selectionPriorityLaneRetainedCount: operatorSelectionPlan && operatorSelectionPlan.priorityLaneRetainedCount,
+        selectionPriorityLaneCandidateUrls: operatorSelectionPlan && operatorSelectionPlan.auditPriorityLaneCandidateUrls,
+        selectionNormalizedCandidateCount: operatorSelectionPlan && operatorSelectionPlan.normalizedCandidateCount,
+        selectionEligibilityEvaluationCount: operatorSelectionPlan && operatorSelectionPlan.eligibilityEvaluationCount,
+        selectionEligibleCandidateCount: operatorSelectionPlan && operatorSelectionPlan.eligibleCandidateCount,
+        selectionAuditCandidates: operatorSelectionPlan && operatorSelectionPlan.auditCandidates,
+        operatorIdentityNoSaveRedirectDebug: opts.operatorIdentityNoSaveRedirectDebug === true,
         probeCandidateCount: operatorProbeCandidateCount,
         completeCandidateCount: operatorFormalRecordPresent ? 1 : 0,
         formalRecordPresent: operatorFormalRecordPresent,
@@ -11868,12 +12896,19 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         firstProbeResult: operatorIdentityProbe && operatorIdentityProbe.firstProbeResult,
         landingProbeUrl: operatorIdentityProbe && operatorIdentityProbe.landingProbeUrl,
         landingProbeResult: operatorIdentityProbe && operatorIdentityProbe.landingProbeResult,
+        landingProbeErrorCode: operatorIdentityProbe && operatorIdentityProbe.landingProbeErrorCode,
+        fallbackProbeAttempted: operatorIdentityProbe && operatorIdentityProbe.fallbackProbeAttempted === true,
+        fallbackProbeResult: operatorIdentityProbe && operatorIdentityProbe.fallbackProbeResult,
+        fallbackProbeErrorCode: operatorIdentityProbe && operatorIdentityProbe.fallbackProbeErrorCode,
+        fallbackSelectionReason: operatorIdentityProbe && operatorIdentityProbe.fallbackSelectionReason,
         hubProbeAttempted: operatorIdentityProbe && operatorIdentityProbe.hubProbeAttempted === true,
         hubProbeUrl: operatorIdentityProbe && operatorIdentityProbe.hubProbeUrl,
         hubProbeResult: operatorIdentityProbe && operatorIdentityProbe.hubProbeResult,
+        hubProbeErrorCode: operatorIdentityProbe && operatorIdentityProbe.hubProbeErrorCode,
         detailProbeAttempted: operatorIdentityProbe && operatorIdentityProbe.detailProbeAttempted === true,
         detailProbeUrl: operatorIdentityProbe && operatorIdentityProbe.detailProbeUrl,
         detailProbeResult: operatorIdentityProbe && operatorIdentityProbe.detailProbeResult,
+        detailProbeErrorCode: operatorIdentityProbe && operatorIdentityProbe.detailProbeErrorCode,
         totalOperatorProbeCount: operatorIdentityProbe && operatorIdentityProbe.totalOperatorProbeCount,
         secondProbeAttempted: operatorIdentityProbe && operatorIdentityProbe.secondProbeAttempted === true,
         secondProbeUrl: operatorIdentityProbe && operatorIdentityProbe.secondProbeUrl,
@@ -20197,6 +21232,17 @@ function buildBalancedShortResponsePayload(fullPayload) {
   return shortPayload;
 }
 
+function isOperatorIdentityNoSaveRedirectDebugRequestV1_(req, signalsFirstLight, noCache) {
+  const requestSource = String(
+    req && typeof req.get === 'function' ? (req.get('X-From') || '')
+      : (req && req.headers && (req.headers['x-from'] || req.headers['X-From']) || '')
+  ).trim();
+  // The extra URL-shape projection is intentionally limited to the existing
+  // authenticated GAS explicit no-save debug request. It is not enabled by
+  // normal light diagnostics, saved runs, or arbitrary query parameters.
+  return signalsFirstLight === true && noCache === true && requestSource === 'GAS-debug-no-save';
+}
+
 async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   const urlToFetch = req.query.url;
   const executionAuth = scrapeOptions && scrapeOptions.executionAuth || null;
@@ -20213,6 +21259,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   const debugHeavySiteStartedAt = Date.now();
   const observerMode = String(req.query.observer || '').toLowerCase();
   const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
+  const operatorIdentityNoSaveRedirectDebug = isOperatorIdentityNoSaveRedirectDebugRequestV1_(req, signalsFirstLight, noCache);
   const signalsFirstBalanced = signalsMode === 'balanced' || signalsMode === 'balancedshort' || signalsMode === 'balancedfast' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
   const balancedShortFastResponse = signalsFirstBalanced && (responseMode === 'shortfast' || responseMode === 'short-fast' || signalsMode === 'balancedfast');
   const balancedShortResponse = signalsFirstBalanced && (responseMode === 'short' || signalsMode === 'balancedshort' || balancedShortFastResponse);
@@ -24227,6 +25274,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         signalsMode,
         debugHeavySite,
         debugHeavySiteStartedAt,
+        operatorIdentityNoSaveRedirectDebug,
         lightBudget: signalsFirstLight ? lightBudget : null
         ,executionAuth
       });
@@ -27750,6 +28798,7 @@ module.exports.__lightBudgetTestHooks = {
   HTML_SITEMAP_STANDARD_PATHS_V1_,
   detectBreadcrumbUiFromCheerio_,
   buildGeoSignalsV1,
+  buildBalancedShortResponsePayload,
   normalizeFrameContentUrlV1_,
   frameDepthFromMainV1_,
   isUsableFrameContentObservationV1_,
@@ -27777,6 +28826,7 @@ module.exports.__lightBudgetTestHooks = {
   selectOperatorSecondPageCompanyProfileDetailLink_,
   selectOperatorCompanyProfileHubLink_,
   selectOperatorCompanyProfileFollowupV1_,
+  classifyOperatorIdentityFieldConflictsV1_,
   operatorIdentityFieldsConflict_,
   buildOperatorIdentityFieldExtractionAuditV1_,
   isObservedCompanyProfileScope_,
@@ -27786,11 +28836,29 @@ module.exports.__lightBudgetTestHooks = {
   isHighConfidenceCompanyProfileCandidate_,
   evaluateBoundedOperatorIdentityProbeCandidate_,
   buildOperatorIdentityCandidateAuditV1_,
+  createOperatorIdentityCandidateAuditKeyerV1_,
+  operatorIdentityRelationAuditV1_,
+  safeOperatorIdentityDebugUrlProjectionV1_,
+  buildOperatorIdentityProbeAuditContextV1_,
+  isOperatorIdentityNoSaveRedirectDebugRequestV1_,
+  normalizeOperatorIdentityProbeErrorCodeV1_,
   buildOperatorIdentityDiscoverLinkAuditV1_,
   applyCompanyProfileHubCorroboration_,
   collectDiscoverLinksFromPage,
   collectOfficialExternalOperatorProfileCandidates_,
+  collectOfficialSameOriginOperatorProfileCandidates_,
+  operatorIdentityCandidatePreselectionRank_,
+  buildOperatorIdentityProbeSelectionPlan_,
+  selectOperatorIdentityProbeCandidates_,
   selectOperatorIdentityProbeCandidate_,
+  OPERATOR_IDENTITY_PRESELECTION_INPUT_MAX_V1_,
+  OPERATOR_IDENTITY_PRESELECTION_EVALUATION_MAX_V1_,
+  OPERATOR_IDENTITY_PRIORITY_LANE_SCAN_MAX_V1_,
+  OPERATOR_IDENTITY_PRIORITY_LANE_RETAIN_MAX_V1_,
+  isOperatorIdentityPriorityLaneCandidate_,
+  canAttemptOperatorIdentityFallbackV1_,
+  retainSafeStaticFormalCoverageEvidence_,
+  buildExplicitOperatorIdentityRelationEvidenceV1_,
   normalizeOperatorIdentityInfo_,
   isFormalOperatorIdentityRecord_,
   attachOperatorIdentityProbeProvenance_,
@@ -27815,6 +28883,14 @@ module.exports.__lightBudgetTestHooks = {
   extractSubpageProductOfferingSignal_,
   inferEcGeneralLinkPageType_,
   addEcGeneralLinkCandidatesFromLinks_,
+  SUBPAGE_HTML_MAX_BYTES_V1_,
+  SUBPAGE_HTML_MAX_REDIRECTS_V1_,
+  normalizeComparableIpAddressV1_,
+  isBlockedSubpageIpAddressV1_,
+  validateSafeSubpageFetchUrlV1_,
+  resolveValidatedSubpageAddressV1_,
+  requestValidatedSubpageHtmlV1_,
+  fetchSubpageHtmlLightOnce_,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,
   buildCoverageSignalsV1FromSubpageObservation_,

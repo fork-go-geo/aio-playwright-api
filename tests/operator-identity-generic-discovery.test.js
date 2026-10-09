@@ -26,12 +26,19 @@ function candidate(url, label, sources) {
 // A rendered global-navigation/footer label may authorize one bounded probe
 // without sitemap corroboration. The structured profile fields still create
 // the formal record; the link alone cannot do so.
-const footerCompany = candidate('https://fixture.example.test/about-us/', '運営会社', ['footer']);
+const footerCompany = Object.assign(candidate('https://fixture.example.test/about-us/', '運営会社', ['footer']), {
+  officialSameOriginOperatorProfile: true,
+  operatorRelationLabel: '運営会社',
+  operatorRelationSource: 'explicit_body_company_profile_relation',
+  operatorRelationSourceOrigin: 'https://fixture.example.test'
+});
 assert.strictEqual(evaluateBoundedOperatorIdentityProbeCandidate_(footerCompany).probeTier, 'human_labeled_company_profile');
 assert.strictEqual(selectOperatorIdentityProbeCandidate_([footerCompany], 'saas').url, footerCompany.url);
 const profile = extractOperatorIdentityInfoFromHtml_(profileHtml, footerCompany.url, { highConfidenceCompanyProfile: true });
 assert.strictEqual(profile.hasOperatorInfo, true);
-const formalProfile = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(profile, 'company_profile'), Object.assign({}, footerCompany, {
+const formalProfile = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(profile, 'company_profile', {
+  relationEvidence: hooks.buildExplicitOperatorIdentityRelationEvidenceV1_(footerCompany)
+}), Object.assign({}, footerCompany, {
   operatorIdentityProbeSourceType: 'company_profile'
 }));
 assert.strictEqual(formalProfile.hasCompanyName, true);
@@ -69,7 +76,7 @@ const namePhoneOnly = extractOperatorIdentityInfoFromHtml_(
 );
 assert.strictEqual(namePhoneOnly.hasOperatorInfo, false);
 assert.strictEqual(selectOperatorIdentityProbeCandidate_([], 'saas'), null);
-assert.strictEqual(selectOperatorIdentityProbeCandidate_([footerCompany], 'shop_facility'), null);
+assert.strictEqual(selectOperatorIdentityProbeCandidate_([footerCompany], 'shop_facility').url, footerCompany.url);
 const incomplete = buildOperatorIdentityObservationV1_(null, {
   attempted: true, observationComplete: false, sourceUrl: footerCompany.url, reason: 'timeout'
 }, { siteMode: 'saas', candidates: [footerCompany], discoveryComplete: true });

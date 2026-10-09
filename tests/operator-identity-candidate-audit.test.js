@@ -21,8 +21,12 @@ const eligibleBefore = candidates.map(hooks.isHighConfidenceCompanyProfileCandid
 assert.strictEqual(selectedBefore.url, houjinGaiyo.url);
 assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'saas').url, houjinGaiyo.url,
   'SaaS may use the same already-high-confidence company profile probe');
-assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'shop_facility'), null,
-  'shop/facility remains outside the operator profile probe contract');
+assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'shop_facility').url, houjinGaiyo.url,
+  'shop/facility shares the bounded formal-profile probe contract');
+assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'ec'), null,
+  'EC remains outside the dedicated operator profile probe contract');
+assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'media'), null,
+  'media remains outside the dedicated operator profile probe contract');
 const identityHtml = '<table><tr><th>会社名</th><td>Fixture株式会社</td></tr><tr><th>所在地</th><td>東京都千代田区1-1</td></tr><tr><th>電話番号</th><td>03-0000-0000</td></tr></table>';
 const formalBefore = hooks.normalizeOperatorIdentityInfo_(
   hooks.extractOperatorIdentityInfoFromHtml_(identityHtml, eligibleCompany.url, { highConfidenceCompanyProfile: true }),
@@ -32,7 +36,7 @@ const formalBefore = hooks.normalizeOperatorIdentityInfo_(
 const audit = hooks.buildOperatorIdentityCandidateAuditV1_(candidates, 'corporate', selectedBefore);
 assert.strictEqual(audit.version, 'operator_identity_candidate_audit_v1');
 assert.strictEqual(audit.candidates.length <= 5, true);
-assert.strictEqual(audit.selection.selectedCandidateUrl, houjinGaiyo.url);
+assert.strictEqual(audit.selection.selectedCandidateKey, audit.candidates.find(item => item.selectedForProbe).candidateKey);
 assert.strictEqual(audit.selection.selectedCandidateLabel, '法人概要');
 assert.strictEqual(audit.selection.noCandidateReason, null);
 
@@ -97,10 +101,13 @@ assert.strictEqual(info.highConfidenceEligible, true);
 
 const path = byLabel('会社概要');
 assert.ok(path);
-// The rejected path candidate can fall outside the bounded five-entry audit;
-// evaluate it directly to keep the bound independent of selection behavior.
-assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(pathMiss).rejectionReasons, ['path_not_company_profile']);
-assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(labelMiss).rejectionReasons, ['company_profile_label_missing']);
+// Canonical-site context treats an explicit company-profile label as a valid
+// routing hint even when its pathname is generic. Evaluate it directly to
+// keep the bounded audit independent of selection behavior.
+assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(pathMiss).rejectionReasons, []);
+// A canonical company-profile pathname is independently sufficient context;
+// `labelMiss` still requires corroboration before it can be selected.
+assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(labelMiss).rejectionReasons, []);
 assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(corroborationMiss).rejectionReasons, ['independent_corroboration_missing']);
 
 // Re-evaluate the unchanged producer selectors after audit construction.
@@ -150,8 +157,8 @@ console.log(JSON.stringify({
     houjinGaiyoSelectedWithCorroboration: eligible.highConfidenceEligible === true && eligible.selectedForProbe === true,
     houjinGaiyoRejectedWithoutCorroboration: houjinNavOnly.highConfidenceEligible === false,
     houjinInfoLabelMatched: info.labelMatched === true,
-    pathFailure: true,
-    labelFailure: true,
+    canonicalContextPathAccepted: true,
+    canonicalContextLabelAccepted: true,
     corroborationFailure: true,
     bounded: audit.candidates.length <= 5,
     groupedFooterOperator: true,
