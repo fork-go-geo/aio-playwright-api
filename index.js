@@ -5354,10 +5354,13 @@ async function resolveValidatedSubpageAddressV1_(hostname, opts = {}) {
     return { address: normalizedHost, family: net.isIP(normalizedHost) };
   }
   const records = await dnsLookupAllV1_(normalizedHost, opts.dnsLookup);
-  const approved = records.find(record => record && !isBlockedSubpageIpAddressV1_(record.address));
-  if (!approved) {
-    const error = new Error('dns_no_public_address'); error.code = 'SSRF_DNS_NO_PUBLIC_ADDRESS'; throw error;
+  // Do not silently select one public answer when the same name also returns
+  // a private address. A mixed answer is unsafe for server-side fetches and
+  // is a practical DNS-rebinding signal.
+  if (!records.length || records.some(record => !record || isBlockedSubpageIpAddressV1_(record.address))) {
+    const error = new Error('dns_private_or_invalid_address'); error.code = 'SSRF_DNS_PRIVATE_OR_INVALID_ADDRESS'; throw error;
   }
+  const approved = records[0];
   return { address: normalizeComparableIpAddressV1_(approved.address), family: Number(approved.family) || net.isIP(approved.address) };
 }
 
@@ -5447,6 +5450,108 @@ async function requestValidatedSubpageHtmlV1_(target, opts = {}) {
   });
 }
 
+// Shared safe text transport for non-rendered public-site observations. It
+// keeps the existing socket pinning and peer check; redirects are checked one
+// hop at a time before the next connection is opened.
+async function fetchValidatedTextResponseV1_(value, opts = {}) {
+  const initial = validateSafeSubpageFetchUrlV1_(value);
+  if (!initial.ok) {
+    const error = new Error(initial.reason); error.code = 'SSRF_URL_REJECTED'; throw error;
+  }
+  const maxRedirects = Math.max(0, Math.min(5, Number(opts.maxRedirects == null ? 3 : opts.maxRedirects)));
+  const maxBytes = Math.max(1, Math.min(2 * 1024 * 1024, Number(opts.maxBytes || 512 * 1024)));
+  const initialOrigin = initial.url.origin;
+  let current = initial.url;
+  for (let hop = 0; hop <= maxRedirects; hop += 1) {
+    const checked = validateSafeSubpageFetchUrlV1_(current);
+    if (!checked.ok) {
+      const error = new Error(checked.reason); error.code = 'SSRF_URL_REJECTED'; throw error;
+    }
+    const response = await requestValidatedSubpageHtmlV1_(checked.url, {
+      signal: opts.signal,
+      dnsLookup: opts.dnsLookup,
+      maxBytes,
+      headers: Object.assign({}, opts.headers || {}, typeof opts.headersForUrl === 'function' ? opts.headersForUrl(checked.url) : {})
+    });
+    const status = Number(response && response.status || 0);
+    const location = responseHeaderValueV1_(response && response.headers, 'location');
+    if (![301, 302, 303, 307, 308].includes(status)) {
+      return {
+        status,
+        ok: status >= 200 && status < 300,
+        url: checked.url.toString(),
+        redirected: hop > 0,
+        headers: { get: name => responseHeaderValueV1_(response.headers, name) },
+        text: async () => String(response.text || '')
+      };
+    }
+    if (!location || hop === maxRedirects) {
+      const error = new Error('redirect_limit_or_location_missing'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    let next;
+    try { next = new URL(location, checked.url); } catch (_) {
+      const error = new Error('redirect_location_invalid'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    const nextCheck = validateSafeSubpageFetchUrlV1_(next);
+    if (!nextCheck.ok || (opts.sameOrigin === true && nextCheck.url.origin !== initialOrigin) ||
+        (opts.rejectHttpsDowngrade === true && checked.url.protocol === 'https:' && nextCheck.url.protocol !== 'https:')) {
+      const error = new Error('redirect_target_rejected'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    current = nextCheck.url;
+  }
+  throw new Error('redirect_limit');
+}
+
+async function validateOutboundHttpUrlV1_(value, opts = {}) {
+  const checked = validateSafeSubpageFetchUrlV1_(value);
+  if (!checked.ok) return checked;
+  try {
+    const approved = await resolveValidatedSubpageAddressV1_(checked.url.hostname, opts);
+    return { ok: true, reason: null, url: checked.url, approved };
+  } catch (error) {
+    return { ok: false, reason: String(error && error.code || error && error.message || 'dns_validation_failed'), url: checked.url };
+  }
+}
+
+// Basic-auth runs retain their HTTPS/origin-scoped credential policy. Fixed
+// Google API clients are deliberately outside this public-site requester.
+async function fetchPublicSiteTextV1_(value, opts = {}, executionAuth = null) {
+  const preflight = await validateOutboundHttpUrlV1_(value, opts);
+  if (!preflight.ok) {
+    const error = new Error(preflight.reason || 'outbound_url_rejected');
+    error.code = 'SSRF_OUTBOUND_REJECTED';
+    throw error;
+  }
+  if (executionAuth) {
+    return fetchValidatedTextResponseV1_(preflight.url, Object.assign({}, opts, {
+      rejectHttpsDowngrade: true,
+      headersForUrl: target => authHeadersForUrl_(target, executionAuth)
+    }));
+  }
+  return fetchValidatedTextResponseV1_(preflight.url, opts);
+}
+
+function awaitAbortableFixtureTransportV1_(promise, signal) {
+  if (!signal || typeof signal.addEventListener !== 'function') return Promise.resolve(promise);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+      fn(value);
+    };
+    const onAbort = () => {
+      const error = new Error('request_aborted');
+      error.name = 'AbortError';
+      finish(reject, error);
+    };
+    if (signal.aborted) return onAbort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(value => finish(resolve, value), error => finish(reject, error));
+  });
+}
+
 async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
   const timeoutMs = Math.max(0, Number(opts && opts.timeoutMs || 0));
   const controller = timeoutMs > 0 && typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -5530,10 +5635,10 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
         if (typeof opts.fetchImpl === 'function') {
           // Test-only transport seam: production always uses the validated
           // Node socket path above. URL validation still runs before this seam.
-          response = await opts.fetchImpl(currentUrl.toString(), {
+          response = await awaitAbortableFixtureTransportV1_(opts.fetchImpl(currentUrl.toString(), {
             method: 'GET', redirect: 'manual', headers: { 'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8' },
             signal: activeSignal
-          });
+          }), activeSignal);
         } else {
           response = await requestValidatedSubpageHtmlV1_(currentUrl, {
             signal: activeSignal,
@@ -7138,13 +7243,14 @@ async function fetchDiscoverSubpageText(url, timeoutMs = 8000, executionAuth = n
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    const response = await fetchWithExecutionAuth_(url, {
+    const response = await fetchPublicSiteTextV1_(url, {
       method: 'GET',
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'application/xml,text/xml,text/html,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
+      },
+      maxBytes: 2 * 1024 * 1024
     }, executionAuth);
     const status = response && typeof response.status === 'number' ? response.status : null;
     if (!response || !response.ok) return { ok: false, status, text: '', finalUrl: response && response.url || url };
@@ -15135,9 +15241,9 @@ async function fetchNewsIndexFreshnessSignalsLight_(url, opts = {}) {
   try {
     const initialUrl = new URL(String(url || ''));
     if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) return null;
-    const response = await fetch(url, {
+    const response = await fetchPublicSiteTextV1_(url, {
       method: 'GET',
-      redirect: 'follow',
+      maxBytes: 2 * 1024 * 1024,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -15531,7 +15637,7 @@ async function collectAiPolicyTrustSignalV1_(pageUrl, timeoutMs = 1500, executio
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
-      const response = await fetchWithExecutionAuth_(url, {
+      const response = await fetchPublicSiteTextV1_(url, {
         method: 'GET',
         signal: controller ? controller.signal : undefined,
         headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
@@ -15662,7 +15768,7 @@ async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 15
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
-      const response = await fetchWithExecutionAuth_(url, { method:'GET', signal:controller ? controller.signal : undefined, headers:{ Accept:'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', 'User-Agent':'geo-unified-observer-html-sitemap/1.0' } }, executionAuth);
+      const response = await fetchPublicSiteTextV1_(url, { method:'GET', signal:controller ? controller.signal : undefined, maxBytes:500000, headers:{ Accept:'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', 'User-Agent':'geo-unified-observer-html-sitemap/1.0' } }, executionAuth);
       const status = response && typeof response.status === 'number' ? response.status : null;
       const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
       const text = response && response.ok ? String(await response.text() || '').slice(0, 500000) : '';
@@ -19408,13 +19514,14 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
     if (parentSignal && typeof parentSignal.addEventListener === 'function') parentSignal.addEventListener('abort', abortFromParent, { once: true });
     timeoutId = controller ? setTimeout(() => { try { controller.abort(); } catch (_) {} }, timeoutMs) : null;
     let response = null;
-    response = await fetchWithExecutionAuth_(url, {
+    response = await fetchPublicSiteTextV1_(url, {
       method: 'GET',
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
+      },
+      maxBytes: 2 * 1024 * 1024
     }, opts.executionAuth || null);
     result.status = response && typeof response.status === 'number' ? response.status : null;
     result.finalUrl = response && response.url ? response.url : String(url || '');
@@ -21342,6 +21449,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   logSfMemory('scrape_enter');
 
   if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
+  const targetPreflight = await validateOutboundHttpUrlV1_(urlToFetch);
+  if (!targetPreflight.ok) {
+    return res.status(400).json({ error: 'URL is not eligible for server-side observation.', code: targetPreflight.reason || 'SSRF_OUTBOUND_REJECTED' });
+  }
 
   // --- CACHE CHECK (early return) ---
   try {
@@ -21852,10 +21963,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
           const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
           try {
-            const response = await fetch(targetUrl, {
+            const response = await fetchPublicSiteTextV1_(targetUrl, {
               method: 'GET',
-              redirect: 'follow',
               signal: controller ? controller.signal : undefined,
+              maxBytes: 120000,
               headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
             });
             const status = response && typeof response.status === 'number' ? response.status : null;
@@ -28890,6 +29001,9 @@ module.exports.__lightBudgetTestHooks = {
   validateSafeSubpageFetchUrlV1_,
   resolveValidatedSubpageAddressV1_,
   requestValidatedSubpageHtmlV1_,
+  fetchValidatedTextResponseV1_,
+  fetchPublicSiteTextV1_,
+  validateOutboundHttpUrlV1_,
   fetchSubpageHtmlLightOnce_,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,
