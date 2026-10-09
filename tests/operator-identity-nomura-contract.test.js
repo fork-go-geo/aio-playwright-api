@@ -64,9 +64,10 @@ assert.strictEqual(partialCover.signalState, 'true');
 assert.strictEqual(partialCover.strongEvidenceCount, 2);
 assert.strictEqual(Object.prototype.hasOwnProperty.call(partialCover, 'companyName'), false);
 
-// F: The existing non-applicable mode contract remains fail-closed.
+// F: Facilities are eligible for the same bounded probe, but an empty probe
+// remains unknown rather than becoming a positive identity record.
 const shopCover = hooks.buildOperatorIdentityObservationV1_(null, {}, { siteMode: 'shop_facility', candidates: [], discoveryComplete: true });
-assert.strictEqual(shopCover.applicability, 'not_applicable');
+assert.strictEqual(shopCover.applicability, 'applicable');
 assert.strictEqual(shopCover.signalState, 'unknown');
 
 // Discovery: a sitemap-only company detail inherits a label only from an

@@ -43,7 +43,9 @@ const selected = selectExternalOperatorRootCompanyProfileDetailLink_(
 assert.strictEqual(selected.url, links[0].url);
 const detail = extractOperatorIdentityInfoFromHtml_(profileHtml, selected.url, { highConfidenceCompanyProfile: true });
 assert.strictEqual(detail.hasOperatorInfo, true);
-const record = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(detail, 'company_profile'), externalRootCandidate);
+const record = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(detail, 'company_profile', {
+  relationEvidence: hooks.buildExplicitOperatorIdentityRelationEvidenceV1_(externalRootCandidate)
+}), externalRootCandidate);
 assert.strictEqual(record.hasOperatorInfo, true);
 assert.strictEqual(record.authority, 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1');
 
