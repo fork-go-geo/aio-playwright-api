@@ -5513,6 +5513,47 @@ async function validateOutboundHttpUrlV1_(value, opts = {}) {
   }
 }
 
+// Chromium may already have connected when a redirect completes.  This guard
+// is therefore a quarantine boundary, not a network egress control: it stops
+// the resulting document, observations, and payload from being returned or
+// cached when the main navigation ended at a URL the Node public-site policy
+// would reject.
+const UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_ = 'UNSAFE_NAVIGATION_QUARANTINED';
+
+function createUnsafeNavigationQuarantineErrorV1_() {
+  const error = new Error(UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_);
+  error.code = UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_;
+  return error;
+}
+
+async function assertSafeMainNavigationV1_(page, response, opts = {}) {
+  const candidates = [];
+  try {
+    const responseUrl = response && typeof response.url === 'function' ? String(response.url() || '') : '';
+    if (responseUrl) candidates.push(responseUrl);
+  } catch (_) {}
+  try {
+    const pageUrl = page && typeof page.url === 'function' ? String(page.url() || '') : '';
+    if (pageUrl) candidates.push(pageUrl);
+  } catch (_) {}
+
+  const uniqueCandidates = Array.from(new Set(candidates));
+  if (!uniqueCandidates.length) throw createUnsafeNavigationQuarantineErrorV1_();
+  for (const candidate of uniqueCandidates) {
+    const checked = await validateOutboundHttpUrlV1_(candidate, opts);
+    if (!checked || checked.ok !== true) throw createUnsafeNavigationQuarantineErrorV1_();
+  }
+  return true;
+}
+
+function sendUnsafeNavigationQuarantineV1_(res) {
+  return res.status(422).json({
+    ok: false,
+    error: 'unsafe_navigation_quarantined',
+    code: UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_
+  });
+}
+
 // Basic-auth runs retain their HTTPS/origin-scoped credential policy. Fixed
 // Google API clients are deliberately outside this public-site requester.
 async function fetchPublicSiteTextV1_(value, opts = {}, executionAuth = null) {
@@ -21758,6 +21799,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       } catch (e) {
         errorMessage = String(e && (e.message || e) || '').slice(0, 240);
       }
+      // Probe mode also reads the main document. Keep its response path behind
+      // the same quarantine boundary as the ordinary main navigation.
+      if (!errorMessage) await assertSafeMainNavigationV1_(page, resp);
       const gotoMs = Math.max(0, Date.now() - gotoStart);
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
       const pageSignals = await page.evaluate(() => {
@@ -22077,6 +22121,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         };
       }, 13000);
       gotoPhase = phases[phases.length - 1];
+      // runPhase records ordinary navigation failures for the probe response,
+      // but an unsafe final document must never be sampled by the recovery or
+      // DOM probe paths below.
+      await assertSafeMainNavigationV1_(page, resp);
       finalUrl = page && typeof page.url === 'function' ? page.url() : finalUrl;
       status = resp && typeof resp.status === 'function' ? resp.status() : status;
       if (unifiedBalancedObserverProbe && gotoPhase && (!gotoPhase.ok || (gotoPhase.minimalResult && gotoPhase.minimalResult.gotoPartial))) {
@@ -24418,6 +24466,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
       if (authenticatedRun) assertAuthenticatedFinalOrigin_(page && typeof page.url === 'function' ? page.url() : urlToFetch, executionAuth);
       if (authenticatedRun && resp && typeof resp.status === 'function' && [401, 403].includes(resp.status())) throw authError_('AUTH_FAILED');
+      await assertSafeMainNavigationV1_(page, resp);
       if (signalsFirstLight) {
         markLightMainFrameGotoTrace_(lightBudget, page, {
           gotoOutcome: 'success',
@@ -28526,6 +28575,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   return res.status(200).json(out);
 
   } catch (err) {
+    if (err && err.code === UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_ && !res.headersSent) {
+      return sendUnsafeNavigationQuarantineV1_(res);
+    }
     // Authenticated runs must never enter generic error logging, fallback, or
     // response paths. Keep the full error/request context execution-local.
     if (authenticatedRun && !res.headersSent) {
@@ -29004,6 +29056,9 @@ module.exports.__lightBudgetTestHooks = {
   fetchValidatedTextResponseV1_,
   fetchPublicSiteTextV1_,
   validateOutboundHttpUrlV1_,
+  UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_,
+  assertSafeMainNavigationV1_,
+  sendUnsafeNavigationQuarantineV1_,
   fetchSubpageHtmlLightOnce_,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,
