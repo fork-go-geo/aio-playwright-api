@@ -3491,10 +3491,14 @@ function createOperatorIdentityCandidateAuditKeyerV1_(secret) {
 }
 
 function operatorIdentityRelationAuditV1_(candidate, candidateKey, opts = {}) {
-  const sameOrigin = !!(candidate && candidate.officialSameOriginOperatorProfile === true &&
+  const providedEvidence = opts && opts.relationEvidence && typeof opts.relationEvidence === 'object'
+    ? opts.relationEvidence : null;
+  const directSameOrigin = !!(candidate && candidate.officialSameOriginOperatorProfile === true &&
     candidate.operatorRelationSource === 'explicit_body_company_profile_relation');
-  const external = !!(candidate && candidate.officialExternalOperatorProfile === true &&
+  const directExternal = !!(candidate && candidate.officialExternalOperatorProfile === true &&
     ['explicit_body_operator_relation', 'nav', 'footer'].includes(String(candidate.operatorRelationSource || '')));
+  const sameOrigin = directSameOrigin || !!(providedEvidence && providedEvidence.kind === 'explicit_same_origin_company_profile_relation');
+  const external = directExternal || !!(providedEvidence && providedEvidence.kind === 'explicit_external_operator_relation');
   const relationKind = sameOrigin ? 'explicit_same_origin_company_profile_relation'
     : (external ? 'explicit_external_operator_relation' : null);
   const label = normalizeSubpageJsonLdText(candidate && (candidate.operatorRelationLabel || candidate.operatorRelationAnchorLabel || candidate.label) || '');
@@ -3514,7 +3518,7 @@ function operatorIdentityRelationAuditV1_(candidate, candidateKey, opts = {}) {
       else if (external && source.origin === target.origin) reason = 'external_relation_origin_not_distinct';
     } catch (_) { reason = 'relation_url_invalid'; }
   }
-  const evidence = reason ? null : buildExplicitOperatorIdentityRelationEvidenceV1_(candidate);
+  const evidence = reason ? null : (providedEvidence || buildExplicitOperatorIdentityRelationEvidenceV1_(candidate));
   if (!reason && !evidence) reason = 'relation_evidence_unavailable';
   const selectedRole = opts.selectedForProbe === true ? 'primary'
     : (opts.selectedForFallback === true ? 'fallback' : 'not_selected');
@@ -3522,7 +3526,7 @@ function operatorIdentityRelationAuditV1_(candidate, candidateKey, opts = {}) {
     candidateKey,
     sameOrigin: relationKind ? sameOrigin : null,
     relationKind,
-    relationSourceType: relationKind ? String(candidate.operatorRelationSource || '') : null,
+    relationSourceType: relationKind ? String((evidence && evidence.relationSource) || candidate.operatorRelationSource || '') : null,
     relationEvidenceEligible: !!evidence,
     relationEvidenceReason: evidence ? 'ready' : reason,
     priorityLane: opts.priorityLane === true,
@@ -3572,7 +3576,9 @@ function normalizeOperatorIdentityDebugUrlProjectionV1_(value) {
 function buildOperatorIdentityProbeAuditContextV1_(candidate, sourceType, page, rawIdentity, normalizedIdentity, opts = {}) {
   const fetchResult = page && page.ok === true ? 'fetched' : 'fetch_failed';
   const errorCode = fetchResult === 'fetched' ? null : normalizeOperatorIdentityProbeErrorCodeV1_(page);
-  const relation = operatorIdentityRelationAuditV1_(candidate, null);
+  const relation = operatorIdentityRelationAuditV1_(candidate, null, {
+    relationEvidence: normalizedIdentity && normalizedIdentity.identityEvidenceV1
+  });
   let formalizationReason = null;
   if (fetchResult !== 'fetched') formalizationReason = errorCode || 'fetch_failed';
   else if (!rawIdentity) formalizationReason = 'identity_record_missing';
@@ -3607,6 +3613,7 @@ function buildOperatorIdentityProbeAuditContextV1_(candidate, sourceType, page, 
     fetchResult,
     errorCode,
     redirect,
+    relationEvidence: normalizedIdentity && normalizedIdentity.identityEvidenceV1 || null,
     formalRecordGenerated: !!normalizedIdentity,
     formalizationReason
   };
@@ -3695,10 +3702,16 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
     if (!context || !context.candidate) return null;
     const contextCandidateKey = candidateKey(String(context.candidate.url || ''));
     const item = entryByKey.get(contextCandidateKey);
-    const relation = item && item.relation ? item.relation : operatorIdentityRelationAuditV1_(context.candidate, candidateKey(String(context.candidate.url || '')), {
+    const relation = context.relationEvidence
+      ? operatorIdentityRelationAuditV1_(context.candidate, candidateKey(String(context.candidate.url || '')), {
+        relationEvidence: context.relationEvidence,
+        selectedForProbe: role === 'primary', selectedForFallback: role === 'fallback',
+        priorityLane: priorityLaneUrls.has(String(context.candidate.url || ''))
+      })
+      : (item && item.relation ? item.relation : operatorIdentityRelationAuditV1_(context.candidate, candidateKey(String(context.candidate.url || '')), {
       selectedForProbe: role === 'primary', selectedForFallback: role === 'fallback',
       priorityLane: priorityLaneUrls.has(String(context.candidate.url || ''))
-    });
+      }));
     const linkage = {
       role,
       candidateKey: relation.candidateKey,
@@ -5354,10 +5367,13 @@ async function resolveValidatedSubpageAddressV1_(hostname, opts = {}) {
     return { address: normalizedHost, family: net.isIP(normalizedHost) };
   }
   const records = await dnsLookupAllV1_(normalizedHost, opts.dnsLookup);
-  const approved = records.find(record => record && !isBlockedSubpageIpAddressV1_(record.address));
-  if (!approved) {
-    const error = new Error('dns_no_public_address'); error.code = 'SSRF_DNS_NO_PUBLIC_ADDRESS'; throw error;
+  // Do not silently select one public answer when the same name also returns
+  // a private address. A mixed answer is unsafe for server-side fetches and
+  // is a practical DNS-rebinding signal.
+  if (!records.length || records.some(record => !record || isBlockedSubpageIpAddressV1_(record.address))) {
+    const error = new Error('dns_private_or_invalid_address'); error.code = 'SSRF_DNS_PRIVATE_OR_INVALID_ADDRESS'; throw error;
   }
+  const approved = records[0];
   return { address: normalizeComparableIpAddressV1_(approved.address), family: Number(approved.family) || net.isIP(approved.address) };
 }
 
@@ -5447,6 +5463,149 @@ async function requestValidatedSubpageHtmlV1_(target, opts = {}) {
   });
 }
 
+// Shared safe text transport for non-rendered public-site observations. It
+// keeps the existing socket pinning and peer check; redirects are checked one
+// hop at a time before the next connection is opened.
+async function fetchValidatedTextResponseV1_(value, opts = {}) {
+  const initial = validateSafeSubpageFetchUrlV1_(value);
+  if (!initial.ok) {
+    const error = new Error(initial.reason); error.code = 'SSRF_URL_REJECTED'; throw error;
+  }
+  const maxRedirects = Math.max(0, Math.min(5, Number(opts.maxRedirects == null ? 3 : opts.maxRedirects)));
+  const maxBytes = Math.max(1, Math.min(2 * 1024 * 1024, Number(opts.maxBytes || 512 * 1024)));
+  const initialOrigin = initial.url.origin;
+  let current = initial.url;
+  for (let hop = 0; hop <= maxRedirects; hop += 1) {
+    const checked = validateSafeSubpageFetchUrlV1_(current);
+    if (!checked.ok) {
+      const error = new Error(checked.reason); error.code = 'SSRF_URL_REJECTED'; throw error;
+    }
+    const response = await requestValidatedSubpageHtmlV1_(checked.url, {
+      signal: opts.signal,
+      dnsLookup: opts.dnsLookup,
+      maxBytes,
+      headers: Object.assign({}, opts.headers || {}, typeof opts.headersForUrl === 'function' ? opts.headersForUrl(checked.url) : {})
+    });
+    const status = Number(response && response.status || 0);
+    const location = responseHeaderValueV1_(response && response.headers, 'location');
+    if (![301, 302, 303, 307, 308].includes(status)) {
+      return {
+        status,
+        ok: status >= 200 && status < 300,
+        url: checked.url.toString(),
+        redirected: hop > 0,
+        headers: { get: name => responseHeaderValueV1_(response.headers, name) },
+        text: async () => String(response.text || '')
+      };
+    }
+    if (!location || hop === maxRedirects) {
+      const error = new Error('redirect_limit_or_location_missing'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    let next;
+    try { next = new URL(location, checked.url); } catch (_) {
+      const error = new Error('redirect_location_invalid'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    const nextCheck = validateSafeSubpageFetchUrlV1_(next);
+    if (!nextCheck.ok || (opts.sameOrigin === true && nextCheck.url.origin !== initialOrigin) ||
+        (opts.rejectHttpsDowngrade === true && checked.url.protocol === 'https:' && nextCheck.url.protocol !== 'https:')) {
+      const error = new Error('redirect_target_rejected'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    current = nextCheck.url;
+  }
+  throw new Error('redirect_limit');
+}
+
+async function validateOutboundHttpUrlV1_(value, opts = {}) {
+  const checked = validateSafeSubpageFetchUrlV1_(value);
+  if (!checked.ok) return checked;
+  try {
+    const approved = await resolveValidatedSubpageAddressV1_(checked.url.hostname, opts);
+    return { ok: true, reason: null, url: checked.url, approved };
+  } catch (error) {
+    return { ok: false, reason: String(error && error.code || error && error.message || 'dns_validation_failed'), url: checked.url };
+  }
+}
+
+// Chromium may already have connected when a redirect completes.  This guard
+// is therefore a quarantine boundary, not a network egress control: it stops
+// the resulting document, observations, and payload from being returned or
+// cached when the main navigation ended at a URL the Node public-site policy
+// would reject.
+const UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_ = 'UNSAFE_NAVIGATION_QUARANTINED';
+
+function createUnsafeNavigationQuarantineErrorV1_() {
+  const error = new Error(UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_);
+  error.code = UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_;
+  return error;
+}
+
+async function assertSafeMainNavigationV1_(page, response, opts = {}) {
+  const candidates = [];
+  try {
+    const responseUrl = response && typeof response.url === 'function' ? String(response.url() || '') : '';
+    if (responseUrl) candidates.push(responseUrl);
+  } catch (_) {}
+  try {
+    const pageUrl = page && typeof page.url === 'function' ? String(page.url() || '') : '';
+    if (pageUrl) candidates.push(pageUrl);
+  } catch (_) {}
+
+  const uniqueCandidates = Array.from(new Set(candidates));
+  if (!uniqueCandidates.length) throw createUnsafeNavigationQuarantineErrorV1_();
+  for (const candidate of uniqueCandidates) {
+    const checked = await validateOutboundHttpUrlV1_(candidate, opts);
+    if (!checked || checked.ok !== true) throw createUnsafeNavigationQuarantineErrorV1_();
+  }
+  return true;
+}
+
+function sendUnsafeNavigationQuarantineV1_(res) {
+  return res.status(422).json({
+    ok: false,
+    error: 'unsafe_navigation_quarantined',
+    code: UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_
+  });
+}
+
+// Basic-auth runs retain their HTTPS/origin-scoped credential policy. Fixed
+// Google API clients are deliberately outside this public-site requester.
+async function fetchPublicSiteTextV1_(value, opts = {}, executionAuth = null) {
+  const preflight = await validateOutboundHttpUrlV1_(value, opts);
+  if (!preflight.ok) {
+    const error = new Error(preflight.reason || 'outbound_url_rejected');
+    error.code = 'SSRF_OUTBOUND_REJECTED';
+    throw error;
+  }
+  if (executionAuth) {
+    return fetchValidatedTextResponseV1_(preflight.url, Object.assign({}, opts, {
+      rejectHttpsDowngrade: true,
+      headersForUrl: target => authHeadersForUrl_(target, executionAuth)
+    }));
+  }
+  return fetchValidatedTextResponseV1_(preflight.url, opts);
+}
+
+function awaitAbortableFixtureTransportV1_(promise, signal) {
+  if (!signal || typeof signal.addEventListener !== 'function') return Promise.resolve(promise);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+      fn(value);
+    };
+    const onAbort = () => {
+      const error = new Error('request_aborted');
+      error.name = 'AbortError';
+      finish(reject, error);
+    };
+    if (signal.aborted) return onAbort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(value => finish(resolve, value), error => finish(reject, error));
+  });
+}
+
 async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
   const timeoutMs = Math.max(0, Number(opts && opts.timeoutMs || 0));
   const controller = timeoutMs > 0 && typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -5530,10 +5689,10 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
         if (typeof opts.fetchImpl === 'function') {
           // Test-only transport seam: production always uses the validated
           // Node socket path above. URL validation still runs before this seam.
-          response = await opts.fetchImpl(currentUrl.toString(), {
+          response = await awaitAbortableFixtureTransportV1_(opts.fetchImpl(currentUrl.toString(), {
             method: 'GET', redirect: 'manual', headers: { 'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8' },
             signal: activeSignal
-          });
+          }), activeSignal);
         } else {
           response = await requestValidatedSubpageHtmlV1_(currentUrl, {
             signal: activeSignal,
@@ -6468,6 +6627,24 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   const url = normalizeDiscoverSubpageUrl(rawHref, origin, { allowCategory: source === 'ecGeneralLink' });
   if (!url) return false;
   const key = discoverSubpageCandidateKey(url);
+  const navigationWitness = (source === 'nav' || source === 'footer') && rawUrl && typeof rawUrl === 'object'
+    ? {
+      source,
+      label: label.slice(0, 120),
+      navigationScope: rawUrl.navigationScope === true,
+      footerScope: rawUrl.footerScope === true
+    }
+    : null;
+  const addWitness = item => {
+    if (!navigationWitness) return;
+    const witnesses = Array.isArray(item.operatorIdentityNavigationWitnesses)
+      ? item.operatorIdentityNavigationWitnesses : (item.operatorIdentityNavigationWitnesses = []);
+    const witnessKey = [navigationWitness.source, navigationWitness.label,
+      navigationWitness.navigationScope ? 'nav' : '', navigationWitness.footerScope ? 'footer' : ''].join('\n');
+    if (!witnesses.some(value => [value.source, value.label, value.navigationScope ? 'nav' : '', value.footerScope ? 'footer' : ''].join('\n') === witnessKey)) {
+      witnesses.push(navigationWitness);
+    }
+  };
   const sourcePriority = { genericRoute: 0, sitemap: 1, ecGeneralLink: 2, htmlSitemap: 3, footer: 4, nav: 5 };
   const existing = map.get(key);
   if (existing) {
@@ -6479,6 +6656,7 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
     }
     existing.score = scoreDiscoverSubpageCandidate(url, existing.source, existing.sources, existing.label || label);
     existing.reason = reasonDiscoverSubpageCandidate(url, existing.source, existing.sources);
+    addWitness(existing);
     if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
     return false;
   }
@@ -6489,8 +6667,10 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
     source,
     sources: [source],
     score: scoreDiscoverSubpageCandidate(url, source, [source], label),
-    reason: reasonDiscoverSubpageCandidate(url, source, [source]) || reason
+    reason: reasonDiscoverSubpageCandidate(url, source, [source]) || reason,
+    operatorRelationSourceOrigin: String(origin || '')
   };
+  addWitness(item);
   map.set(key, item);
   if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
   return true;
@@ -7138,13 +7318,14 @@ async function fetchDiscoverSubpageText(url, timeoutMs = 8000, executionAuth = n
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    const response = await fetchWithExecutionAuth_(url, {
+    const response = await fetchPublicSiteTextV1_(url, {
       method: 'GET',
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'application/xml,text/xml,text/html,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
+      },
+      maxBytes: 2 * 1024 * 1024
     }, executionAuth);
     const status = response && typeof response.status === 'number' ? response.status : null;
     if (!response || !response.ok) return { ok: false, status, text: '', finalUrl: response && response.url || url };
@@ -7266,7 +7447,12 @@ async function collectDiscoverLinksFromPage(page) {
       text: clean(a.innerText || a.textContent || ''),
       ariaLabel: clean(a.getAttribute && a.getAttribute('aria-label') || ''),
       title: clean(a.getAttribute && a.getAttribute('title') || ''),
-      groupHeading: groupHeadingFor(a)
+      groupHeading: groupHeadingFor(a),
+      // A footer may contain its own <nav>. Preserve both landmark facts so
+      // one anchor observed through overlapping selectors cannot impersonate
+      // independent navigation and footer corroboration.
+      navigationScope: !!a.closest('nav,[role="navigation"],header'),
+      footerScope: !!a.closest('footer,[role="contentinfo"]')
     });
     const allLinks = queryAllDeep('a[href]', { maxNodes: 500 }).map(linkFrom).filter(x => x.href);
     // Preserve a tiny, explicitly-labelled operator/company relation pool
@@ -7499,7 +7685,10 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
       source: item.source,
       sources: item.sources,
       score: item.score,
-      reason: item.reason
+      reason: item.reason,
+      operatorRelationSourceOrigin: item.operatorRelationSourceOrigin || String(origin || ''),
+      operatorIdentityNavigationWitnesses: Array.isArray(item.operatorIdentityNavigationWitnesses)
+        ? item.operatorIdentityNavigationWitnesses.map(witness => Object.assign({}, witness)) : []
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
   applyCompanyProfileHubCorroboration_(allCandidates);
@@ -11202,9 +11391,12 @@ function pickBestLegalOperatorInfo_(pages) {
 }
 
 function buildExplicitOperatorIdentityRelationEvidenceV1_(candidate) {
+  const opts = arguments.length > 1 && arguments[1] && typeof arguments[1] === 'object' ? arguments[1] : {};
   if (!candidate || typeof candidate !== 'object') return null;
-  const sameOrigin = candidate.officialSameOriginOperatorProfile === true &&
+  const directSameOrigin = candidate.officialSameOriginOperatorProfile === true &&
     candidate.operatorRelationSource === 'explicit_body_company_profile_relation';
+  const corporateSameOrigin = isCorroboratedCorporateSameOriginCompanyProfileRelationV1_(candidate, opts);
+  const sameOrigin = directSameOrigin || corporateSameOrigin;
   const external = candidate.officialExternalOperatorProfile === true &&
     ['explicit_body_operator_relation', 'nav', 'footer'].includes(String(candidate.operatorRelationSource || ''));
   if (!sameOrigin && !external) return null;
@@ -11225,10 +11417,61 @@ function buildExplicitOperatorIdentityRelationEvidenceV1_(candidate) {
     explicit: true,
     currentRun: true,
     relationLabel: label,
-    relationSource: String(candidate.operatorRelationSource || ''),
+    relationSource: corporateSameOrigin
+      ? 'nav_footer_corroborated_company_profile_relation'
+      : String(candidate.operatorRelationSource || ''),
     relationSourceOrigin: sourceOrigin,
     candidateSourceUrl: candidateUrl
   };
+}
+
+// A corporate site may identify itself through a same-origin company profile
+// linked from distinct global-navigation and footer regions. This is not a
+// generic same-origin-link rule: it is evaluated only after that exact page
+// has been fetched in the current run and yielded a conflict-free company
+// name in the company-profile scope.
+function isCorroboratedCorporateSameOriginCompanyProfileRelationV1_(candidate, opts = {}) {
+  if (!candidate || typeof candidate !== 'object') return false;
+  if (String(opts.siteMode || '').toLowerCase() !== 'corporate') return false;
+  if (candidate.officialExternalOperatorProfile === true || candidate.officialSameOriginOperatorProfile === true) return false;
+  if (candidate.operatorIdentityEntityConflict === true || candidate.operatorIdentityMixedEntity === true) return false;
+  if (opts.currentRunFetched !== true || opts.companyProfileScope !== true || opts.provenanceCandidateUrl !== String(candidate.url || '')) return false;
+  const identity = opts.observedIdentity && typeof opts.observedIdentity === 'object' ? opts.observedIdentity : null;
+  if (!identity || identity.observed !== true || identity.conflict === true ||
+      !normalizeSubpageJsonLdText(identity.companyName || identity.operatorName)) return false;
+  const candidateUrl = String(candidate.url || '').trim();
+  const sourceOrigin = String(candidate.operatorRelationSourceOrigin || '').trim();
+  try {
+    const source = new URL(sourceOrigin);
+    const target = new URL(candidateUrl);
+    const observed = new URL(String(identity.sourceUrl || ''));
+    if (source.protocol !== 'https:' || target.protocol !== 'https:' || observed.protocol !== 'https:') return false;
+    if (source.origin !== target.origin || target.origin !== observed.origin) return false;
+    if (discoverSubpageCandidateKey(observed.toString()) !== discoverSubpageCandidateKey(candidateUrl)) return false;
+  } catch (_) { return false; }
+  const witnesses = Array.isArray(candidate.operatorIdentityNavigationWitnesses)
+    ? candidate.operatorIdentityNavigationWitnesses : [];
+  const isCompanyWitness = witness => witness &&
+    // The destination path is only a routing hint. A human-facing link must
+    // itself state a company-profile context; otherwise any /company/* URL
+    // would become relation evidence through an unrelated nav/footer label.
+    isOrganizationInformationContext_('', String(witness.label || '')) &&
+    !/(?:加盟店|フランチャイズ|franchise|代理店|agency|dealer|\bfc|ＦＣ)/i.test(String(witness.label || ''));
+  const navWitness = witnesses.some(witness => isCompanyWitness(witness) && witness.source === 'nav' &&
+    witness.navigationScope === true && witness.footerScope !== true);
+  const footerWitness = witnesses.some(witness => isCompanyWitness(witness) && witness.source === 'footer' &&
+    witness.footerScope === true && witness.navigationScope !== true);
+  return navWitness && footerWitness;
+}
+
+function buildObservedCompanyProfileRelationEvidenceV1_(candidate, page, identity, siteMode) {
+  return buildExplicitOperatorIdentityRelationEvidenceV1_(candidate, {
+    siteMode,
+    currentRunFetched: !!(page && page.ok === true),
+    companyProfileScope: !!(identity && identity.scope === 'company_profile_page'),
+    observedIdentity: identity || null,
+    provenanceCandidateUrl: String(candidate && candidate.url || '')
+  });
 }
 
 function normalizeOperatorIdentityInfo_(info, sourceType, opts = {}) {
@@ -12539,7 +12782,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       operatorIdentityProbe.firstProbeFormalRecord = rawOperatorIdentity && rawOperatorIdentity.hasOperatorInfo === true;
       if (rawOperatorIdentity) {
       const normalizedOperatorIdentity = normalizeOperatorIdentityInfo_(rawOperatorIdentity, operatorProbeSourceType, {
-        relationEvidence: buildExplicitOperatorIdentityRelationEvidenceV1_(operatorCandidate)
+        relationEvidence: buildObservedCompanyProfileRelationEvidenceV1_(operatorCandidate, operatorPage, rawOperatorIdentity, siteMode)
       });
       operatorIdentityPrimaryProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
         operatorCandidate, operatorProbeSourceType, operatorPage, rawOperatorIdentity, normalizedOperatorIdentity, opts
@@ -12628,7 +12871,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             : fallbackPage.operatorIdentityInfo);
           if (rawOperatorIdentity) {
             const normalizedFallbackIdentity = normalizeOperatorIdentityInfo_(rawOperatorIdentity, fallbackSourceType, {
-              relationEvidence: buildExplicitOperatorIdentityRelationEvidenceV1_(fallbackCandidate)
+              relationEvidence: buildObservedCompanyProfileRelationEvidenceV1_(fallbackCandidate, fallbackPage, rawOperatorIdentity, siteMode)
             });
             operatorIdentityFallbackProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
               fallbackCandidate, fallbackSourceType, fallbackPage, rawOperatorIdentity, normalizedFallbackIdentity, opts
@@ -12712,7 +12955,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             return { identity, outcome: 'conflict' };
           }
           const normalized = identity && normalizeOperatorIdentityInfo_(identity, 'company_profile', {
-            relationEvidence: buildExplicitOperatorIdentityRelationEvidenceV1_(operatorCandidate)
+            relationEvidence: buildObservedCompanyProfileRelationEvidenceV1_(operatorCandidate, page, identity, siteMode)
           });
           if (normalized) {
             normalized.operatorIdentityFieldExtractionAuditV1 = identity.operatorIdentityFieldExtractionAuditV1 || null;
@@ -15135,9 +15378,9 @@ async function fetchNewsIndexFreshnessSignalsLight_(url, opts = {}) {
   try {
     const initialUrl = new URL(String(url || ''));
     if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) return null;
-    const response = await fetch(url, {
+    const response = await fetchPublicSiteTextV1_(url, {
       method: 'GET',
-      redirect: 'follow',
+      maxBytes: 2 * 1024 * 1024,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -15531,7 +15774,7 @@ async function collectAiPolicyTrustSignalV1_(pageUrl, timeoutMs = 1500, executio
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
-      const response = await fetchWithExecutionAuth_(url, {
+      const response = await fetchPublicSiteTextV1_(url, {
         method: 'GET',
         signal: controller ? controller.signal : undefined,
         headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
@@ -15662,7 +15905,7 @@ async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 15
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
-      const response = await fetchWithExecutionAuth_(url, { method:'GET', signal:controller ? controller.signal : undefined, headers:{ Accept:'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', 'User-Agent':'geo-unified-observer-html-sitemap/1.0' } }, executionAuth);
+      const response = await fetchPublicSiteTextV1_(url, { method:'GET', signal:controller ? controller.signal : undefined, maxBytes:500000, headers:{ Accept:'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', 'User-Agent':'geo-unified-observer-html-sitemap/1.0' } }, executionAuth);
       const status = response && typeof response.status === 'number' ? response.status : null;
       const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
       const text = response && response.ok ? String(await response.text() || '').slice(0, 500000) : '';
@@ -19408,13 +19651,14 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
     if (parentSignal && typeof parentSignal.addEventListener === 'function') parentSignal.addEventListener('abort', abortFromParent, { once: true });
     timeoutId = controller ? setTimeout(() => { try { controller.abort(); } catch (_) {} }, timeoutMs) : null;
     let response = null;
-    response = await fetchWithExecutionAuth_(url, {
+    response = await fetchPublicSiteTextV1_(url, {
       method: 'GET',
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
+      },
+      maxBytes: 2 * 1024 * 1024
     }, opts.executionAuth || null);
     result.status = response && typeof response.status === 'number' ? response.status : null;
     result.finalUrl = response && response.url ? response.url : String(url || '');
@@ -21342,6 +21586,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   logSfMemory('scrape_enter');
 
   if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
+  const targetPreflight = await validateOutboundHttpUrlV1_(urlToFetch);
+  if (!targetPreflight.ok) {
+    return res.status(400).json({ error: 'URL is not eligible for server-side observation.', code: targetPreflight.reason || 'SSRF_OUTBOUND_REJECTED' });
+  }
 
   // --- CACHE CHECK (early return) ---
   try {
@@ -21647,6 +21895,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       } catch (e) {
         errorMessage = String(e && (e.message || e) || '').slice(0, 240);
       }
+      // Probe mode also reads the main document. Keep its response path behind
+      // the same quarantine boundary as the ordinary main navigation.
+      if (!errorMessage) await assertSafeMainNavigationV1_(page, resp);
       const gotoMs = Math.max(0, Date.now() - gotoStart);
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
       const pageSignals = await page.evaluate(() => {
@@ -21852,10 +22103,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
           const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
           try {
-            const response = await fetch(targetUrl, {
+            const response = await fetchPublicSiteTextV1_(targetUrl, {
               method: 'GET',
-              redirect: 'follow',
               signal: controller ? controller.signal : undefined,
+              maxBytes: 120000,
               headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
             });
             const status = response && typeof response.status === 'number' ? response.status : null;
@@ -21966,6 +22217,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         };
       }, 13000);
       gotoPhase = phases[phases.length - 1];
+      // runPhase records ordinary navigation failures for the probe response,
+      // but an unsafe final document must never be sampled by the recovery or
+      // DOM probe paths below.
+      await assertSafeMainNavigationV1_(page, resp);
       finalUrl = page && typeof page.url === 'function' ? page.url() : finalUrl;
       status = resp && typeof resp.status === 'function' ? resp.status() : status;
       if (unifiedBalancedObserverProbe && gotoPhase && (!gotoPhase.ok || (gotoPhase.minimalResult && gotoPhase.minimalResult.gotoPartial))) {
@@ -24307,6 +24562,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
       if (authenticatedRun) assertAuthenticatedFinalOrigin_(page && typeof page.url === 'function' ? page.url() : urlToFetch, executionAuth);
       if (authenticatedRun && resp && typeof resp.status === 'function' && [401, 403].includes(resp.status())) throw authError_('AUTH_FAILED');
+      await assertSafeMainNavigationV1_(page, resp);
       if (signalsFirstLight) {
         markLightMainFrameGotoTrace_(lightBudget, page, {
           gotoOutcome: 'success',
@@ -28415,6 +28671,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   return res.status(200).json(out);
 
   } catch (err) {
+    if (err && err.code === UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_ && !res.headersSent) {
+      return sendUnsafeNavigationQuarantineV1_(res);
+    }
     // Authenticated runs must never enter generic error logging, fallback, or
     // response paths. Keep the full error/request context execution-local.
     if (authenticatedRun && !res.headersSent) {
@@ -28859,6 +29118,8 @@ module.exports.__lightBudgetTestHooks = {
   canAttemptOperatorIdentityFallbackV1_,
   retainSafeStaticFormalCoverageEvidence_,
   buildExplicitOperatorIdentityRelationEvidenceV1_,
+  isCorroboratedCorporateSameOriginCompanyProfileRelationV1_,
+  buildObservedCompanyProfileRelationEvidenceV1_,
   normalizeOperatorIdentityInfo_,
   isFormalOperatorIdentityRecord_,
   attachOperatorIdentityProbeProvenance_,
@@ -28890,6 +29151,12 @@ module.exports.__lightBudgetTestHooks = {
   validateSafeSubpageFetchUrlV1_,
   resolveValidatedSubpageAddressV1_,
   requestValidatedSubpageHtmlV1_,
+  fetchValidatedTextResponseV1_,
+  fetchPublicSiteTextV1_,
+  validateOutboundHttpUrlV1_,
+  UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_,
+  assertSafeMainNavigationV1_,
+  sendUnsafeNavigationQuarantineV1_,
   fetchSubpageHtmlLightOnce_,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,

@@ -92,7 +92,7 @@ const assertRejected = async (url, routes, needle, extra) => {
   };
   await assert.rejects(
     hooks.resolveValidatedSubpageAddressV1_('dns-private.fixture.invalid', { dnsLookup: privateDns('dns-private.fixture.invalid') }),
-    /dns_no_public_address/
+    /dns_private_or_invalid_address/
   );
   // A rebinding-style second resolution cannot reuse a formerly approved IP:
   // every new socket resolves through the validating lookup, and the second
@@ -105,7 +105,7 @@ const assertRejected = async (url, routes, needle, extra) => {
       : { address: '127.0.0.1', family: 4 }]);
   };
   assert.deepStrictEqual(await hooks.resolveValidatedSubpageAddressV1_('rebind.fixture.invalid', { dnsLookup: rebindLookup }), { address: '93.184.216.34', family: 4 });
-  await assert.rejects(hooks.resolveValidatedSubpageAddressV1_('rebind.fixture.invalid', { dnsLookup: rebindLookup }), /dns_no_public_address/);
+  await assert.rejects(hooks.resolveValidatedSubpageAddressV1_('rebind.fixture.invalid', { dnsLookup: rebindLookup }), /dns_private_or_invalid_address/);
 
   const tooLarge = '<html>' + 'x'.repeat(hooks.SUBPAGE_HTML_MAX_BYTES_V1_) + '</html>';
   await assertRejected('https://fixture.invalid/large', {
