@@ -391,7 +391,7 @@ async function collectEnrichedObservations(page, url) {
     const base = new URL(url).origin;
     const fetchTextWithPageRequest = async (targetUrl, timeoutMs = 1500) => {
       try {
-        const response = await page.request.get(targetUrl, {
+        const response = await safePageRequestGetV1_(page, targetUrl, {
           timeout: timeoutMs,
           headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
         });
@@ -1600,9 +1600,11 @@ async function buildSubPagesVNext_V1_(browserPage, origin, decision){
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo'
     });
+    await installPlaywrightSsrfUrlGuardV1_(subContext);
     subPage = await subContext.newPage();
     await subPage.setViewportSize({ width: 800, height: 600 }).catch(() => {});
     await subPage.route('**/*', route => {
+      if (shouldBlockBrowserRequestUrlV1_(route.request().url()).block) return route.abort('blockedbyclient');
       const type = route.request().resourceType();
       if (['image', 'font', 'media', 'stylesheet'].includes(type)) return route.abort();
       return route.continue();
@@ -2933,9 +2935,11 @@ async function playScrapeMinimal(url) {
     args: ['--no-sandbox','--disable-setuid-sandbox']
   });
   const page = await browser.newPage({ javaScriptEnabled: true });
+  await installPlaywrightSsrfUrlGuardV1_(page.context());
 
   // 画像・フォント・メディアはブロック（テキスト優先で高速化）
   await page.route('**/*', (route) => {
+    if (shouldBlockBrowserRequestUrlV1_(route.request().url()).block) return route.abort('blockedbyclient');
     const t = route.request().resourceType();
     if (['image','font','media'].includes(t)) return route.abort();
     return route.continue();
@@ -5526,6 +5530,76 @@ async function validateOutboundHttpUrlV1_(value, opts = {}) {
   }
 }
 
+// Keep Playwright's APIRequestContext for callers that intentionally share a
+// browser context's cookies or Basic-auth challenge state. Redirects are made
+// explicit so each target receives the same URL/DNS preflight. The request
+// transport cannot pin a peer address, so this supplements rather than
+// replaces the socket-pinned static requester.
+async function safePageRequestGetV1_(page, value, options = {}) {
+  if (!page || !page.request || typeof page.request.get !== 'function') {
+    const error = new Error('page_request_unavailable'); error.code = 'PAGE_REQUEST_UNAVAILABLE'; throw error;
+  }
+  const maxRedirects = Math.max(0, Math.min(5, Number(options.maxRedirects == null ? 5 : options.maxRedirects)));
+  const requestOptions = Object.assign({}, options);
+  delete requestOptions.dnsLookup;
+  let current = String(value || '');
+  for (let hop = 0; hop <= maxRedirects; hop += 1) {
+    const preflight = await validateOutboundHttpUrlV1_(current, { dnsLookup: options.dnsLookup });
+    if (!preflight.ok) {
+      const error = new Error(preflight.reason || 'outbound_url_rejected'); error.code = 'SSRF_OUTBOUND_REJECTED'; throw error;
+    }
+    const response = await page.request.get(preflight.url.toString(), Object.assign({}, requestOptions, { maxRedirects: 0 }));
+    const status = response && typeof response.status === 'function' ? Number(response.status()) : 0;
+    if (![301, 302, 303, 307, 308].includes(status)) return response;
+    const headers = response && typeof response.headers === 'function' ? response.headers() : {};
+    const location = responseHeaderValueV1_(headers, 'location');
+    if (!location || hop === maxRedirects) {
+      const error = new Error('redirect_limit_or_location_missing'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    let next;
+    try { next = new URL(location, preflight.url); } catch (_) {
+      const error = new Error('redirect_location_invalid'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    if (preflight.url.protocol === 'https:' && next.protocol !== 'https:') {
+      const error = new Error('redirect_https_downgrade'); error.code = 'SSRF_REDIRECT_REJECTED'; throw error;
+    }
+    current = next.toString();
+  }
+  throw new Error('redirect_limit');
+}
+
+// This browser route is a URL-policy boundary. It blocks literal and known
+// private targets before Chromium starts navigation, while the existing
+// post-navigation quarantine remains the DNS-rebinding safeguard.
+function shouldBlockBrowserRequestUrlV1_(value) {
+  let candidate = value;
+  try {
+    const parsed = new URL(String(value || ''));
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+    candidate = parsed.toString();
+  } catch (_) {}
+  const checked = validateSafeSubpageFetchUrlV1_(candidate);
+  return { block: !checked.ok, reason: checked.ok ? null : checked.reason };
+}
+
+async function installPlaywrightSsrfUrlGuardV1_(context) {
+  if (!context || typeof context.route !== 'function') return;
+  await context.route('**/*', async route => {
+    const decision = shouldBlockBrowserRequestUrlV1_(route.request().url());
+    if (decision.block) return route.abort('blockedbyclient');
+    if (typeof route.fallback === 'function') return route.fallback();
+    return route.continue();
+  });
+  if (typeof context.routeWebSocket === 'function') {
+    await context.routeWebSocket('**/*', async ws => {
+      const decision = shouldBlockBrowserRequestUrlV1_(ws.url());
+      if (decision.block) return ws.close();
+      return ws.connectToServer();
+    });
+  }
+}
+
 // Chromium may already have connected when a redirect completes.  This guard
 // is therefore a quarantine boundary, not a network egress control: it stops
 // the resulting document, observations, and payload from being returned or
@@ -7595,6 +7669,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     };
     if (opts.executionAuth) contextOptions.httpCredentials = { username:opts.executionAuth.username, password:opts.executionAuth.password, origin:opts.executionAuth.authOrigin };
     context = await browser.newContext(contextOptions);
+    await installPlaywrightSsrfUrlGuardV1_(context);
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -13441,6 +13516,7 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
         timezoneId: 'Asia/Tokyo',
         ignoreHTTPSErrors: true
       });
+      await installPlaywrightSsrfUrlGuardV1_(context);
       try {
         console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
           phase: 'observe_context_created',
@@ -13664,6 +13740,7 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       timezoneId: 'Asia/Tokyo',
       ignoreHTTPSErrors: true
     });
+    await installPlaywrightSsrfUrlGuardV1_(context);
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -15104,7 +15181,7 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
           out.skippedDueToBudget = true;
           break;
         }
-        const r = await page.request.get(scriptUrl, { timeout: requestTimeoutMs });
+        const r = await safePageRequestGetV1_(page, scriptUrl, { timeout: requestTimeoutMs });
         const headers = typeof r.headers === 'function' ? r.headers() : {};
         const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
         if (contentLength > MAX_BYTES_PER_SCRIPT) {
@@ -15441,6 +15518,7 @@ async function fetchNewsIndexFreshnessSignalsPlaywrightLight_(url, opts = {}) {
         timezoneId: 'Asia/Tokyo',
         ignoreHTTPSErrors: true
       });
+      await installPlaywrightSsrfUrlGuardV1_(context);
     }
     page = await context.newPage();
     const response = await page.goto(url, {
@@ -20600,7 +20678,7 @@ async function collectLightPostCoverageSupplementals_(page, finalUrl, options = 
       if (!origin) return buildLightSitemapDiscoveryUnavailable_('not_checked');
       const fetchTextWithPageRequest = async (targetUrl, requestTimeoutMs = timeoutMs) => {
         try {
-          const response = await page.request.get(targetUrl, {
+          const response = await safePageRequestGetV1_(page, targetUrl, {
             timeout: Math.max(1, Math.min(Number(requestTimeoutMs || timeoutMs), Number(timeoutMs || 1))),
             headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
           });
@@ -21810,6 +21888,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         })
       : await createContext();
     if (lightAttempt) lightAttempt.context = context;
+    await installPlaywrightSsrfUrlGuardV1_(context);
 
     const createPage = () => context.newPage();
     const pageCreateTimeoutMs = signalsFirstLight
@@ -21865,6 +21944,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         await page.route('**/*', async (route) => {
           try {
             const request = route.request();
+            if (shouldBlockBrowserRequestUrlV1_(request.url()).block) return route.abort('blockedbyclient').catch(() => {});
             const type = request.resourceType();
             const requestUrl = request.url();
             const shouldBlockType = ['image', 'font', 'media', 'stylesheet'].includes(type);
@@ -21977,6 +22057,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         await page.route('**/*', async (route) => {
           try {
             const request = route.request();
+            if (shouldBlockBrowserRequestUrlV1_(request.url()).block) return route.abort('blockedbyclient').catch(() => {});
             const type = request.resourceType();
             const requestUrl = request.url();
             const shouldBlockType = ['image', 'font', 'media', 'stylesheet'].includes(type);
@@ -25010,7 +25091,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           textSample: ''
         };
         try {
-          const r = await page.request.get(scriptUrl, { timeout: 10000 });
+          const r = await safePageRequestGetV1_(page, scriptUrl, { timeout: 10000 });
           const headers = typeof r.headers === 'function' ? r.headers() : {};
           const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
           if (contentLength > MAX_BYTES_PER_SCRIPT) {
@@ -26155,7 +26236,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             for (const u of probeJsonUrls) {
               resourceJsonSummary.attemptedCount += 1;
               try {
-                const r = await page.request.get(u, { timeout: 10000 });
+                const r = await safePageRequestGetV1_(page, u, { timeout: 10000 });
                 if (!r.ok()) continue;
                 const body = await r.text();
                 const len = String(body || '').length;
@@ -26320,7 +26401,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               jsFetchSummary.attemptedCount += 1;
               jsFetchSummary.stage = 'fetch_js_each';
               try {
-                const r = await page.request.get(u, { timeout: 10000 });
+                const r = await safePageRequestGetV1_(page, u, { timeout: 10000 });
                 row.status = typeof r.status === 'function' ? r.status() : null;
                 row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
                 row.ok = !!(r && typeof r.ok === 'function' && r.ok());
@@ -26419,7 +26500,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               jsScanSummary.attemptedCount += 1;
               jsScanSummary.stage = 'fetch_js_each';
               try {
-                const r = await page.request.get(u, { timeout: 10000 });
+                const r = await safePageRequestGetV1_(page, u, { timeout: 10000 });
                 row.status = typeof r.status === 'function' ? r.status() : null;
                 row.ok = !!(r && typeof r.ok === 'function' && r.ok());
                 const raw = await r.text();
@@ -26525,7 +26606,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               jsChunkSummary.stage = 'fetch_js_each';
               const eachStart = Date.now();
               try {
-                const r = await page.request.get(u, { timeout: 10000 });
+                const r = await safePageRequestGetV1_(page, u, { timeout: 10000 });
                 if (!r.ok()) continue;
                 const raw = await r.text();
                 const decoded = decodeUnicodeEscapes(raw);
@@ -26563,7 +26644,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               jsChunkSummary.stage = 'fetch_chunk_each';
               jsChunkSummary.attemptedChunkCount += 1;
               try {
-                const r = await page.request.get(u, { timeout: 15000 });
+                const r = await safePageRequestGetV1_(page, u, { timeout: 15000 });
                 row.status = typeof r.status === 'function' ? r.status() : null;
                 row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
                 row.ok = !!(r && typeof r.ok === 'function' && r.ok());
@@ -26686,7 +26767,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               subpagesSummary.stage = 'fetch_subpage_each';
               subpagesSummary.attemptedCount += 1;
               try {
-                const r = await page.request.get(u, { timeout: 15000 });
+                const r = await safePageRequestGetV1_(page, u, { timeout: 15000 });
                 row.status = typeof r.status === 'function' ? r.status() : null;
                 row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
                 row.ok = !!(r && typeof r.ok === 'function' && r.ok());
@@ -27126,11 +27207,11 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   let topHtml = '';
   let aboutHtml = '';
   try {
-    const r1 = await page.request.get(topUrl, { timeout: 20000 });
+    const r1 = await safePageRequestGetV1_(page, topUrl, { timeout: 20000 });
     if (r1.ok()) topHtml = await r1.text();
   } catch(_) {}
   try {
-    const r2 = await page.request.get(aboutUrl, { timeout: 20000 });
+    const r2 = await safePageRequestGetV1_(page, aboutUrl, { timeout: 20000 });
     if (r2.ok()) aboutHtml = await r2.text();
   } catch(_) {}
 
@@ -27217,7 +27298,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       } catch(_) {}
     }
     try {
-      const resp0 = await page.request.get(urlToFetch, { timeout: 20000 });
+      const resp0 = await safePageRequestGetV1_(page, urlToFetch, { timeout: 20000 });
       if (resp0.ok()) {
         const html0 = await resp0.text();
         const urlMatches0 = html0.match(/https?:\/\/[^\s"'<>]+/g) || [];
@@ -27310,7 +27391,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     logSfMemory('before_resource_json_tap');
     for (const u of jsonToTap) {
       try {
-        const resp = await page.request.get(u, { timeout: 10000 });
+        const resp = await safePageRequestGetV1_(page, u, { timeout: 10000 });
         if (!resp.ok()) continue;
         const body = await resp.text();
         if (!body) continue;
@@ -27363,7 +27444,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     logSfMemory('before_resource_js_tap');
     for (const u of jsToTap) {
       try {
-        const resp = await page.request.get(u, { timeout: 20_000 });
+        const resp = await safePageRequestGetV1_(page, u, { timeout: 20_000 });
         if (!resp.ok()) continue;
         const ct = (resp.headers()['content-type'] || '').toLowerCase();
         if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
@@ -27452,7 +27533,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       for (const u of Array.from(extraChunkUrls)) {
         if (count++ >= 8) break;
         try {
-          const resp = await page.request.get(u, { timeout: 15_000 });
+          const resp = await safePageRequestGetV1_(page, u, { timeout: 15_000 });
           if (!resp.ok()) continue;
           const ct = (resp.headers()['content-type'] || '').toLowerCase();
           if (!(ct.includes('javascript') || u.endsWith('.js'))) continue;
@@ -27986,7 +28067,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     if (origin) {
       const fetchTextWithPageRequest = async (targetUrl, timeoutMs = 1500) => {
         try {
-          const response = await page.request.get(targetUrl, {
+          const response = await safePageRequestGetV1_(page, targetUrl, {
             timeout: timeoutMs,
             headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
           });
@@ -29154,6 +29235,9 @@ module.exports.__lightBudgetTestHooks = {
   fetchValidatedTextResponseV1_,
   fetchPublicSiteTextV1_,
   validateOutboundHttpUrlV1_,
+  safePageRequestGetV1_,
+  shouldBlockBrowserRequestUrlV1_,
+  installPlaywrightSsrfUrlGuardV1_,
   UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_,
   assertSafeMainNavigationV1_,
   sendUnsafeNavigationQuarantineV1_,
