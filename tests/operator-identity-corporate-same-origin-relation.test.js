@@ -100,6 +100,54 @@ assert.equal(evidenceFor(candidate({
 }), identity()), null, 'one footer-contained navigation anchor is not independent corroboration');
 assert.equal(evidenceFor(candidate(), identity(), { siteMode: 'generic' }), null, 'corporate mode is required');
 
+// A bounded landing/hub may disclose exactly one explicit formal detail.  It
+// does not inherit nav/footer status: the current-run hub and detail must be
+// same-origin, and the detail must itself have a conflict-free company name.
+const detailUrl = `${entryOrigin}/company/profile.html`;
+const detailLink = { url: detailUrl, label: '会社概要', source: 'explicit_company_profile_link' };
+const hubDetailEvidence = hooks.buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
+  positiveCandidate,
+  { ok: true, finalUrl: companyUrl },
+  detailLink,
+  { ok: true, finalUrl: detailUrl },
+  identity({ sourceUrl: detailUrl }),
+  'corporate'
+);
+assert.ok(hubDetailEvidence, 'explicit current-run hub/detail chain is accepted');
+assert.equal(hubDetailEvidence.candidateSourceUrl, detailUrl);
+assert.equal(hubDetailEvidence.relationSource, 'nav_footer_corroborated_company_profile_hub_detail_relation');
+const hubDetailFormal = hooks.normalizeOperatorIdentityInfo_(identity({ sourceUrl: detailUrl }), 'company_profile', {
+  relationEvidence: hubDetailEvidence
+});
+const hubDetailRecord = hooks.attachOperatorIdentityProbeProvenance_(hubDetailFormal, positiveCandidate, {
+  candidateSourceUrl: hubDetailEvidence.candidateSourceUrl,
+  candidateSource: hubDetailEvidence.relationSource,
+  relationLabel: hubDetailEvidence.relationLabel,
+  relationSourceOrigin: hubDetailEvidence.relationSourceOrigin,
+  relation: hubDetailEvidence.relationSource
+});
+assert.equal(hubDetailRecord.provenance.candidateSourceUrl, detailUrl);
+assert.equal(hubDetailRecord.identityEvidenceV1.candidateSourceUrl, hubDetailRecord.provenance.candidateSourceUrl);
+assert.equal(hooks.buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
+  positiveCandidate, { ok: true, finalUrl: companyUrl },
+  Object.assign({}, detailLink, { source: 'body_link' }), { ok: true, finalUrl: detailUrl },
+  identity({ sourceUrl: detailUrl }), 'corporate'
+), null, 'unclassified detail links are not evidence');
+assert.equal(hooks.buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
+  positiveCandidate, { ok: true, finalUrl: companyUrl }, detailLink,
+  { ok: true, finalUrl: 'https://other.fixture.invalid/company/profile.html' },
+  identity({ sourceUrl: 'https://other.fixture.invalid/company/profile.html' }), 'corporate'
+), null, 'cross-origin detail is not evidence');
+assert.equal(hooks.buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
+  candidate({ operatorIdentityNavigationWitnesses: [{ source: 'nav', label: '会社概要', navigationScope: true, footerScope: false }] }),
+  { ok: true, finalUrl: companyUrl }, detailLink, { ok: true, finalUrl: detailUrl },
+  identity({ sourceUrl: detailUrl }), 'corporate'
+), null, 'hub/detail route still needs independent nav/footer evidence');
+assert.equal(hooks.buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
+  positiveCandidate, { ok: true, finalUrl: companyUrl }, detailLink, { ok: true, finalUrl: detailUrl },
+  identity({ sourceUrl: detailUrl, conflict: true }), 'corporate'
+), null, 'conflicted detail remains fail-closed');
+
 // Existing explicit paths remain unchanged.
 const existingSameOrigin = {
   url: `${entryOrigin}/company/`, label: '運営会社',
