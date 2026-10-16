@@ -3771,7 +3771,9 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
       .slice(0, 2).map(item => item.relation),
     probeLinkage: {
       primary: probeLinkage(opts.primaryProbeContext, 'primary'),
-      fallback: probeLinkage(opts.fallbackProbeContext, 'fallback')
+      fallback: probeLinkage(opts.fallbackProbeContext, 'fallback'),
+      hub: probeLinkage(opts.hubProbeContext, 'hub'),
+      detail: probeLinkage(opts.detailProbeContext, 'detail')
     },
     selection: {
       selectionStrategy: typeof opts.selectionStrategy === 'string' ? opts.selectionStrategy : null,
@@ -11549,6 +11551,48 @@ function buildObservedCompanyProfileRelationEvidenceV1_(candidate, page, identit
   });
 }
 
+// A corporate entry may link from independently rendered navigation and footer
+// to a company-information hub, which then exposes one explicit company-profile
+// detail link.  The detail is not treated as if it had appeared in navigation:
+// all three current-run hops must be observed and same-origin.  This keeps the
+// direct-relation contract intact while allowing a formal detail page to be
+// used for the already-bounded hub/detail traversal.
+function buildObservedCompanyProfileHubDetailRelationEvidenceV1_(hubCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode) {
+  if (String(siteMode || '').toLowerCase() !== 'corporate') return null;
+  if (!hubCandidate || !hubPage || hubPage.ok !== true || !detailLink || !detailPage || detailPage.ok !== true) return null;
+  if (!detailIdentity || detailIdentity.observed !== true || detailIdentity.conflict === true ||
+      !normalizeSubpageJsonLdText(detailIdentity.companyName || detailIdentity.operatorName)) return null;
+  if (detailIdentity.scope !== 'company_profile_page') return null;
+  if (String(detailLink.source || '') !== 'explicit_company_profile_link' ||
+      !isOrganizationInformationContext_(String(detailLink.url || ''), String(detailLink.label || ''))) return null;
+  const witnesses = Array.isArray(hubCandidate.operatorIdentityNavigationWitnesses) ? hubCandidate.operatorIdentityNavigationWitnesses : [];
+  const isCompanyWitness = witness => witness &&
+    isOrganizationInformationContext_('', String(witness.label || '')) &&
+    !/(?:加盟店|フランチャイズ|franchise|代理店|agency|dealer|\bfc|ＦＣ)/i.test(String(witness.label || ''));
+  const navWitness = witnesses.some(witness => isCompanyWitness(witness) && witness.source === 'nav' && witness.navigationScope === true && witness.footerScope !== true);
+  const footerWitness = witnesses.some(witness => isCompanyWitness(witness) && witness.source === 'footer' && witness.footerScope === true && witness.navigationScope !== true);
+  if (!navWitness || !footerWitness) return null;
+  try {
+    const entry = new URL(String(hubCandidate.operatorRelationSourceOrigin || ''));
+    const hub = new URL(String(hubPage.finalUrl || hubPage.url || hubCandidate.url || ''));
+    const detail = new URL(String(detailPage.finalUrl || detailPage.url || detailLink.url || ''));
+    const observed = new URL(String(detailIdentity.sourceUrl || ''));
+    if (entry.protocol !== 'https:' || hub.protocol !== 'https:' || detail.protocol !== 'https:' || observed.protocol !== 'https:') return null;
+    if (entry.origin !== hub.origin || hub.origin !== detail.origin || detail.origin !== observed.origin) return null;
+    if (discoverSubpageCandidateKey(detail.toString()) !== discoverSubpageCandidateKey(observed.toString())) return null;
+    return {
+      version: 'operator_identity_relation_evidence_v1',
+      kind: 'explicit_same_origin_company_profile_relation',
+      explicit: true,
+      currentRun: true,
+      relationLabel: normalizeSubpageJsonLdText(detailLink.label || '').slice(0, 160),
+      relationSource: 'nav_footer_corroborated_company_profile_hub_detail_relation',
+      relationSourceOrigin: entry.origin,
+      candidateSourceUrl: detail.toString()
+    };
+  } catch (_) { return null; }
+}
+
 function normalizeOperatorIdentityInfo_(info, sourceType, opts = {}) {
   if (!info || typeof info !== 'object') return null;
   const companyName = normalizeSubpageJsonLdText(info.companyName || info.operatorName).slice(0, 120);
@@ -11591,7 +11635,7 @@ function isFormalOperatorIdentityRecord_(info) {
   return !!(info && typeof info === 'object' && info.hasOperatorInfo === true);
 }
 
-function attachOperatorIdentityProbeProvenance_(identity, candidate) {
+function attachOperatorIdentityProbeProvenance_(identity, candidate, opts = {}) {
   if (!identity || typeof identity !== 'object') return identity;
   let redirectedExternal = false;
   try {
@@ -11599,19 +11643,25 @@ function attachOperatorIdentityProbeProvenance_(identity, candidate) {
       new URL(String(candidate.url || '')).origin !== new URL(String(identity.sourceUrl || '')).origin;
   } catch (_) {}
   const sourceType = candidate && candidate.operatorIdentityProbeSourceType === 'legal' ? 'legal' : 'company_profile';
-  const sourceUrl = String(candidate && candidate.url || identity.sourceUrl || '');
+  const relationEvidence = identity.identityEvidenceV1 && typeof identity.identityEvidenceV1 === 'object'
+    ? identity.identityEvidenceV1 : null;
+  // A formal detail reached through the bounded, explicit hub/detail route
+  // must retain that detail as its provenance target.  Direct candidates keep
+  // the historical candidate URL unchanged.
+  const sourceUrl = String(opts.candidateSourceUrl || relationEvidence && relationEvidence.candidateSourceUrl ||
+    candidate && candidate.url || identity.sourceUrl || '');
   const provenance = {
     source: sourceType === 'legal' ? 'bounded_legal_operator_probe' : 'bounded_company_profile_probe',
     scope: sourceType === 'legal' ? 'legal_operator_page' : 'company_profile_page',
     candidateSourceUrl: sourceUrl,
-    candidateSource: String(candidate && candidate.operatorRelationSource || candidate && candidate.source || ''),
-    relationLabel: String(candidate && candidate.operatorRelationLabel || candidate && candidate.label || ''),
-    relationSourceOrigin: String(candidate && candidate.operatorRelationSourceOrigin || ''),
-    relation: candidate && candidate.officialExternalOperatorProfile === true
+    candidateSource: String(opts.candidateSource || candidate && candidate.operatorRelationSource || candidate && candidate.source || ''),
+    relationLabel: String(opts.relationLabel || relationEvidence && relationEvidence.relationLabel || candidate && candidate.operatorRelationLabel || candidate && candidate.label || ''),
+    relationSourceOrigin: String(opts.relationSourceOrigin || relationEvidence && relationEvidence.relationSourceOrigin || candidate && candidate.operatorRelationSourceOrigin || ''),
+    relation: String(opts.relation || '') || (candidate && candidate.officialExternalOperatorProfile === true
       ? 'explicit_external_operator_profile_link'
       : (redirectedExternal
         ? 'explicit_same_origin_company_profile_https_redirect'
-        : (sourceType === 'legal' ? 'same_origin_legal_operator_candidate' : 'same_origin_company_profile_candidate'))
+        : (sourceType === 'legal' ? 'same_origin_legal_operator_candidate' : 'same_origin_company_profile_candidate')))
   };
   identity.authority = 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1';
   identity.provenance = provenance;
@@ -12783,6 +12833,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     let selectedOperatorIdentityFallbackCandidate = null;
     let operatorIdentityPrimaryProbeAuditContext = null;
     let operatorIdentityFallbackProbeAuditContext = null;
+    let operatorIdentityHubProbeAuditContext = null;
+    let operatorIdentityDetailProbeAuditContext = null;
     let operatorIdentityCandidateNoCandidateReason = null;
     const operatorSelectionPlan = discovered.operatorIdentitySelectionPlan &&
       discovered.operatorIdentitySelectionPlan.version === 'operator_identity_probe_selection_v1'
@@ -13015,7 +13067,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           });
           return result && Array.isArray(result.pages) ? result.pages[0] : null;
         };
-        const adoptCompanyProfileIdentity = (page, url, priorIdentity) => {
+        const adoptCompanyProfileIdentity = (page, url, priorIdentity, relationEvidence) => {
           const identity = page && page.operatorIdentityInfo;
           if (identity && operatorIdentityFieldsConflict_(priorIdentity, identity)) {
             operatorIdentityInfo = {
@@ -13027,17 +13079,23 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
               extractionMethod: 'html_text', evidenceLabels: [],
               provenance: { reason: 'company_profile_field_conflict' }
             };
-            return { identity, outcome: 'conflict' };
+            return { identity, normalized: null, outcome: 'conflict' };
           }
           const normalized = identity && normalizeOperatorIdentityInfo_(identity, 'company_profile', {
-            relationEvidence: buildObservedCompanyProfileRelationEvidenceV1_(operatorCandidate, page, identity, siteMode)
+            relationEvidence: relationEvidence || buildObservedCompanyProfileRelationEvidenceV1_(operatorCandidate, page, identity, siteMode)
           });
           if (normalized) {
             normalized.operatorIdentityFieldExtractionAuditV1 = identity.operatorIdentityFieldExtractionAuditV1 || null;
-            const formalRecord = attachOperatorIdentityProbeProvenance_(normalized, operatorCandidate);
+            const formalRecord = attachOperatorIdentityProbeProvenance_(normalized, operatorCandidate, {
+              candidateSourceUrl: normalized.identityEvidenceV1 && normalized.identityEvidenceV1.candidateSourceUrl,
+              candidateSource: normalized.identityEvidenceV1 && normalized.identityEvidenceV1.relationSource,
+              relationLabel: normalized.identityEvidenceV1 && normalized.identityEvidenceV1.relationLabel,
+              relationSourceOrigin: normalized.identityEvidenceV1 && normalized.identityEvidenceV1.relationSourceOrigin,
+              relation: normalized.identityEvidenceV1 && normalized.identityEvidenceV1.relationSource
+            });
             formalRecord.observationComplete = !!(page && page.ok === true);
             operatorIdentityInfo = formalRecord;
-            return { identity, outcome: 'complete' };
+            return { identity, normalized, outcome: 'complete' };
           }
           operatorIdentityInfo = identity ? {
             observed: identity.observed === true, observationComplete: !!(page && page.ok === true),
@@ -13053,7 +13111,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             operatorIdentityFieldExtractionAuditV1: identity.operatorIdentityFieldExtractionAuditV1 || null,
             provenance: { reason: 'required_fields_missing' }
           } : operatorIdentityInfo;
-          return { identity: identity || { observed: false, hasOperatorInfo: false, conflict: false }, outcome: 'incomplete' };
+          return { identity: identity || { observed: false, hasOperatorInfo: false, conflict: false }, normalized: null, outcome: 'incomplete' };
         };
         const landingFollowup = operatorIdentityProbe.fallbackProbeAttempted === true
           ? null
@@ -13073,6 +13131,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             operatorIdentityProbe.reason = String(hubPage && hubPage.error || 'hub_probe_fetch_failed');
           } else {
             const hubResult = adoptCompanyProfileIdentity(hubPage, hubLink.url, incompleteIdentity);
+            operatorIdentityHubProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+              operatorCandidate, 'company_profile', hubPage, hubResult.identity, hubResult.normalized, opts
+            );
             if (hubResult.outcome === 'complete') operatorIdentityProbe.reason = 'hub_probe_fetched';
             else if (hubResult.outcome === 'conflict') operatorIdentityProbe.reason = 'hub_probe_conflict';
             else {
@@ -13091,7 +13152,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
                 if (!detailPage || detailPage.ok !== true) {
                   operatorIdentityProbe.reason = String(detailPage && detailPage.error || 'detail_probe_fetch_failed');
                 } else {
-                  const detailResult = adoptCompanyProfileIdentity(detailPage, detailLink.url, hubResult.identity);
+                  const detailIdentity = detailPage.operatorIdentityInfo;
+                  const detailRelationEvidence = buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
+                    operatorCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode
+                  );
+                  const detailResult = adoptCompanyProfileIdentity(detailPage, detailLink.url, hubResult.identity, detailRelationEvidence);
+                  operatorIdentityDetailProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+                    operatorCandidate, 'company_profile', detailPage, detailResult.identity, detailResult.normalized, opts
+                  );
                   operatorIdentityProbe.reason = detailResult.outcome === 'complete' ? 'detail_probe_fetched'
                     : (detailResult.outcome === 'conflict' ? 'detail_probe_conflict' : 'detail_probe_incomplete');
                 }
@@ -13115,7 +13183,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           if (!detailPage || detailPage.ok !== true) {
             operatorIdentityProbe.reason = String(detailPage && detailPage.error || 'detail_probe_fetch_failed');
           } else {
-            const detailResult = adoptCompanyProfileIdentity(detailPage, directDetailLink.url, incompleteIdentity);
+            const detailIdentity = detailPage.operatorIdentityInfo;
+            const detailRelationEvidence = buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
+              operatorCandidate, operatorPage, directDetailLink, detailPage, detailIdentity, siteMode
+            );
+            const detailResult = adoptCompanyProfileIdentity(detailPage, directDetailLink.url, incompleteIdentity, detailRelationEvidence);
+            operatorIdentityDetailProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
+              operatorCandidate, 'company_profile', detailPage, detailResult.identity, detailResult.normalized, opts
+            );
             operatorIdentityProbe.reason = detailResult.outcome === 'complete' ? 'detail_probe_fetched'
               : (detailResult.outcome === 'conflict' ? 'detail_probe_conflict' : 'detail_probe_incomplete');
           }
@@ -13191,6 +13266,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         fallbackCandidate: selectedOperatorIdentityFallbackCandidate,
         primaryProbeContext: operatorIdentityPrimaryProbeAuditContext,
         fallbackProbeContext: operatorIdentityFallbackProbeAuditContext,
+        hubProbeContext: operatorIdentityHubProbeAuditContext,
+        detailProbeContext: operatorIdentityDetailProbeAuditContext,
         discoverLinkAudit: discovered.operatorIdentityDiscoverLinkAudit,
         producerReached: true,
         candidateCount: Array.isArray(discovered.operatorIdentityAuditCandidates) ? discovered.operatorIdentityAuditCandidates.length : 0,
@@ -16418,14 +16495,45 @@ function collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin) {
 }
 
 function buildHtmlSitemapCandidateDiscoveryV1_(entry, candidates) {
-  const complete = isCoverageObservationV2CompletePage_(entry) && entry && entry.sitemapLinkDiscoveryComplete === true;
+  const complete = isHtmlSitemapCandidateDiscoveryCompleteV1_(entry);
   return {
     checked: !!(entry && entry.checked), discoveryComplete: complete, discoveredCount: Array.isArray(candidates) ? candidates.length : 0,
     candidates: complete ? (Array.isArray(candidates) ? candidates.slice(0, COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : []) : [],
     completeness: complete ? 'complete' : ((entry && entry.checked) ? 'partial' : 'unavailable'),
     limited: !complete, scope: 'entry_rendered_document_and_open_shadow_links', authority: COVERAGE_OBSERVATION_V2_AUTHORITY_, fallbackApplied: false,
-    failureKind: complete ? null : (entry && entry.failureKind || 'render_incomplete')
+    failureKind: complete ? null : htmlSitemapCandidateDiscoveryFailureKindV1_(entry)
   };
+}
+
+// HTML sitemap discovery has a deliberately narrower scope than the generic
+// coverage producers: it scans the entry document plus reachable open shadow
+// roots, not arbitrary child-frame documents.  An embedded widget must not
+// make that finite link scan partial; a frameset or a sparse no-main envelope
+// still requires the child content scope and remains incomplete.
+function isCoverageObservationV2EntryContentShell_(entry) {
+  return !!(entry && entry.hasFrame === true && (entry.hasFrameset === true ||
+    (entry.mainContentObserved !== true && Number(entry.mainTextLength || 0) < 300)));
+}
+
+function isHtmlSitemapCandidateDiscoveryCompleteV1_(entry) {
+  return !!(entry && entry.checked === true && entry.renderComplete === true &&
+    !entry.failureKind && entry.sitemapLinkDiscoveryComplete === true &&
+    !isCoverageObservationV2EntryContentShell_(entry));
+}
+
+function htmlSitemapCandidateDiscoveryFailureKindV1_(entry) {
+  if (entry && entry.failureKind) return entry.failureKind;
+  if (isCoverageObservationV2EntryContentShell_(entry)) return 'frame_incomplete';
+  return 'render_incomplete';
+}
+
+// Candidate discovery only reads the rendered document and reachable open
+// shadow roots.  After `goto(..., { waitUntil: 'load' })`, both interactive
+// and complete are stable document states for that finite scan.  `loading`,
+// entry content shells, and explicit fetch/evaluation failures remain
+// incomplete.
+function isCoverageObservationV2StableDocumentState_(readyState) {
+  return readyState === 'interactive' || readyState === 'complete';
 }
 
 async function readCoverageObservationV2Page_(page) {
@@ -16471,7 +16579,7 @@ async function readCoverageObservationV2Page_(page) {
       const breadcrumb = !!document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="パンくず" i], [class*="breadcrumb" i], [id*="breadcrumb" i], ol.breadcrumb, ul.breadcrumb');
       const serviceNodes = Array.from(main.querySelectorAll('section, article, [class], [id], [aria-label]')).filter(el => /(?:service|product|solution|feature|pricing|サービス|製品|商品|機能|料金)/i.test(`${el.id || ''} ${el.className || ''} ${el.getAttribute('aria-label') || ''}`));
       const serviceText = clean(serviceNodes.map(el => el.innerText || '').join(' '));
-      return { readyState: document.readyState, hasFrame: !!document.querySelector('frame, frameset, iframe'), mainContentObserved: !!mainElement, mainTextLength: mainText.length,
+      return { readyState: document.readyState, hasFrame: !!document.querySelector('frame, frameset, iframe'), hasFrameset: !!document.querySelector('frameset'), mainContentObserved: !!mainElement, mainTextLength: mainText.length,
         // A zero-length text region is still a finite observation when the
         // rendered service region exists. Null is reserved for an unobserved
         // region and must not accompany completeness='complete'.
@@ -16480,7 +16588,7 @@ async function readCoverageObservationV2Page_(page) {
         serviceLinks, serviceLinkObserved:serviceLinks.length>0,
         sitemapLinks, sitemapLinkDiscoveryComplete:true };
     });
-    return Object.assign({ checked: true, attempted: true, renderComplete: fact.readyState === 'complete', frameComplete: !fact.hasFrame, failureKind: null }, fact, {
+    return Object.assign({ checked: true, attempted: true, renderComplete: isCoverageObservationV2StableDocumentState_(fact.readyState), frameComplete: !fact.hasFrame, failureKind: null }, fact, {
       faqContent: detectFaqContentV2_(fact.faqDetector)
     });
   } catch (error) {
@@ -16519,7 +16627,8 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.faqLinks || entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_) : [];
   const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.serviceLinks || entry.links, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
   const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
-  const sitemapUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
+  const htmlSitemapDiscoveryComplete = isHtmlSitemapCandidateDiscoveryCompleteV1_(entry) && !!origin;
+  const sitemapUrls = htmlSitemapDiscoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
   const canOpen = context && typeof context.newPage === 'function';
   const faqRows = canOpen ? await observeCoverageObservationV2Candidates_(context, faqUrls) : [];
   const serviceRows = canOpen ? await observeCoverageObservationV2Candidates_(context, serviceUrls) : [];
@@ -29129,6 +29238,7 @@ module.exports.__lightBudgetTestHooks = {
   buildBreadcrumbObservationV2_,
   collectReusableBreadcrumbObservationV2Rows_,
   buildHtmlSitemapCandidateDiscoveryV1_,
+  isCoverageObservationV2StableDocumentState_,
   collectCoverageObservationsV2_,
   COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_,
   COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_,
@@ -29201,6 +29311,7 @@ module.exports.__lightBudgetTestHooks = {
   buildExplicitOperatorIdentityRelationEvidenceV1_,
   isCorroboratedCorporateSameOriginCompanyProfileRelationV1_,
   buildObservedCompanyProfileRelationEvidenceV1_,
+  buildObservedCompanyProfileHubDetailRelationEvidenceV1_,
   normalizeOperatorIdentityInfo_,
   isFormalOperatorIdentityRecord_,
   attachOperatorIdentityProbeProvenance_,
