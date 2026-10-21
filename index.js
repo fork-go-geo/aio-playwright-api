@@ -3452,6 +3452,25 @@ function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
       probeSourceType: 'legal'
     });
   }
+  // An explicitly rendered formal-disclosure link is a bounded discovery
+  // source in its own right, including links that are late in a non-semantic
+  // footer. It authorizes only one existing profile/legal probe; extracted
+  // fields and relation provenance remain the positive-evidence gate.
+  const formalDisclosure = candidate && sourceTypes.includes('formalDisclosure');
+  if (formalDisclosure && explicitCompanyOrOperatorLabel) {
+    return Object.assign({}, strict, {
+      probeEligible: true,
+      probeTier: 'formal_disclosure_company_profile',
+      probeSourceType: 'company_profile'
+    });
+  }
+  if (formalDisclosure && explicitLegalLink) {
+    return Object.assign({}, strict, {
+      probeEligible: true,
+      probeTier: 'formal_disclosure_legal_notice',
+      probeSourceType: 'legal'
+    });
+  }
   // A generic-route candidate is only a bounded fetch permission, never
   // identity evidence.  Some corporate sites expose their primary company
   // page in a non-semantic wrapper, so its anchor label cannot satisfy the
@@ -3469,7 +3488,10 @@ function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
     const excludedSection = /\/(?:csr|contribution|sustainability|safety|security|ir|investor|governance|environment|health|recruit|career|group)(?:\/|$)/i.test(path);
     return !excludedSection && (directProfile || namedProfile || companyChildProfile);
   })();
-  if (genericRouteOnly && genericProfilePath) {
+  // A labelled disclosure is handled by the dedicated formalDisclosure lane.
+  // Keep the legacy generic-route escape hatch path-only, so it cannot turn a
+  // loosely labelled company link into an operator probe.
+  if (genericRouteOnly && genericProfilePath && !strict.label) {
     return Object.assign({}, strict, {
       probeEligible: true,
       probeTier: 'generic_route_company_profile',
@@ -5047,6 +5069,78 @@ function detectBreadcrumbUiFromCheerio_($, currentUrl) {
     : { hasBreadcrumbUi: false, source: 'not_observed', element: null };
 }
 
+function extractRoleLimitedEntityEvidenceV1_(html, sourceUrl, pageType) {
+  const text = normalizeSubpageJsonLdText(cheerio.load(String(html || '')).text());
+  const privacy = /(?:個人情報|privacy|プライバシー)/i.test(text);
+  const contact = pageType === 'contact' && /(?:お問い合わせ|contact|inquiry|問い合わせ)/i.test(text);
+  if (!privacy && !contact) return null;
+  // Keep the three fields in one bounded rendered-text scope.  A page-wide
+  // regex can otherwise combine a footer company name with another entity's
+  // address or telephone number.
+  const cue = privacy ? text.search(/(?:個人情報|privacy|プライバシー)/i) : text.search(/(?:お問い合わせ|contact|inquiry|問い合わせ)/i);
+  const scopeStart = Math.max(0, cue - 280);
+  const scopedText = text.slice(scopeStart, Math.min(text.length, cue + 1200));
+  const cueInScope = Math.max(0, cue - scopeStart);
+  const entityRe = /(?:株式会社|有限会社|合同会社|一般社団法人|学校法人)[^\s、。]{1,60}/g;
+  const entities = [];
+  let entityMatch;
+  while ((entityMatch = entityRe.exec(scopedText))) entities.push({name:entityMatch[0], start:entityMatch.index});
+  // A role cue may name the responsible company either immediately before or
+  // after the cue.  Once selected, never borrow NAP fields past the next legal
+  // entity mention in this evidence scope.
+  const entityIndex = entities.findIndex(item => item.start >= cueInScope);
+  const selectedEntityIndex = entityIndex >= 0 ? entityIndex : entities.length - 1;
+  const selectedEntity = selectedEntityIndex >= 0 ? entities[selectedEntityIndex] : null;
+  const entityScope = selectedEntity
+    ? scopedText.slice(selectedEntity.start, selectedEntityIndex + 1 < entities.length ? entities[selectedEntityIndex + 1].start : scopedText.length)
+    : '';
+  const name = selectedEntity ? selectedEntity.name : '';
+  const address = (entityScope.match(/(?:〒?\s?\d{3}[-‐]?\d{4}\s*)?(?:東京都|北海道|(?:京都|大阪)府|..県)[^\n]{0,100}/) || [''])[0];
+  const telephone = (entityScope.match(/0\d{1,4}[-−‐]\d{1,4}[-−‐]\d{3,4}/) || [''])[0];
+  if (!name) return null;
+  let sourcePath = '';
+  try { sourcePath = new URL(String(sourceUrl || '')).pathname.slice(0, 240); } catch (_) {}
+  // The privacy-controller declaration identifies a legal entity with its
+  // name + address. A contact-responsible declaration instead identifies a
+  // reachable entity with its name + telephone. Retain all three fields for
+  // audit, but do not make an unrelated optional field a universal gate.
+  const identitySameEvidenceScope = !!(name && address);
+  const contactSameEvidenceScope = !!(name && telephone);
+  const role = privacy ? 'privacy_controller' : 'contact_responsible_entity';
+  const acceptance = assessRoleLimitedEntityEvidenceV2_({
+    role, companyName:name, hasAddress:!!address, hasTelephone:!!telephone,
+    identitySameEvidenceScope, contactSameEvidenceScope
+  });
+  return {version:'role_limited_entity_evidence_v2', observed:true,
+    sourceUrl:String(sourceUrl || ''), sourcePath, sourcePageType:privacy ? 'privacy_notice' : 'contact_page',
+    role, companyName:name.slice(0,120),
+    hasAddress:!!address, hasTelephone:!!telephone,
+    identitySameEvidenceScope, contactSameEvidenceScope,
+    napSameEvidenceScope:!!(name && address && telephone), relationConfirmed:false, conflict:false,
+    provenance:'rendered_observed_page', rejectionCode:acceptance.accepted ? null : acceptance.reasonCode};
+}
+
+// Role-limited evidence never establishes a site operator. This helper only
+// answers whether a single observed role declaration identifies that role's
+// entity strongly enough to support the separate improvement state.
+function assessRoleLimitedEntityEvidenceV2_(item) {
+  item = item && typeof item === 'object' ? item : {};
+  const role = String(item.role || '');
+  if (!String(item.companyName || '').trim()) return {accepted:false, reasonCode:'role_limited_company_name_missing'};
+  if (role === 'privacy_controller') {
+    return item.hasAddress === true && item.identitySameEvidenceScope === true
+      ? {accepted:true, reasonCode:null}
+      : {accepted:false, reasonCode:'privacy_controller_address_scope_incomplete'};
+  }
+  if (role === 'contact_responsible_entity') {
+    return (item.hasTelephone === true && item.contactSameEvidenceScope === true) ||
+      (item.hasAddress === true && item.identitySameEvidenceScope === true)
+      ? {accepted:true, reasonCode:null}
+      : {accepted:false, reasonCode:'contact_responsible_contact_scope_incomplete'};
+  }
+  return {accepted:false, reasonCode:'role_limited_role_unsupported'};
+}
+
 function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts = {}) {
   const $ = cheerio.load(String(html || ''));
   const title = normalizeSubpageJsonLdText($('title').first().text()).slice(0, 180);
@@ -5127,6 +5221,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
   const contactSignals = pageType === 'contact'
     ? extractContactSignalsFromHtml_(html, finalUrl || url)
     : null;
+  const roleLimitedEntityEvidence = extractRoleLimitedEntityEvidenceV1_(html, finalUrl || url, pageType);
   const formSignals = (() => {
     const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test((() => {
       try { return new URL(finalUrl || url).pathname || ''; } catch (_) { return ''; }
@@ -5244,6 +5339,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     companyProfileDetailLinks,
     companyProfileHubLinks,
     contactSignals,
+    roleLimitedEntityEvidence,
     formSignals,
     articleSignals,
     error: null,
@@ -6680,7 +6776,7 @@ function reasonDiscoverSubpageCandidate(url, source, sources) {
 function scoreDiscoverSubpageCandidate(url, source, sources, label = '') {
   let path = '';
   try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
-  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'article' ? 35 : (source === 'ecGeneralLink' ? 30 : (source === 'sitemap' ? 20 : (source === 'genericRoute' ? 5 : 0))))));
+  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'formalDisclosure' ? 40 : (source === 'article' ? 35 : (source === 'ecGeneralLink' ? 30 : (source === 'sitemap' ? 20 : (source === 'genericRoute' ? 5 : 0)))))));
   const depth = path.split('/').filter(Boolean).length;
   const sourceCount = Array.isArray(sources) ? sources.length : 1;
   let score = sourceScore;
@@ -6721,7 +6817,7 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
       witnesses.push(navigationWitness);
     }
   };
-  const sourcePriority = { genericRoute: 0, sitemap: 1, ecGeneralLink: 2, htmlSitemap: 3, footer: 4, nav: 5 };
+  const sourcePriority = { genericRoute: 0, sitemap: 1, ecGeneralLink: 2, formalDisclosure: 3, htmlSitemap: 4, footer: 5, nav: 6 };
   const existing = map.get(key);
   if (existing) {
     if (!existing.sources.includes(source)) existing.sources.push(source);
@@ -6769,6 +6865,25 @@ function isGenericRepresentativeRouteCandidate_(link, origin) {
     /(?:会社|企業|運営|概要|事業|サービス|製品|商品|よくある質問|お問い合わせ|問合せ|料金|価格|プラン|\b(?:about|company|corporate|profile|business|service|product|faq|pricing|price|plan|contact|inquiry)\b)/i.test(haystack);
 }
 
+// Formal disclosures are often placed late in a footer, after ordinary
+// product/navigation links.  Keep a separate, metadata-only collection lane
+// so the general 500-link sample cannot hide an explicitly linked company,
+// privacy, or legal page.  This is discovery only: normal origin validation,
+// bounded probe selection, field extraction, and relation checks still decide
+// whether any fetched page can become a formal operator record.
+function isFormalDisclosureRouteCandidate_(link, origin) {
+  const rawHref = link && (link.href || link.url || '');
+  const normalized = normalizeDiscoverSubpageUrl(rawHref, origin);
+  if (!normalized) return false;
+  const label = normalizeSubpageJsonLdText([
+    link && link.text, link && link.ariaLabel, link && link.title, link && link.groupHeading
+  ].filter(Boolean).join(' '));
+  const path = (() => { try { return new URL(normalized).pathname.toLowerCase(); } catch (_) { return ''; } })();
+  const routeMatch = /\/(?:about|company|corporate|profile|outline|privacy|policy|terms|legal|law|tokushoho)(?:\/|$|-|_|\.(?:php|html?|htm)$)/i.test(path);
+  const labelMatch = /会社(?:概要|情報|案内)|企業(?:情報|概要)|運営(?:会社|者|主体|情報)|個人情報(?:保護方針|の取り扱い)|プライバシー|利用規約|特定商取引|legal\s*notice|privacy|terms|company|corporate\s*(?:info|profile)/i.test(label);
+  return routeMatch || labelMatch;
+}
+
 function addGenericRepresentativeRouteCandidatesFromLinks_(links, origin, candidateMap, sourceSummary, limit = 6) {
   const added = [];
   for (const link of (Array.isArray(links) ? links : [])) {
@@ -6777,6 +6892,16 @@ function addGenericRepresentativeRouteCandidatesFromLinks_(links, origin, candid
     if (addDiscoverSubpageCandidate(candidateMap, link, 'genericRoute', origin, 'bounded generic same-origin representative route', sourceSummary)) {
       added.push(link);
     }
+  }
+  return added;
+}
+
+function addFormalDisclosureRouteCandidatesFromLinks_(links, origin, candidateMap, sourceSummary, limit = 6) {
+  const added = [];
+  for (const link of (Array.isArray(links) ? links : [])) {
+    if (added.length >= limit) break;
+    if (!isFormalDisclosureRouteCandidate_(link, origin)) continue;
+    if (addDiscoverSubpageCandidate(candidateMap, link, 'formalDisclosure', origin, 'explicit rendered formal disclosure route', sourceSummary)) added.push(link);
   }
   return added;
 }
@@ -7429,12 +7554,33 @@ function parseDiscoverSitemapXml(xml) {
   return { sitemapLocs, urlLocs };
 }
 
+function isExpectedAbsentSitemapDiscoveryResultV1_(result) {
+  // Sitemap roots are optional discovery inputs. A completed 404 tells us
+  // that this particular input is absent; it is not a failed search.
+  return !!(result && Number(result.status) === 404);
+}
+
+function isExpectedAbsentSitemapDiscoveryErrorV1_(item) {
+  return !!(item && item.source === 'sitemap' && isExpectedAbsentSitemapDiscoveryResultV1_(item));
+}
+
+function isFormalOperatorCandidateDiscoveryCompleteV2_(input = {}) {
+  if (input.observationLimited === true || input.discoveryCapped === true) return false;
+  const errors = Array.isArray(input.errors) ? input.errors : [];
+  // Keep transport failures and non-404 sitemap failures blocking.  This
+  // exception is deliberately limited to a completed optional sitemap-root
+  // absence, not to missing candidates or generic fetch failures.
+  return !errors.some(item => !isExpectedAbsentSitemapDiscoveryErrorV1_(item));
+}
+
 async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors, opts = {}) {
   const roots = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'].map(path => origin.replace(/\/$/, '') + path);
   for (const sitemapUrl of roots) {
     const rootRes = await fetchDiscoverSubpageText(sitemapUrl, 8000, opts.executionAuth || null);
     if (!rootRes.ok) {
-      errors.push({ source: 'sitemap', message: `${sitemapUrl}: ${rootRes.status || rootRes.error || 'fetch_failed'}` });
+      if (!isExpectedAbsentSitemapDiscoveryResultV1_(rootRes)) {
+        errors.push({ source: 'sitemap', status: Number(rootRes.status || 0) || null, message: `${sitemapUrl}: ${rootRes.status || rootRes.error || 'fetch_failed'}` });
+      }
       continue;
     }
     const parsed = parseDiscoverSitemapXml(rootRes.text);
@@ -7454,7 +7600,9 @@ async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSumm
         }
         const childRes = await fetchDiscoverSubpageText(childUrl, 8000, opts.executionAuth || null);
         if (!childRes.ok) {
-          errors.push({ source: 'sitemap', message: `${childUrl}: ${childRes.status || childRes.error || 'fetch_failed'}` });
+          if (!isExpectedAbsentSitemapDiscoveryResultV1_(childRes)) {
+            errors.push({ source: 'sitemap', status: Number(childRes.status || 0) || null, message: `${childUrl}: ${childRes.status || childRes.error || 'fetch_failed'}` });
+          }
           continue;
         }
         const childParsedXml = parseDiscoverSitemapXml(childRes.text);
@@ -7554,6 +7702,30 @@ async function collectDiscoverLinksFromPage(page) {
         return true;
       })
       .slice(0, 2);
+    // This parallel lane intentionally scans the same already-rendered DOM;
+    // it does not fetch URLs or make a path-derived request.  It captures
+    // formal-disclosure links beyond the ordinary allLinks cap.
+    const isFormalDisclosureLink = link => {
+      const href = String(link && link.href || '');
+      let parsed;
+      try { parsed = new URL(href); } catch (_) { return false; }
+      if (!/^https?:$/.test(parsed.protocol) || parsed.origin !== location.origin) return false;
+      const label = clean([link.text, link.ariaLabel, link.title, link.groupHeading].filter(Boolean).join(' '));
+      const path = String(parsed.pathname || '').toLowerCase();
+      return /\/(?:about|company|corporate|profile|outline|privacy|policy|terms|legal|law|tokushoho)(?:\/|$|-|_|\.(?:php|html?|htm)$)/i.test(path) ||
+        /会社(?:概要|情報|案内)|企業(?:情報|概要)|運営(?:会社|者|主体|情報)|個人情報(?:保護方針|の取り扱い)|プライバシー|利用規約|特定商取引|legal\s*notice|privacy|terms|company|corporate\s*(?:info|profile)/i.test(label);
+    };
+    const formalDisclosureSeen = new Set();
+    const formalDisclosureLinks = queryAllDeep('a[href]', { maxNodes: 2048 })
+      .map(linkFrom)
+      .filter(link => {
+        if (!isFormalDisclosureLink(link)) return false;
+        const key = String(link.href || '').replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase();
+        if (!key || formalDisclosureSeen.has(key)) return false;
+        formalDisclosureSeen.add(key);
+        return true;
+      })
+      .slice(0, 6);
     const htmlSitemapLinks = allLinks.filter(x => /sitemap|site-map|サイトマップ/i.test(`${x.href} ${x.text}`)).slice(0, 5);
     const navLinks = queryAllDeep('nav a[href],[role="navigation"] a[href],header a[href]', { maxNodes: 250 }).map(linkFrom).filter(x => x.href).slice(0, 200);
     const semanticFooterAnchors = queryAllDeep('footer a[href],[role="contentinfo"] a[href]', { maxNodes: 200 });
@@ -7571,8 +7743,8 @@ async function collectDiscoverLinksFromPage(page) {
       footerAnchors.push(anchor);
     });
     const footerLinks = footerAnchors.map(linkFrom).filter(x => x.href);
-    return { allLinks: allLinks.slice(0, 500), operatorRelationLinks, htmlSitemapLinks, navLinks, footerLinks };
-  }).catch(() => ({ allLinks: [], operatorRelationLinks: [], htmlSitemapLinks: [], navLinks: [], footerLinks: [] }));
+    return { allLinks: allLinks.slice(0, 500), operatorRelationLinks, formalDisclosureLinks, htmlSitemapLinks, navLinks, footerLinks };
+  }).catch(() => ({ allLinks: [], operatorRelationLinks: [], formalDisclosureLinks: [], htmlSitemapLinks: [], navLinks: [], footerLinks: [] }));
 }
 
 async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts = {}) {
@@ -7631,9 +7803,11 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       });
       const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
       const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
-      if (candidateMap.size === 0) {
-        addGenericRepresentativeRouteCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
-      }
+      // Add only explicitly rendered, same-origin formal/representative links.
+      // Unlike the old empty-map fallback, this cannot be hidden merely because
+      // contact/product links were discovered first.
+      addFormalDisclosureRouteCandidatesFromLinks_(navFooterLinks.formalDisclosureLinks || [], origin, candidateMap, sourceSummary);
+      if (candidateMap.size === 0) addGenericRepresentativeRouteCandidatesFromLinks_(navFooterLinks.allLinks || [], origin, candidateMap, sourceSummary);
       logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
       if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
       return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin)
@@ -7710,9 +7884,11 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     });
     const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
     const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
-    if (candidateMap.size === 0) {
-      addGenericRepresentativeRouteCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
-    }
+    // See the page-reuse branch above. A real disclosure link remains bounded
+    // and does not become identity evidence until the existing probe contract
+    // accepts its extracted fields and relation provenance.
+    addFormalDisclosureRouteCandidatesFromLinks_(navFooterLinks.formalDisclosureLinks || [], origin, candidateMap, sourceSummary);
+    if (candidateMap.size === 0) addGenericRepresentativeRouteCandidatesFromLinks_(navFooterLinks.allLinks || [], origin, candidateMap, sourceSummary);
     logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
     if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
     return collectOfficialExternalOperatorProfileCandidates_(navFooterLinks, origin)
@@ -7742,7 +7918,7 @@ function normalizeDiscoverTopUrl(rawTopUrl) {
 
 async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts = {}) {
   const normalizedLimit = Math.max(1, Math.min(50, Number(limit || 20) || 20));
-  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, article: 0, genericRoute: 0 };
+  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, article: 0, genericRoute: 0, formalDisclosure: 0 };
   const errors = [];
   const candidateMap = new Map();
   await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors, opts);
@@ -8574,6 +8750,8 @@ function compactSubpageJsonLdObservation_(page) {
       formObservationLimited: typeof page.formSignals.formObservationLimited === 'boolean' ? page.formSignals.formObservationLimited : null,
       observationScope: page.formSignals.observationScope === 'contact_subpage' ? 'contact_subpage' : null
     } : null,
+    roleLimitedEntityEvidence: page && page.roleLimitedEntityEvidence && page.roleLimitedEntityEvidence.observed === true
+      ? page.roleLimitedEntityEvidence : null,
     legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? {
       observed: true,
       pageType: 'legal',
@@ -13223,6 +13401,72 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     }
     const operatorFormalRecordPresent = isFormalOperatorIdentityRecord_(operatorIdentityInfo) ||
       isFormalOperatorIdentityRecord_(legalOperatorInfo);
+    // Role-limited evidence is informative, never a substitute for a formal
+    // operator record.  Preserve a bounded, non-HTML provenance summary so
+    // GAS can distinguish observed insufficiency from incomplete observation.
+    const roleLimitedRunId = 'role-limited-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    const isSameOriginRoleEvidence = item => {
+      try { return new URL(String(item && item.sourceUrl || '')).origin === normalized.origin; } catch (_) { return false; }
+    };
+    const allRoleLimitedEvidence = operatorIdentityObservations
+      .map(page => page && page.roleLimitedEntityEvidence)
+      .filter(item => item && item.observed === true && item.companyName);
+    const evidenceSummary = allRoleLimitedEvidence.map(item => ({
+      role: String(item.role || ''), sourcePageType: String(item.sourcePageType || ''),
+      sourcePath: String(item.sourcePath || '').slice(0, 240),
+      runId: roleLimitedRunId,
+      sameOrigin: isSameOriginRoleEvidence(item), hasCompanyName: !!item.companyName,
+      hasAddress: item.hasAddress === true, hasTelephone: item.hasTelephone === true,
+      identitySameEvidenceScope: item.identitySameEvidenceScope === true,
+      contactSameEvidenceScope: item.contactSameEvidenceScope === true,
+      napSameEvidenceScope: item.napSameEvidenceScope === true,
+      provenance: item.provenance === 'rendered_observed_page' ? 'rendered_observed_page' : 'unknown'
+    }));
+    const roleLimitedEvidence = allRoleLimitedEvidence.filter(item =>
+      isSameOriginRoleEvidence(item) && item.conflict !== true && assessRoleLimitedEntityEvidenceV2_(item).accepted === true);
+    const namesByRole = {};
+    allRoleLimitedEvidence.forEach(item => {
+      const role = String(item.role || 'unknown');
+      const name = normalizeSubpageJsonLdText(item.companyName);
+      if (!namesByRole[role]) namesByRole[role] = new Set();
+      namesByRole[role].add(name);
+    });
+    const conflictingRoles = Object.keys(namesByRole).filter(role => namesByRole[role].size > 1);
+    const roleNames = Array.from(new Set(roleLimitedEvidence.map(item => normalizeSubpageJsonLdText(item.companyName))));
+    const discoveryCapped = Array.isArray(discovered.operatorIdentityCandidates) && discovered.operatorIdentityCandidates.length >= 5;
+    // A zero-candidate result can be complete only when candidate discovery
+    // itself completed without a cap/error.  Preserve the legacy probe
+    // scopeComplete separately: it means a selected profile probe completed.
+    const formalCandidateDiscoveryComplete = isFormalOperatorCandidateDiscoveryCompleteV2_({
+      observationLimited,
+      errors: discovered.errors,
+      discoveryCapped
+    });
+    const formalOperatorExplorationComplete = formalCandidateDiscoveryComplete &&
+      (operatorFormalRecordPresent || !selectedOperatorIdentityCandidate || operatorIdentityProbe.observationComplete === true);
+    const roleLimitedScopeComplete = observationLimited !== true &&
+      observations.every(page => page && page.ok === true) && formalOperatorExplorationComplete;
+    const roleLimitedAssessment = !operatorFormalRecordPresent && roleLimitedEvidence.length && roleNames.length === 1 &&
+      conflictingRoles.length === 0 && roleLimitedScopeComplete
+      ? {version:'operator_identity_role_limited_assessment_v2',observed:true,observationComplete:true,
+        roleLimitedScopeComplete:true,formalOperatorExplorationComplete:true,state:'relation_missing',companyName:roleNames[0],
+        roles:Array.from(new Set(roleLimitedEvidence.map(item => item.role))).slice(0,2),evidenceCount:roleLimitedEvidence.length,
+        acceptedEvidenceCount:roleLimitedEvidence.length,rejectedEvidenceCount:allRoleLimitedEvidence.length-roleLimitedEvidence.length,
+        relationConfirmed:false,conflict:false,reason:'formal_site_operator_relation_missing',reasonCode:'formal_site_operator_relation_missing',
+        formalOperatorExploration:{candidateDiscoveryComplete:formalCandidateDiscoveryComplete,selectedProbeComplete:operatorIdentityProbe.observationComplete===true,legacyScopeComplete:operatorIdentityProbe.observationComplete===true,reason:selectedOperatorIdentityCandidate?'selected_probe_complete':'completed_no_eligible_candidate'},
+        provenance:{sameRun:true,runId:roleLimitedRunId,source:'rendered_subpage_observation',evidence:evidenceSummary},
+        rejectionCodes:allRoleLimitedEvidence.filter(item => roleLimitedEvidence.indexOf(item)<0).map(item => item.rejectionCode || assessRoleLimitedEntityEvidenceV2_(item).reasonCode || 'role_evidence_rejected').slice(0,8)}
+      : {version:'operator_identity_role_limited_assessment_v2',observed:allRoleLimitedEvidence.length>0,
+        observationComplete:roleLimitedScopeComplete,roleLimitedScopeComplete,formalOperatorExplorationComplete,
+        state:'unavailable',companyName:null,roles:[],evidenceCount:roleLimitedEvidence.length,
+        acceptedEvidenceCount:0,rejectedEvidenceCount:allRoleLimitedEvidence.length,relationConfirmed:false,
+        conflict:conflictingRoles.length>0,
+        reason:conflictingRoles.length?'same_role_entity_conflict':(!formalOperatorExplorationComplete?'formal_operator_exploration_incomplete':(!roleLimitedScopeComplete?'role_limited_scope_incomplete':'insufficient_role_limited_evidence')),
+        reasonCode:conflictingRoles.length?'same_role_entity_conflict':(!formalOperatorExplorationComplete?'formal_operator_exploration_incomplete':(!roleLimitedScopeComplete?'role_limited_scope_incomplete':'insufficient_role_limited_evidence')),
+        formalOperatorExploration:{candidateDiscoveryComplete:formalCandidateDiscoveryComplete,selectedProbeComplete:operatorIdentityProbe.observationComplete===true,legacyScopeComplete:operatorIdentityProbe.observationComplete===true,reason:selectedOperatorIdentityCandidate?'selected_probe_incomplete':'candidate_discovery_incomplete'},
+        provenance:{sameRun:true,runId:roleLimitedRunId,source:'rendered_subpage_observation',evidence:evidenceSummary},
+        rejectionCodes:allRoleLimitedEvidence.map(item => item.rejectionCode || assessRoleLimitedEntityEvidenceV2_(item).reasonCode || 'role_evidence_rejected').slice(0,8)};
+    geoSignalsV1.operatorIdentityRoleLimitedAssessmentV1 = roleLimitedAssessment;
     const operatorProbeFailureStage = operatorFormalRecordPresent ? null
       : (!selectedOperatorIdentityCandidate ? 'operator_probe_candidate_missing'
         : (operatorIdentityProbe && operatorIdentityProbe.hubProbeAttempted === true
@@ -29256,6 +29500,10 @@ module.exports.__lightBudgetTestHooks = {
   mergeFrameContentObservationIntoGeoSignalsV1_,
   FRAME_CONTENT_OBSERVATION_MAX_DEPTH_V1_,
   FRAME_CONTENT_OBSERVATION_MAX_CANDIDATES_V1_,
+  isExpectedAbsentSitemapDiscoveryResultV1_,
+  isExpectedAbsentSitemapDiscoveryErrorV1_,
+  isFormalOperatorCandidateDiscoveryCompleteV2_,
+  assessRoleLimitedEntityEvidenceV2_,
   attachContactDestination_,
   buildHeadObservations_,
   extractTopPageStaticSignalsFromHtml_,
@@ -29267,6 +29515,7 @@ module.exports.__lightBudgetTestHooks = {
   buildFreshnessOperationSignalsFromArticleSignals_,
   extractArticleVisibleDateCandidatesFromCheerio_,
   parseSubpageJsonLdLightHtml,
+  extractRoleLimitedEntityEvidenceV1_,
   extractOperatorIdentityInfoFromHtml_,
   extractLegalOperatorInfoFromHtml_,
   collectExplicitCompanyProfileDetailLinksFromHtml_,
@@ -29317,7 +29566,9 @@ module.exports.__lightBudgetTestHooks = {
   attachOperatorIdentityProbeProvenance_,
   buildOperatorIdentityObservationV1_,
   isGenericRepresentativeRouteCandidate_,
+  isFormalDisclosureRouteCandidate_,
   addGenericRepresentativeRouteCandidatesFromLinks_,
+  addFormalDisclosureRouteCandidatesFromLinks_,
   normalizeDiscoverSubpageUrl,
   addDiscoverSubpageCandidate,
   discoverSubpageCandidatesLightData_,
