@@ -3951,11 +3951,19 @@ function applyCompanyProfileHubCorroboration_(candidates) {
     const sources = Array.isArray(candidate.sources) ? candidate.sources : [];
     const candidatePath = pathFor(candidate.url);
     const candidateOrigin = originFor(candidate.url);
-    if (!sources.includes('sitemap') || !candidatePath || !companyPathRe.test(candidatePath)) return;
+    if (!sources.some(source => source === 'sitemap' || source === 'htmlSitemap') ||
+      !candidatePath || !companyPathRe.test(candidatePath)) return;
     candidate.companyProfileHubCorroborated = hubs.some(hub => {
       const hubPath = pathFor(hub.url);
+      // A same-origin human-facing hub can be a static landing document
+      // (for example /about-us.html) whose explicit sitemap detail lives
+      // beneath its stem (/about-us/company-profile.html).  Treat that stem
+      // as the hub scope; the existing label, origin and sitemap gates still
+      // decide whether the detail is eligible.
+      const hubScopePath = hubPath.replace(/\.(?:html?|htm)$/i, '');
       return !!hubPath && hubPath !== '/' && originFor(hub.url) === candidateOrigin &&
-        candidatePath.indexOf(hubPath + '/') === 0;
+        (candidatePath.indexOf(hubPath + '/') === 0 ||
+          (hubScopePath !== hubPath && candidatePath.indexOf(hubScopePath + '/') === 0));
     });
   });
   return list;
