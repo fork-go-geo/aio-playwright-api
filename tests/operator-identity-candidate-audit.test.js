@@ -105,9 +105,11 @@ assert.ok(path);
 // routing hint even when its pathname is generic. Evaluate it directly to
 // keep the bounded audit independent of selection behavior.
 assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(pathMiss).rejectionReasons, []);
-// A canonical company-profile pathname is independently sufficient context;
-// `labelMiss` still requires corroboration before it can be selected.
-assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(labelMiss).rejectionReasons, []);
+// A corporate-looking pathname alone is not enough: the link itself must
+// carry company-profile meaning, in addition to independent corroboration.
+const labelMissEvaluation = hooks.evaluateHighConfidenceCompanyProfileCandidate_(labelMiss);
+assert.deepStrictEqual(labelMissEvaluation.rejectionReasons, ['company_profile_label_missing']);
+assert.strictEqual(labelMissEvaluation.highConfidenceEligible, false);
 assert.deepStrictEqual(hooks.evaluateHighConfidenceCompanyProfileCandidate_(corroborationMiss).rejectionReasons, ['independent_corroboration_missing']);
 
 // Re-evaluate the unchanged producer selectors after audit construction.

@@ -7,6 +7,10 @@ const path = require('path');
 // safe-request fixtures.  This test makes each producer keep using that shared
 // transport with its pre-existing HTTP contract.
 const source = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+assert.ok(source.includes("const GEO_UNIFIED_OBSERVER_HTML_UA_V1_ = 'geo-unified-observer-html/1.0'"));
+assert.ok(source.includes("const GEO_UNIFIED_OBSERVER_SITEMAP_UA_V1_ = 'geo-unified-observer-sitemap/1.0'"));
+assert.equal(source.includes('Chrome/122.0.0.0'), false,
+  'Node public fetches must not claim an unrelated browser version');
 
 function block(startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -24,6 +28,7 @@ const discovery = block('async function fetchDiscoverSubpageText', '\nfunction p
 includesAll('robots/sitemap discovery', discovery, [
   'fetchPublicSiteTextV1_(url',
   "'Accept': 'application/xml,text/xml,text/html,*/*;q=0.8'",
+  "'User-Agent': GEO_UNIFIED_OBSERVER_SITEMAP_UA_V1_",
   'maxBytes: 2 * 1024 * 1024',
   'finalUrl: response && response.url || url',
   'status: null, text: \'\''
@@ -61,6 +66,7 @@ const news = block('async function fetchNewsIndexFreshnessSignalsLight_', '\nasy
 includesAll('news index', news, [
   'fetchPublicSiteTextV1_(url',
   'maxBytes: 2 * 1024 * 1024',
+  "'User-Agent': GEO_UNIFIED_OBSERVER_HTML_UA_V1_",
   'finalParsed.origin !== initialUrl.origin',
   'buildNewsIndexFreshnessSignalsFromText_(text, finalUrl || url)'
 ]);
@@ -69,6 +75,7 @@ const topPage = block('async function fetchTopPageStaticSignals_', '\nfunction b
 includesAll('top-page static fetch', topPage, [
   'fetchPublicSiteTextV1_(url',
   'maxBytes: 2 * 1024 * 1024',
+  "'User-Agent': GEO_UNIFIED_OBSERVER_HTML_UA_V1_",
   'unsupported_content_type:',
   'extractTopPageStaticSignalsFromHtml_',
   'controller.abort()'
@@ -81,6 +88,12 @@ includesAll('shared safe transport', safeTransport, [
   'SSRF_REDIRECT_REJECTED',
   'rejectHttpsDowngrade',
   'headersForUrl'
+]);
+
+const authenticatedHtml = block('async function requestValidatedSubpageHtmlV1_', '\nasync function fetchValidatedTextResponseV1_');
+includesAll('validated HTML and Basic-auth transport', authenticatedHtml, [
+  "'User-Agent': GEO_UNIFIED_OBSERVER_HTML_UA_V1_",
+  'opts.headers || {}'
 ]);
 
 console.log(JSON.stringify({

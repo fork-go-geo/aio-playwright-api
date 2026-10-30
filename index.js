@@ -161,6 +161,11 @@ const express = require('express');
 const { chromium } = require('playwright');
 const PQueue = require('p-queue').default;
 
+// Node-side observations are not Chromium navigations. Keep their identity
+// explicit instead of presenting a synthetic browser UA to target sites.
+const GEO_UNIFIED_OBSERVER_HTML_UA_V1_ = 'geo-unified-observer-html/1.0';
+const GEO_UNIFIED_OBSERVER_SITEMAP_UA_V1_ = 'geo-unified-observer-sitemap/1.0';
+
 const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -1594,7 +1599,6 @@ async function buildSubPagesVNext_V1_(browserPage, origin, decision){
 
   try{
     subContext = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       viewport: { width: 800, height: 600 },
       javaScriptEnabled: true,
       locale: 'ja-JP',
@@ -3315,6 +3319,29 @@ function isOrganizationInformationContext_(url, text) {
     /大学について|基本情報|組織概要|組織情報|法人情報|団体概要|機関概要|運営情報|会社概要|企業情報|運営主体|\b(?:organization|institution|governance|basic\s+information|company|corporate|profile|overview)\b/i.test(hay);
 }
 
+// A company-looking parent path is only a routing hint.  Keep the semantic
+// meaning in the rendered link label separate so `/company/news/` or
+// `/aboutus/summary.htm` cannot become a formal-profile probe merely because
+// their ancestors look corporate.
+function isExcludedCompanyProfileContentRouteV1_(path) {
+  return /(?:^|\/)(?:news(?:room|-release)?|press(?:-release)?|ir|investor(?:-relations)?|recruit(?:ment)?|careers?|jobs?|products?|services?|business(?:es)?|division|departments?|csr|sustainability|governance|environment|health)(?:\/|$|\.)/i.test(String(path || ''));
+}
+
+function isCompanyProfileRouteV1_(path) {
+  const normalizedPath = String(path || '').toLowerCase();
+  if (!normalizedPath || isExcludedCompanyProfileContentRouteV1_(normalizedPath)) return false;
+  return /\/(?:about(?:us)?|company|corporate|profile|outline|overview|company-info)(?:\/|$|-|_|\.)/i.test(normalizedPath);
+}
+
+function isExplicitCompanyProfileLabelV1_(label) {
+  const value = normalizeSubpageJsonLdText(label).toLowerCase();
+  if (!value) return false;
+  // Do not infer a company profile from a person/author profile or from a
+  // newsroom title that happens to include a corporate word.
+  if (/(?:会社|企業|corporate|company).*(?:ニュース|news|ir|採用|recruit|career|製品|product|サービス|service|事業|business)|(?:著者|人物|スタッフ|member|author|team).*(?:プロフィール|profile)/i.test(value)) return false;
+  return /会社概要|会社情報|企業情報|企業概要|法人概要|法人情報|団体概要|組織概要|組織情報|基本情報|事業者情報|運営会社(?:情報)?|運営主体(?:情報)?|運営情報|\b(?:company|corporate)\s*(?:information|profile|overview|outline)\b|\b(?:company|corporate)\b/i.test(value);
+}
+
 // Evaluate the existing high-confidence predicate once so the bounded audit
 // below can report its inputs without creating a second selection contract.
 function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
@@ -3326,12 +3353,12 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
   const sources = Array.isArray(candidate && candidate.sources)
     ? candidate.sources.map(value => String(value || ''))
     : (candidate && candidate.source ? [String(candidate.source)] : []);
-  const companyPath = /\/(?:about(?:us)?|company|corporate|profile|outline|company-info|overview)(?:\/|$|-|_)/i.test(path);
+  const companyPath = isCompanyProfileRouteV1_(path);
   // Corporate sites commonly use an English global-navigation label even
   // when the destination page itself contains a Japanese company profile.
   // A label is still only a discovery hint: the sitemap + human-navigation
   // corroboration below remains mandatory before the extra probe is made.
-  const companyLabel = isOrganizationInformationContext_(url, label);
+  const companyLabel = isExplicitCompanyProfileLabelV1_(label);
   // XML and HTML sitemaps are both discovery corroboration.  An HTML
   // sitemap alone is not enough: it must be independently linked from a
   // human-facing navigation surface as well.
@@ -3376,10 +3403,10 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
   // navigation or footer hub whose path is its parent.  The discovery phase
   // sets this flag after checking both relationships; it is not a URL-only
   // fallback and does not admit arbitrary "company" paths.
-  if (!companyPath && !isOrganizationInformationContext_(url, label)) result.rejectionReasons.push('path_not_company_profile');
+  if (!companyPath && !companyLabel) result.rejectionReasons.push('path_not_company_profile');
   if (!companyLabel && !semanticHubCorroborated) result.rejectionReasons.push('company_profile_label_missing');
   if (!corroborated && !semanticHubCorroborated) result.rejectionReasons.push('independent_corroboration_missing');
-  result.highConfidenceEligible = (companyPath || isOrganizationInformationContext_(url, label)) && ((companyLabel && corroborated) || semanticHubCorroborated);
+  result.highConfidenceEligible = (companyPath || companyLabel) && ((companyLabel && corroborated) || semanticHubCorroborated);
   return result;
 }
 
@@ -5428,7 +5455,7 @@ async function requestValidatedSubpageHtmlV1_(target, opts = {}) {
         lookup: safeLookup,
         headers: Object.assign({
           'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'User-Agent': GEO_UNIFIED_OBSERVER_HTML_UA_V1_,
           'Connection': 'close'
         }, opts.headers || {})
       }, response => {
@@ -5498,6 +5525,7 @@ async function fetchValidatedTextResponseV1_(value, opts = {}) {
       return {
         status,
         ok: status >= 200 && status < 300,
+        requestedUrl: initial.url.toString(),
         url: checked.url.toString(),
         redirected: hop > 0,
         headers: { get: name => responseHeaderValueV1_(response.headers, name) },
@@ -7399,7 +7427,7 @@ async function fetchDiscoverSubpageText(url, timeoutMs = 8000, executionAuth = n
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'application/xml,text/xml,text/html,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        'User-Agent': GEO_UNIFIED_OBSERVER_SITEMAP_UA_V1_
       },
       maxBytes: 2 * 1024 * 1024
     }, executionAuth);
@@ -7661,7 +7689,6 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       ]
     });
     const contextOptions = {
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       serviceWorkers: 'allow',
       viewport: { width: 1366, height: 900 },
       javaScriptEnabled: true,
@@ -7672,9 +7699,6 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     if (opts.executionAuth) contextOptions.httpCredentials = { username:opts.executionAuth.username, password:opts.executionAuth.password, origin:opts.executionAuth.authOrigin };
     context = await browser.newContext(contextOptions);
     await installPlaywrightSsrfUrlGuardV1_(context);
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
     page = await context.newPage();
     page.setDefaultNavigationTimeout(15000);
     page.setDefaultTimeout(15000);
@@ -13583,9 +13607,6 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
         }));
       } catch (_) {}
       context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-                   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                   'Chrome/122.0.0.0 Safari/537.36',
         serviceWorkers: 'allow',
         viewport: { width: 1366, height: 900 },
         javaScriptEnabled: true,
@@ -13604,9 +13625,6 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           observeCount: normalizedUrls.length
         }));
       } catch (_) {}
-      await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      });
     } else {
       try {
         console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
@@ -13807,9 +13825,6 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       ]
     });
     context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                 'Chrome/122.0.0.0 Safari/537.36',
       serviceWorkers: 'allow',
       viewport: { width: 1366, height: 900 },
       javaScriptEnabled: true,
@@ -13818,9 +13833,6 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       ignoreHTTPSErrors: true
     });
     await installPlaywrightSsrfUrlGuardV1_(context);
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
     const tasks = normalizedUrls.map(url => {
       let origin = '';
       try { origin = new URL(url).origin; } catch (_) {}
@@ -14798,6 +14810,46 @@ function mergeEntityLinkSignalsLight_(items) {
   return Object.keys(out).length ? out : null;
 }
 
+// Formal entity-linking evidence is evaluated only from the same rendered-DOM
+// JSON-LD scan that produced entityLinkSignals.  Legacy booleans remain for
+// compatibility; they are not used as a substitute for this V2 contract.
+function buildEntityLinkingObservationV2_(presence, options = {}) {
+  const p = presence && typeof presence === 'object' ? presence : {};
+  const scanComplete = options.scanComplete === true;
+  const limited = options.limited === true;
+  const failed = options.failed === true;
+  const conflict = options.conflict === true;
+  const sourceRoot = String(options.sourceRoot || 'geoSignalsV1.structuredData').replace(/\.$/, '');
+  const stateFor = (targetObserved, value, propertyPath) => {
+    if (failed || limited || conflict || !scanComplete) {
+      return { applicability: 'unknown', state: 'unknown', checked: false, observed: false, explicit: false, value: null,
+        targetNodeObserved: targetObserved === true ? true : (targetObserved === false ? false : null), sourcePath: null,
+        sourceType: null, conflict };
+    }
+    if (targetObserved !== true) {
+      return { applicability: 'not_applicable', state: 'not_applicable', checked: true, observed: true, explicit: true,
+        value: null, targetNodeObserved: false, sourcePath: `${sourceRoot}.jsonldNodeScan`,
+        sourceType: 'cloud_run_jsonld_node_scan', conflict: false };
+    }
+    return { applicability: 'applicable', state: value === true ? 'true' : 'explicit_false', checked: true, observed: true,
+      explicit: true, value: value === true, targetNodeObserved: true, sourcePath: propertyPath,
+      sourceType: 'cloud_run_jsonld_node_scan', conflict: false };
+  };
+  return {
+    version: 'entity_linking_observation_v2',
+    authority: 'cloud_run_geoSignalsV1_entity_linking_v2',
+    scope: failed ? 'failed' : (scanComplete && !limited && !conflict ? 'complete' : 'incomplete'),
+    rawNodeScanComplete: scanComplete && !limited && !failed && !conflict,
+    directProvenanceComplete: false,
+    parseErrorsCount: Number(options.parseErrorsCount || 0),
+    signals: {
+      hasOrgContactPointLink: stateFor(p.orgNodeObserved, p.orgContactPointLink, `${sourceRoot}.Organization.contactPoint`),
+      hasOrgOfferCatalogLink: stateFor(p.orgNodeObserved, p.orgOfferCatalogLink, `${sourceRoot}.Organization.hasOfferCatalog|offerCatalog`),
+      hasServiceProviderLink: stateFor(p.serviceNodeObserved, p.serviceProviderLink, `${sourceRoot}.Service.provider`)
+    }
+  };
+}
+
 function summarizeJsonLdTextsLight(texts, source) {
   const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
   const typeNames = (node) => {
@@ -14968,6 +15020,7 @@ function summarizeJsonLdTextsLight(texts, source) {
     contactPointMissingFields: contactPointMissingFields.slice(0, 8),
     contactPointSource: 'seo_jsonld',
     entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
+    entityLinkPresence,
     source: source || 'jsonld_light'
   };
 }
@@ -15537,7 +15590,7 @@ async function fetchNewsIndexFreshnessSignalsLight_(url, opts = {}) {
       maxBytes: 2 * 1024 * 1024,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        'User-Agent': GEO_UNIFIED_OBSERVER_HTML_UA_V1_
       }
     }).catch(() => null);
     const finalUrl = response && response.url ? response.url : url;
@@ -15585,9 +15638,6 @@ async function fetchNewsIndexFreshnessSignalsPlaywrightLight_(url, opts = {}) {
         ]
       });
       context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-                   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                   'Chrome/122.0.0.0 Safari/537.36',
         serviceWorkers: 'allow',
         viewport: { width: 1366, height: 900 },
         javaScriptEnabled: true,
@@ -16018,7 +16068,10 @@ function buildHtmlSitemapCoverageSignalV1_(origin, observations = [], options = 
             : (serverError ? `http_${httpStatus}`
               : (fetchError ? 'fetch_error'
                 : (httpStatus >= 200 && httpStatus < 300 ? 'invalid_content' : (httpStatus == null ? 'fetch_error' : `http_${httpStatus}`)))))));
-    return { url, path:url ? new URL(url).pathname : null, checked:true, httpStatus, status,
+    const requestedUrl = typeof item.requestedUrl === 'string' && item.requestedUrl ? item.requestedUrl : null;
+    const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : null;
+    const redirected = typeof item.redirected === 'boolean' ? item.redirected : null;
+    return { url, path:url ? new URL(url).pathname : null, requestedUrl, finalUrl, redirected, checked:true, httpStatus, status,
       found:validation.valid, valid:validation.valid, validationReason:validation.reason,
       linkCount:validation.linkCount, fetchError, timeout, serverError };
   });
@@ -16064,7 +16117,15 @@ async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 15
       const status = response && typeof response.status === 'number' ? response.status : null;
       const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
       const text = response && response.ok ? String(await response.text() || '').slice(0, 500000) : '';
-      return { url, status, text, contentType };
+      return {
+        url,
+        requestedUrl: response && typeof response.requestedUrl === 'string' ? response.requestedUrl : null,
+        finalUrl: response && typeof response.url === 'string' ? response.url : null,
+        redirected: response && typeof response.redirected === 'boolean' ? response.redirected : null,
+        status,
+        text,
+        contentType
+      };
     } catch (error) {
       return { url, status:null, text:'', contentType:'', errorMessage:String(error && (error.message || error) || '').slice(0, 180) };
     } finally { if (timer) clearTimeout(timer); }
@@ -16914,6 +16975,41 @@ function mergeFrameContentObservationIntoGeoSignalsV1_(geoSignalsV1, frameObserv
   observed.coverageFrameObservationV1 = frameObservation;
 }
 
+// External-profile evidence is intentionally separate from JSON-LD sameAs.
+// A link can be an official profile only when the analysed site explicitly
+// identifies the relationship in the rendered anchor/context; host or count
+// alone never establishes the relationship.
+function buildExternalProfileObservationV1_(links, opts = {}) {
+  const source = links && typeof links === 'object' ? links : {};
+  const rows = Array.isArray(source.externalProfileLinkEvidence)
+    ? source.externalProfileLinkEvidence
+    : [];
+  const relationRe = /(?:公式|official|follow\s+us|公式(?:アカウント|sns|ソーシャル)|our\s+(?:social|account))/i;
+  const profiles = [];
+  for (const row of rows.slice(0, 10)) {
+    if (!row || typeof row !== 'object') continue;
+    const href = String(row.href || '').trim();
+    const label = normalizeSubpageJsonLdText([row.text, row.ariaLabel, row.title, row.nearbyLabel].filter(Boolean).join(' '));
+    let externalHttps = false;
+    try { externalHttps = new URL(href).protocol === 'https:'; } catch (_) {}
+    if (!externalHttps) continue;
+    profiles.push({ href, label: label.slice(0, 160), placement: String(row.placement || 'rendered_dom').slice(0, 40),
+      relationConfirmed: relationRe.test(label) });
+  }
+  const complete = opts.linksObserved === true && opts.linksLimited !== true;
+  return {
+    version: 'external_profile_observation_v1',
+    authority: 'cloud_run_geoSignalsV1_external_profile_v1',
+    checked: opts.linksObserved === true,
+    completeness: complete ? 'complete' : (opts.linksObserved === true ? 'partial' : 'unavailable'),
+    limited: !complete,
+    candidateCount: profiles.length,
+    officialProfileCount: profiles.filter(item => item.relationConfirmed === true).length,
+    relationConfirmed: profiles.some(item => item.relationConfirmed === true),
+    profiles
+  };
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
@@ -17542,6 +17638,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const anchors = queryAllDeep('a[href]').map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
+        ariaLabel: clean(a.getAttribute('aria-label') || ''),
+        title: clean(a.getAttribute('title') || ''),
+        nearbyLabel: clean(a.getAttribute('data-label') || a.getAttribute('data-context') || ''),
         navLike: !!a.closest('nav,[role="navigation"],header,footer'),
         footerLike: !!a.closest('footer,[role="contentinfo"]'),
         source: (a.getRootNode && a.getRootNode() instanceof ShadowRoot) ? 'open_shadow_dom' : 'dom'
@@ -17566,7 +17665,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
                 anchors.push({
                   text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')),
                   href: absUrl(el.getAttribute('href') || ''),
+                  ariaLabel: clean(el.getAttribute('aria-label') || ''),
+                  title: clean(el.getAttribute('title') || ''),
+                  nearbyLabel: clean(el.getAttribute('data-label') || el.getAttribute('data-context') || ''),
                   navLike: !!el.closest('nav,[role="navigation"],header,footer'),
+                  footerLike: !!el.closest('footer,[role="contentinfo"]'),
                   source: 'open_shadow_dom'
                 });
               }
@@ -17629,6 +17732,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
       const externalProfileItems = limit(anchors.filter((a) => profileHostRe.test(a.href)).map((a) => a.href), 10);
+      const externalProfileLinkEvidence = limit(anchors.filter((a) => profileHostRe.test(a.href)).map((a) => ({
+        href: a.href, text: a.text || '', ariaLabel: a.ariaLabel || '', title: a.title || '',
+        nearbyLabel: a.nearbyLabel || '', placement: a.footerLike ? 'footer' : (a.navLike ? 'nav' : 'rendered_dom')
+      })), 10);
       const footerExternalProfileItems = limit(anchors.filter((a) => a.footerLike && profileHostRe.test(a.href)).map((a) => a.href), 10);
       const semanticHeaderCount = queryAllDeep('header,[role="banner"]').length;
       const semanticNavCount = queryAllDeep('nav,[role="navigation"]').length;
@@ -18123,6 +18230,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           canonicalNavigationLinkCount: canonicalNavigationLinks.length,
           canonicalNavigationLinkObservation: { checked: true, complete: true, sourceScope: 'rendered_dom_visible_same_origin_primary_routes' },
           internalLinksSample: internal.slice(0, 50),
+          externalProfileLinkEvidence,
           externalProfileLinksSample: externalProfileItems.slice(0, 10),
           socialLinksSample: externalProfileItems.slice(0, 10),
           footerExternalLinksSample: footerExternalProfileItems.slice(0, 10),
@@ -18201,6 +18309,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             source: 'seo_jsonld'
           },
           entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
+          entityLinkPresence,
           structuredDataQualityV1,
           htmlScanSkipped: true,
           jsScanSkipped: true,
@@ -18679,6 +18788,18 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       htmlContentJsonLdSummary && htmlContentJsonLdSummary.entityLinkSignals,
       scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.entityLinkSignals
     ]);
+    const renderedEntityLinkingObservationV2 = buildEntityLinkingObservationV2_(
+      renderedStructured.entityLinkPresence,
+      {
+        scanComplete: renderedStructured.renderedDomObserved === true &&
+          Number(renderedStructured.rawCount || 0) === Number(renderedStructured.parseableCount || 0) &&
+          Number(renderedStructured.parseErrorsCount || 0) === 0,
+        limited: false,
+        failed: false,
+        parseErrorsCount: Number(renderedStructured.parseErrorsCount || 0),
+        sourceRoot: 'geoSignalsV1.structuredData.renderedDomJsonLd'
+      }
+    );
     const observedMultimodalSignals = observed.multimodalSignals && typeof observed.multimodalSignals === 'object'
       ? observed.multimodalSignals
       : null;
@@ -18819,6 +18940,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       // script-src, or microdata observations into this contract.
       structuredDataQualityV1: renderedStructured && renderedStructured.structuredDataQualityV1 || null,
       entityLinkSignals: entityLinkSignalsLight,
+      entityLinkingObservationV2: renderedEntityLinkingObservationV2,
       htmlScanSkipped: false,
       jsScanSkipped: true,
       chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
@@ -18866,6 +18988,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       structuredData: structuredDataLight,
       structuredDataQualityV1: structuredDataLight.structuredDataQualityV1 || null,
       entityLinkSignals: entityLinkSignalsLight,
+      entityLinkingObservationV2: structuredDataLight.entityLinkingObservationV2 || null,
       articleSignals,
       headings: {
         h1Count: mergedH1.length,
@@ -19120,6 +19243,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             : 0,
           canonicalNavigationLinkObservation: observed.links && observed.links.canonicalNavigationLinkObservation || null,
           internalLinksSample: observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.slice(0, 50) : [],
+          externalProfileLinkEvidence: observed.links && Array.isArray(observed.links.externalProfileLinkEvidence) ? observed.links.externalProfileLinkEvidence.slice(0, 10) : [],
           externalProfileLinksSample: observed.links && Array.isArray(observed.links.externalProfileLinksSample) ? observed.links.externalProfileLinksSample.slice(0, 10) : [],
           socialLinksSample: observed.links && Array.isArray(observed.links.socialLinksSample) ? observed.links.socialLinksSample.slice(0, 10) : [],
           footerExternalLinksSample: observed.links && Array.isArray(observed.links.footerExternalLinksSample) ? observed.links.footerExternalLinksSample.slice(0, 10) : [],
@@ -19257,6 +19381,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     attachAltObservationV2ToGeoSignalsV1_(geoSignalsV1, { staticFallback: opts.staticFallback === true });
     attachPrimaryMessageObservationV2ToGeoSignalsV1_(geoSignalsV1, { staticFallback: opts.staticFallback === true });
     attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, null, { siteMode, url });
+    geoSignalsV1.externalProfileObservationV1 = buildExternalProfileObservationV1_(geoSignalsV1.observed && geoSignalsV1.observed.links, {
+      linksObserved: !!(geoSignalsV1.observed && geoSignalsV1.observed.links &&
+        Array.isArray(geoSignalsV1.observed.links.externalProfileLinkEvidence)),
+      linksLimited: !!(geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.observationLimitedByPhase && geoSignalsV1.diagnostics.observationLimitedByPhase.linksAndTrust)
+    });
+    geoSignalsV1.observed.externalProfileObservationV1 = geoSignalsV1.externalProfileObservationV1;
     try {
       console.log('[PW][GEO_SIGNALS_V1]', JSON.stringify({
         h1Count: geoSignalsV1.observed.h1.count,
@@ -19843,7 +19973,7 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
       signal: controller ? controller.signal : undefined,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        'User-Agent': GEO_UNIFIED_OBSERVER_HTML_UA_V1_
       },
       maxBytes: 2 * 1024 * 1024
     }, opts.executionAuth || null);
@@ -20060,11 +20190,96 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
     coreSignalsReady: staticFetchResult && staticFetchResult.success === true,
     topPageStaticFetch: geoSignalsV1.diagnostics.topPageStaticFetch
   };
+  geoSignalsV1.diagnostics.observationProvenanceV1 = {
+    version: 1,
+    sources: {
+      browser_rendered: { status: null, state: 'not_attempted' },
+      node_static: {
+        status: typeof staticFetchResult.status === 'number' ? staticFetchResult.status : null,
+        state: staticFetchResult && staticFetchResult.success === true ? 'available' : 'unavailable'
+      },
+      static_only_fallback: true,
+      observation_limited: true
+    },
+    merge: { allowed: false, appliedFields: [] }
+  };
   return { geoSignalsV1, lightweightSummary };
 }
 
-function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, staticFetchResult) {
-  if (!staticFetchResult || !staticFetchResult.success || !staticFetchResult.signals) return;
+function isSuccessfulEntryStatusV1_(status) {
+  return typeof status === 'number' && status >= 200 && status < 300;
+}
+
+function browserHeadingObservationCompleteV1_(geoSignalsV1) {
+  const observed = geoSignalsV1 && geoSignalsV1.observed || {};
+  const headings = geoSignalsV1 && geoSignalsV1.headings || {};
+  return observed.headingCollectionObserved === true && !!(observed.h1 && observed.h1.observed === true) &&
+    headings.headingObservationLimited === false;
+}
+
+function browserStructuredObservationCompleteV1_(geoSignalsV1) {
+  const observed = geoSignalsV1 && geoSignalsV1.observed || {};
+  const structured = observed.structuredData || geoSignalsV1 && geoSignalsV1.structuredData || null;
+  if (!structured || typeof structured !== 'object') return false;
+  return structured.renderedDomObserved === true || structured.observationComplete === true ||
+    structured.observationLimited === false || Object.prototype.hasOwnProperty.call(structured, 'rawCount');
+}
+
+function classifyBrowserEntryDocumentHealthV1_(geoSignalsV1, lightweightSummary, opts = {}) {
+  const status = opts && opts.browserStatus;
+  if (!isSuccessfulEntryStatusV1_(status)) return 'http_failure';
+  const observed = geoSignalsV1 && geoSignalsV1.observed || {};
+  const title = String(lightweightSummary && lightweightSummary.title || observed.title && (observed.title.value || observed.title.text) || '').trim();
+  const h1 = observed.h1 && Array.isArray(observed.h1.values) ? observed.h1.values.join(' ') : '';
+  const bodyLength = Number(lightweightSummary && lightweightSummary.bodyTextLength || observed.body && observed.body.textLength || 0);
+  const primary = String(observed.primaryMessageObservationSeedV2 && observed.primaryMessageObservationSeedV2.text || '').trim();
+  const text = `${title}\n${h1}\n${primary}`.toLowerCase();
+  const thin = bodyLength >= 0 && bodyLength < 700;
+  const permission = /access denied|forbidden|not authorized|permission to access/.test(text);
+  const delivery = /errors\.edgesuite\.net|akamai|reference\s*#/.test(text);
+  const challenge = /just a moment|checking your browser|attention required|captcha/.test(text);
+  if (thin && ((permission && delivery) || (challenge && /cloudflare|browser/.test(text)))) return 'error_document';
+  return 'normal';
+}
+
+function attachTopPageObservationProvenanceV1_(geoSignalsV1, staticFetchResult, opts, merge) {
+  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') return;
+  geoSignalsV1.diagnostics = geoSignalsV1.diagnostics || {};
+  const browserStatus = opts && typeof opts.browserStatus === 'number' ? opts.browserStatus : null;
+  const browserHealth = classifyBrowserEntryDocumentHealthV1_(geoSignalsV1, opts && opts.lightweightSummary || null, opts || {});
+  const staticStatus = staticFetchResult && typeof staticFetchResult.status === 'number' ? staticFetchResult.status : null;
+  geoSignalsV1.diagnostics.observationProvenanceV1 = {
+    version: 1,
+    sources: {
+      browser_rendered: {
+        status: browserStatus,
+        state: browserHealth === 'normal' ? 'available' : browserHealth
+      },
+      node_static: {
+        status: staticStatus,
+        state: staticFetchResult && staticFetchResult.success === true ? 'available' : 'unavailable'
+      },
+      static_only_fallback: false,
+      observation_limited: browserHealth !== 'normal'
+    },
+    merge: {
+      allowed: !!(merge && merge.allowed),
+      appliedFields: merge && Array.isArray(merge.appliedFields) ? merge.appliedFields.slice(0, 20) : [],
+      disagreements: merge && Array.isArray(merge.disagreements) ? merge.disagreements.slice(0, 20) : []
+    }
+  };
+}
+
+function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, staticFetchResult, opts = {}) {
+  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') return;
+  const merge = { allowed: false, appliedFields: [], disagreements: [] };
+  const browserHealth = classifyBrowserEntryDocumentHealthV1_(geoSignalsV1, lightweightSummary, opts);
+  const staticAvailable = !!(staticFetchResult && staticFetchResult.success === true && staticFetchResult.signals);
+  if (browserHealth !== 'normal' || !staticAvailable) {
+    attachTopPageObservationProvenanceV1_(geoSignalsV1, staticFetchResult, Object.assign({}, opts, { lightweightSummary }), merge);
+    return;
+  }
+  merge.allowed = true;
   const fallback = buildStaticFallbackGeoSignalsPayload_(staticFetchResult.finalUrl || staticFetchResult.url, staticFetchResult, {});
   const fg = fallback.geoSignalsV1;
   const fl = fallback.lightweightSummary;
@@ -20076,27 +20291,32 @@ function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary,
   const observed = geoSignalsV1.observed;
   // A completed rendered-DOM heading query owns an empty H1 result. Do not
   // replace it with static fallback data merely because the count is zero.
-  const renderedDomHeadingObservationComplete = observed.headingCollectionObserved === true &&
-    observed.h1 && observed.h1.observed === true &&
-    geoSignalsV1.headings.headingObservationLimited === false;
+  const renderedDomHeadingObservationComplete = browserHeadingObservationCompleteV1_(geoSignalsV1);
+  const renderedStructuredObservationComplete = browserStructuredObservationCompleteV1_(geoSignalsV1);
+  const browserTitleObserved = !!(observed.title && observed.title.observed === true);
+  const browserDescriptionObserved = !!(observed.metaDescription && observed.metaDescription.observed === true);
+  if (browserTitleObserved && fl.title && String(observed.title.value || observed.title.text || '').trim() !== String(fl.title).trim()) merge.disagreements.push('title');
+  if (renderedDomHeadingObservationComplete && Number(geoSignalsV1.headings.h1Count || 0) !== Number(fl.h1Count || 0)) merge.disagreements.push('h1');
+  const browserStructured = observed.structuredData || geoSignalsV1.structuredData || {};
+  if (renderedStructuredObservationComplete && Number(browserStructured.rawCount || 0) !== Number(fl.jsonldCount || 0)) merge.disagreements.push('jsonld');
   // A completed DOM query with an empty value is a valid absence observation.
   // Only replace an unavailable rendered-DOM result with a completed static one.
-  if (!(observed.title && observed.title.observed === true) && fg.observed.title && fg.observed.title.observed === true) observed.title = fg.observed.title;
-  if (!(observed.metaDescription && observed.metaDescription.observed === true) && fg.observed.metaDescription && fg.observed.metaDescription.observed === true) observed.metaDescription = fg.observed.metaDescription;
-  if (!renderedDomHeadingObservationComplete && fg.observed.h1) observed.h1 = fg.observed.h1;
-  if (!(geoSignalsV1.articleSignals && geoSignalsV1.articleSignals.checked === true) && fg.articleSignals) geoSignalsV1.articleSignals = fg.articleSignals;
-  if (!renderedDomHeadingObservationComplete && !Number(geoSignalsV1.headings.h1Count || 0) && fg.headings) Object.assign(geoSignalsV1.headings, fg.headings);
-  if (!Object.prototype.hasOwnProperty.call(geoSignalsV1.landmarks, 'hasMainLandmark') || geoSignalsV1.landmarks.hasMainLandmark == null) Object.assign(geoSignalsV1.landmarks, fg.landmarks);
+  if (!browserTitleObserved && fg.observed.title && fg.observed.title.observed === true) { observed.title = fg.observed.title; merge.appliedFields.push('title'); }
+  if (!browserDescriptionObserved && fg.observed.metaDescription && fg.observed.metaDescription.observed === true) { observed.metaDescription = fg.observed.metaDescription; merge.appliedFields.push('meta_description'); }
+  if (!renderedDomHeadingObservationComplete && fg.observed.h1) { observed.h1 = fg.observed.h1; merge.appliedFields.push('h1'); }
+  if (geoSignalsV1.articleSignals == null && fg.articleSignals) { geoSignalsV1.articleSignals = fg.articleSignals; merge.appliedFields.push('article_signals'); }
+  if (!renderedDomHeadingObservationComplete && fg.headings) { Object.assign(geoSignalsV1.headings, fg.headings); if (merge.appliedFields.indexOf('h1') < 0) merge.appliedFields.push('headings'); }
+  if (!Object.prototype.hasOwnProperty.call(geoSignalsV1.landmarks, 'hasMainLandmark') || geoSignalsV1.landmarks.hasMainLandmark == null) { Object.assign(geoSignalsV1.landmarks, fg.landmarks); merge.appliedFields.push('landmarks'); }
   ['hasHeaderElement', 'hasNavElement', 'hasFooterElement', 'hasMainElement', 'hasSemanticStructure'].forEach(key => {
     if (!Object.prototype.hasOwnProperty.call(geoSignalsV1.coverage.semanticElements, key) || geoSignalsV1.coverage.semanticElements[key] == null) {
       geoSignalsV1.coverage.semanticElements[key] = fg.coverage.semanticElements[key];
+      if (merge.appliedFields.indexOf('semantic_elements') < 0) merge.appliedFields.push('semantic_elements');
     }
   });
   geoSignalsV1.observed.headings = geoSignalsV1.observed.headings || geoSignalsV1.headings;
   geoSignalsV1.observed.landmarks = geoSignalsV1.observed.landmarks || geoSignalsV1.landmarks;
   geoSignalsV1.observed.coverage = geoSignalsV1.observed.coverage || geoSignalsV1.coverage;
   geoSignalsV1.observed.articleSignals = geoSignalsV1.observed.articleSignals || geoSignalsV1.articleSignals || fg.articleSignals;
-  geoSignalsV1.diagnostics = geoSignalsV1.diagnostics || {};
   geoSignalsV1.diagnostics.topPageStaticFetch = {
     used: true,
     success: true,
@@ -20105,30 +20325,31 @@ function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary,
     error: staticFetchResult.error || ''
   };
   if (lightweightSummary && typeof lightweightSummary === 'object') {
-    const fill = (key, value) => {
-      if ((lightweightSummary[key] == null || lightweightSummary[key] === '' || lightweightSummary[key] === 0) && value != null && value !== '') lightweightSummary[key] = value;
-    };
-    fill('title', fl.title);
-    fill('metaDescription', fl.metaDescription);
-    fill('metaDescriptionLen', fl.metaDescriptionLen);
-    fill('h1Count', fl.h1Count);
-    fill('h1Source', fl.h1Source);
-    fill('headingSource', fl.headingSource);
-    fill('primaryHeadingCandidate', fl.primaryHeadingCandidate);
-    fill('primaryHeadingCandidateSource', fl.primaryHeadingCandidateSource);
-    fill('hasMainLandmark', fl.hasMainLandmark);
-    fill('hasMainLandmarkFinal', fl.hasMainLandmarkFinal);
-    fill('mainLandmarkSource', fl.mainLandmarkSource);
-    fill('hasHeaderElement', fl.hasHeaderElement);
-    fill('hasNavElement', fl.hasNavElement);
-    fill('hasFooterElement', fl.hasFooterElement);
-    fill('hasMainElement', fl.hasMainElement);
-    fill('hasSemanticStructure', fl.hasSemanticStructure);
-    fill('jsonldCount', fl.jsonldCount);
-    if (!(lightweightSummary.articleSignals && lightweightSummary.articleSignals.checked === true) && fl.articleSignals) lightweightSummary.articleSignals = fl.articleSignals;
-    if (!Array.isArray(lightweightSummary.jsonldTypes) || !lightweightSummary.jsonldTypes.length) lightweightSummary.jsonldTypes = fl.jsonldTypes;
+    if (!browserTitleObserved && (lightweightSummary.title == null || lightweightSummary.title === '')) lightweightSummary.title = fl.title;
+    if (!browserDescriptionObserved && (lightweightSummary.metaDescription == null || lightweightSummary.metaDescription === '')) {
+      lightweightSummary.metaDescription = fl.metaDescription;
+      lightweightSummary.metaDescriptionLen = fl.metaDescriptionLen;
+    }
+    if (!renderedDomHeadingObservationComplete) {
+      lightweightSummary.h1Count = fl.h1Count;
+      lightweightSummary.h1Source = fl.h1Source;
+      lightweightSummary.headingSource = fl.headingSource;
+      lightweightSummary.primaryHeadingCandidate = fl.primaryHeadingCandidate;
+      lightweightSummary.primaryHeadingCandidateSource = fl.primaryHeadingCandidateSource;
+    }
+    if (!Object.prototype.hasOwnProperty.call(geoSignalsV1.landmarks, 'hasMainLandmark') || geoSignalsV1.landmarks.hasMainLandmark == null) {
+      lightweightSummary.hasMainLandmark = fl.hasMainLandmark;
+      lightweightSummary.hasMainLandmarkFinal = fl.hasMainLandmarkFinal;
+      lightweightSummary.mainLandmarkSource = fl.mainLandmarkSource;
+    }
+    if (!renderedStructuredObservationComplete) {
+      lightweightSummary.jsonldCount = fl.jsonldCount;
+      lightweightSummary.jsonldTypes = fl.jsonldTypes;
+    }
+    if (lightweightSummary.articleSignals == null && fl.articleSignals) lightweightSummary.articleSignals = fl.articleSignals;
     lightweightSummary.topPageStaticFetch = geoSignalsV1.diagnostics.topPageStaticFetch;
   }
+  attachTopPageObservationProvenanceV1_(geoSignalsV1, staticFetchResult, Object.assign({}, opts, { lightweightSummary }), merge);
 }
 
 // ---- 各スコア（0-100） ----
@@ -21283,6 +21504,8 @@ app.post('/scrape-auth', async (req, res) => {
     request = req && req.body && req.body.request && typeof req.body.request === 'object' ? req.body.request : null;
     executionAuth = parseExecutionAuth_(request, req && req.body && req.body.executionAuth);
     if (!executionAuth) throw authError_('AUTH_INVALID_INPUT');
+    const requestRunId = String(request.runId || '').trim();
+    if (requestRunId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestRunId)) throw authError_('AUTH_INVALID_INPUT');
     // Only explicitly allowed, non-secret request fields enter the legacy
     // scraper. This keeps the original POST body out of all generic traces.
     const query = {
@@ -21291,7 +21514,8 @@ app.post('/scrape-auth', async (req, res) => {
       signalsMode: String(request.signalsMode || 'light'),
       responseMode: String(request.responseMode || ''),
       siteMode: String(request.siteMode || 'generic'),
-      subpageObservationMode: String(request.subpageObservationMode || '')
+      subpageObservationMode: String(request.subpageObservationMode || ''),
+      runId: requestRunId
     };
     console.log('[AUTH_SCRAPE][ENTER]', JSON.stringify({ origin: executionAuth.authOrigin, signalsMode: query.signalsMode }));
     // Keep authenticated light requests on the exact same budget, queue, and
@@ -21371,6 +21595,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     hasFAQPage: structuredData.hasFAQPage,
     hasProductJsonLd: structuredData.hasProductJsonLd,
     entityLinkSignals,
+    entityLinkingObservationV2: structuredData.entityLinkingObservationV2 || g.entityLinkingObservationV2 || null,
     hasSitemapXml: Object.prototype.hasOwnProperty.call(structuredData, 'hasSitemapXml') ? structuredData.hasSitemapXml : null,
     sitemapXmlUrl: structuredData.sitemapXmlUrl || null,
     sitemapDiscoveryMethod: structuredData.sitemapDiscoveryMethod || 'not_checked',
@@ -21443,6 +21668,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     navigationPathObservationsV1: links.navigationPathObservationsV1 || g.navigationPathObservationsV1 || null,
     navTextsSample: arr(links.navTextsSample, 10, 'geoSignalsV1.observed.links.navTextsSample', (v) => str(v, 100)),
     internalLinksSample: arr(links.internalLinksSample, 10, 'geoSignalsV1.observed.links.internalLinksSample', linkSample),
+    externalProfileLinkEvidence: arr(links.externalProfileLinkEvidence, 10, 'geoSignalsV1.observed.links.externalProfileLinkEvidence', linkSample),
     externalProfileLinksSample: arr(links.externalProfileLinksSample, 10, 'geoSignalsV1.observed.links.externalProfileLinksSample', (v) => str(v, 180)),
     socialLinksSample: arr(links.socialLinksSample, 10, 'geoSignalsV1.observed.links.socialLinksSample', (v) => str(v, 180)),
     footerExternalLinksSample: arr(links.footerExternalLinksSample, 10, 'geoSignalsV1.observed.links.footerExternalLinksSample', (v) => str(v, 180)),
@@ -21497,6 +21723,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     navigationPathObservationsV1: g.navigationPathObservationsV1 || (observed.links && observed.links.navigationPathObservationsV1) || null,
     structuredData: shortStructuredData,
     entityLinkSignals,
+    entityLinkingObservationV2: g.entityLinkingObservationV2 || structuredData.entityLinkingObservationV2 || null,
     headings: shortHeadings,
     balanced: shortBalanced,
     landmarks: shortLandmarks,
@@ -21609,6 +21836,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   if (g.operatorIdentityCandidateAuditV1 && typeof g.operatorIdentityCandidateAuditV1 === 'object') {
     shortGeoSignalsV1.operatorIdentityCandidateAuditV1 = g.operatorIdentityCandidateAuditV1;
   }
+  if (g.externalProfileObservationV1 && typeof g.externalProfileObservationV1 === 'object') {
+    shortGeoSignalsV1.externalProfileObservationV1 = g.externalProfileObservationV1;
+  }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
   if (Array.isArray(shortLightweightSummary.seoJsonldTypes)) shortLightweightSummary.seoJsonldTypes = shortLightweightSummary.seoJsonldTypes.slice(0, 50);
@@ -21676,6 +21906,9 @@ function isOperatorIdentityNoSaveRedirectDebugRequestV1_(req, signalsFirstLight,
 
 async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   const urlToFetch = req.query.url;
+  const rawRunId = String(req && req.query && req.query.runId || '').trim();
+  const runId = rawRunId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawRunId) ? rawRunId : '';
+  if (rawRunId && !runId) return res.status(400).json({ ok:false, error:'invalid_run_id' });
   const executionAuth = scrapeOptions && scrapeOptions.executionAuth || null;
   const authenticatedRun = !!(scrapeOptions && scrapeOptions.authenticatedRun && executionAuth);
 
@@ -21976,9 +22209,6 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
 
     const __timingPageReadyStart = Date.now();
     const contextOptions = {
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                 'Chrome/122.0.0.0 Safari/537.36',
       serviceWorkers: 'allow',
       viewport: { width: 1366, height: 900 },
       javaScriptEnabled: true,
@@ -22019,15 +22249,6 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       recordLightCheckpoint_(lightBudget, 'page_defaults_configured');
     }
 
-    const addInitScript = () => page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-    if (signalsFirstLight) {
-      await runLightBudgetStage_(lightBudget, 'init_script', 5000, addInitScript);
-      recordLightCheckpoint_(lightBudget, 'init_script_complete');
-    } else {
-      await addInitScript();
-    }
     scrapeTiming.pageReadyMs = Math.max(0, Date.now() - __timingPageReadyStart);
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
     logHeavySiteTopPageAudit('browser_page_setup_end', {
@@ -22969,6 +23190,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
               : [],
             contactPointSource: 'seo_jsonld',
             entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
+            entityLinkPresence,
             structuredDataQualityV1,
             observed: true
           };
@@ -22993,6 +23215,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           renderedStructuredDataQualityV1: rendered.structuredDataQualityV1 || null,
           htmlSameAsSummary: htmlSummary && htmlSummary.sameAsSummary || null,
           renderedEntityLinkSignals: rendered.entityLinkSignals || null,
+          renderedEntityLinkPresence: rendered.entityLinkPresence || null,
           htmlEntityLinkSignals: htmlSummary && htmlSummary.entityLinkSignals || null,
           renderedTrustSummary: {
             addressObserved: rendered.addressObserved,
@@ -23757,6 +23980,18 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         structuredLight.htmlEntityLinkSignals,
         scriptJsonLd && scriptJsonLd.entityLinkSignals
       ]);
+      const renderedEntityLinkingObservationV2 = buildEntityLinkingObservationV2_(
+        structuredLight.renderedEntityLinkPresence,
+        {
+          scanComplete: structuredLight.renderedDomObserved === true &&
+            Number(structuredLight.renderedDomRawCount || 0) === Number(structuredLight.renderedDomParseableCount || 0) &&
+            Number(structuredLight.renderedDomParseErrorsCount || 0) === 0,
+          limited: false,
+          failed: false,
+          parseErrorsCount: Number(structuredLight.renderedDomParseErrorsCount || 0),
+          sourceRoot: 'geoSignalsV1.structuredData.renderedDomJsonLd'
+        }
+      );
       const structuredTrustSummary = mergeTrustStructuredSummary([
         structuredLight.renderedTrustSummary,
         structuredLight.htmlTrustSummary
@@ -23792,6 +24027,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         },
         sameAsSummary,
         entityLinkSignals: entityLinkSignalsLight,
+        entityLinkingObservationV2: renderedEntityLinkingObservationV2,
         typeClassificationSource: mergedTypeClass.typeClassificationSource,
         source: 'shortfast_phase_builder',
         confidence: 'medium',
@@ -23869,6 +24105,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         structuredData: structuredDataLight,
         structuredDataQualityV1: structuredDataLight.structuredDataQualityV1 || null,
         entityLinkSignals: entityLinkSignalsLight,
+        entityLinkingObservationV2: structuredDataLight.entityLinkingObservationV2 || null,
         articleSignals,
         geoThemeSignals,
         headings: {
@@ -24506,7 +24743,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           }),
           memoryHints
         };
-        mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
+        mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult, {
+          browserStatus: status,
+          browserFinalUrl: finalUrl
+        });
         attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
         unifiedPayload.geoSignalsV1 = geoSignalsV1;
         unifiedPayload.lightweightSummary = lightweightSummary;
@@ -24560,7 +24800,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         fullStructuredDataProfile: profilePresence(geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.organizationProfile),
         lightweightSummaryProfile: profilePresence(lightweightSummary && lightweightSummary.organizationProfile)
       };
-      mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
+      mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult, {
+        browserStatus: status,
+        browserFinalUrl: finalUrl
+      });
       attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
       dedicatedPayload.geoSignalsV1 = geoSignalsV1;
       dedicatedPayload.lightweightSummary = lightweightSummary;
@@ -26034,7 +26277,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       if (memoryHintTask.state === 'completed') {
         memoryHints.estimatedSavedBytes = Math.max(0, Number(memoryHintTask.value || 0) * 2);
       }
-      mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
+      mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult, {
+        browserStatus: resp && typeof resp.status === 'function' ? resp.status() : null,
+        browserFinalUrl: finalUrl || urlToFetch
+      });
       attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
       if (geoSignalsV1 && geoSignalsV1.diagnostics) {
         geoSignalsV1.diagnostics.playwrightTimedOut = false;
@@ -26088,6 +26334,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         diagnostics,
         memoryHints
       };
+      if (runId) signalsResponsePayload.runId = runId;
       if (signalsFirstLight && signalsResponsePayload.diagnostics) {
         Object.assign(signalsResponsePayload.diagnostics, lightRequestTiming() || {});
       }
@@ -26180,6 +26427,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       };
       if (balancedShortResponse) {
         const shortPayload = buildBalancedShortResponsePayload(signalsResponsePayload);
+        if (runId) shortPayload.runId = runId;
         if (balancedShortFastResponse) {
           shortPayload.responseMode = 'shortFast';
           shortPayload.shortFastMode = true;
@@ -29223,6 +29471,7 @@ module.exports.__lightBudgetTestHooks = {
   buildAiPolicyTrustSignalV1_,
   buildHtmlSitemapCoverageSignalV1_,
   attachHtmlSitemapCoverageSignalToGeoSignalsV1_,
+  buildExternalProfileObservationV1_,
   coverageObservationV2Common_,
   buildAltObservationV2_,
   classifyAltPurposeV2_,

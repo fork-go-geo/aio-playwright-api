@@ -178,7 +178,7 @@ async function observeNormal(html, name, options = {}) {
     observed: buildHeadObservations_({}, { observationCompleted: true, source: 'rendered_dom' }),
     headings: {}, landmarks: {}, coverage: { semanticElements: {} }, diagnostics: {}
   };
-  mergeTopPageStaticSignalsIntoPayload_(protectedGeo, {}, staticForMerge);
+  mergeTopPageStaticSignalsIntoPayload_(protectedGeo, {}, staticForMerge, { browserStatus: 200 });
   assertHead(protectedGeo.observed.title, true, null);
   assertHead(protectedGeo.observed.metaDescription, true, null);
   assert.strictEqual(protectedGeo.observed.metaDescription.source, 'rendered_dom');
@@ -187,7 +187,7 @@ async function observeNormal(html, name, options = {}) {
     observed: buildHeadObservations_({}, { observationCompleted: false }),
     headings: {}, landmarks: {}, coverage: { semanticElements: {} }, diagnostics: {}
   };
-  mergeTopPageStaticSignalsIntoPayload_(adoptStaticGeo, {}, staticForMerge);
+  mergeTopPageStaticSignalsIntoPayload_(adoptStaticGeo, {}, staticForMerge, { browserStatus: 200 });
   assertHead(adoptStaticGeo.observed.title, true, null);
   assertHead(adoptStaticGeo.observed.metaDescription, true, null);
   assert.strictEqual(adoptStaticGeo.observed.metaDescription.source, 'top_page_static_html_fetch');
@@ -215,7 +215,7 @@ async function observeNormal(html, name, options = {}) {
     },
     landmarks: {}, coverage: { semanticElements: {} }, diagnostics: {}
   };
-  mergeTopPageStaticSignalsIntoPayload_(protectedRenderedH1ZeroGeo, {}, staticWithH1);
+  mergeTopPageStaticSignalsIntoPayload_(protectedRenderedH1ZeroGeo, {}, staticWithH1, { browserStatus: 200 });
   assert.strictEqual(protectedRenderedH1ZeroGeo.observed.h1.count, 0);
   assert.strictEqual(protectedRenderedH1ZeroGeo.observed.h1.source, 'rendered_dom');
   assert.strictEqual(protectedRenderedH1ZeroGeo.headings.h1Count, 0);

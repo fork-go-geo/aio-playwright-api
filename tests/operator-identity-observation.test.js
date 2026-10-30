@@ -9,12 +9,19 @@ const {
   attachOperatorIdentityProbeProvenance_,
   buildLightCoverageObservationPlan_,
 } = require('../index.js').__lightBudgetTestHooks;
+const hooks = require('../index.js').__lightBudgetTestHooks;
 
 const asuzacUrl = 'https://asuzac-space.jp/aboutus/summary.htm';
-const asuzacCandidate = {
+const asuzacCompanyCandidate = {
+  url: asuzacUrl,
+  label: '会社概要',
+  sources: ['sitemap', 'nav', 'footer'],
+  score: 33,
+};
+const asuzacBusinessCandidate = {
   url: asuzacUrl,
   label: 'アルミ事業部紹介',
-  sources: ['sitemap', 'footer'],
+  sources: ['sitemap', 'nav', 'footer'],
   score: 33,
 };
 const asuzacHtml = `
@@ -68,12 +75,14 @@ const thinksystemHtml = `
   <dl><dt>代表者</dt><dd>中山 千恵</dd></dl>`;
 
 // Case 1: the company-profile probe is independent of the normal two-page plan.
-assert.strictEqual(isHighConfidenceCompanyProfileCandidate_(asuzacCandidate), true);
-assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCandidate], 'generic').url, asuzacUrl);
+assert.strictEqual(isHighConfidenceCompanyProfileCandidate_(asuzacCompanyCandidate), true);
+assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCompanyCandidate], 'generic').url, asuzacUrl);
 assert.strictEqual(selectOperatorIdentityProbeCandidate_([
   { url: 'https://asuzac-space.jp/aboutus/', label: '会社情報', sources: ['sitemap', 'footer'], score: 100 },
-  asuzacCandidate,
+  asuzacCompanyCandidate,
 ], 'generic').url, asuzacUrl);
+assert.strictEqual(isHighConfidenceCompanyProfileCandidate_(asuzacBusinessCandidate), false);
+assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacBusinessCandidate], 'generic'), null);
 const asuzacInfo = extractOperatorIdentityInfoFromHtml_(asuzacHtml, asuzacUrl, { highConfidenceCompanyProfile: true });
 assert.deepStrictEqual(
   [asuzacInfo.companyName, asuzacInfo.address, asuzacInfo.telephone, asuzacInfo.hasOperatorInfo],
@@ -230,7 +239,7 @@ for (const value of ['山田太郎', 'タリーズカード', '商品A', '新宿
 const normalPlan = buildLightCoverageObservationPlan_([
   { url: 'https://asuzac-space.jp/business/index.htm', category: 'business', score: 100 },
   { url: 'https://asuzac-space.jp/contact/form.htm', category: 'contact', score: 100 },
-  asuzacCandidate,
+  asuzacBusinessCandidate,
 ], { siteMode: 'generic', maxObserve: 2 });
 assert.deepStrictEqual(normalPlan.candidates.map((candidate) => candidate.url), [
   'https://asuzac-space.jp/business/index.htm',
@@ -241,13 +250,30 @@ assert.deepStrictEqual(normalPlan.candidates.map((candidate) => candidate.url), 
 const conceptInfo = extractOperatorIdentityInfoFromHtml_('<h1>私たちについて</h1><p>ブランドのコンセプトです。</p>', 'https://example.test/about/', { highConfidenceCompanyProfile: true });
 assert.strictEqual(conceptInfo.hasOperatorInfo, false);
 
-// Case 3: a path alone cannot qualify a company-profile probe.
+// Case 3: a path alone cannot qualify a company-profile probe. Explicit
+// company-profile labels plus independent discovery do qualify across the
+// conventional corporate route families.
+for (const candidate of [
+  { url: 'https://example.test/company/profile/', label: '会社概要', sources: ['sitemap', 'nav'] },
+  { url: 'https://example.test/about/', label: '企業情報', sources: ['htmlSitemap', 'footer'] },
+  { url: 'https://example.test/corporate/outline/', label: '会社概要', sources: ['sitemap', 'footer'] },
+  { url: 'https://example.test/aboutus/company.htm', label: '会社情報', sources: ['sitemap', 'nav'] },
+]) assert.strictEqual(isHighConfidenceCompanyProfileCandidate_(candidate), true, candidate.url);
 assert.strictEqual(isHighConfidenceCompanyProfileCandidate_({
   url: 'https://example.test/aboutus/summary.htm', label: 'About', sources: ['sitemap'], score: 99,
 }), false);
-assert.strictEqual(isHighConfidenceCompanyProfileCandidate_({
-  url: 'https://example.test/company/news/', label: '会社ニュース', sources: ['htmlSitemap', 'nav', 'footer'], score: 100,
-}), false);
+for (const candidate of [
+  { url: 'https://example.test/company/news/', label: '会社ニュース', sources: ['htmlSitemap', 'nav', 'footer'] },
+  { url: 'https://example.test/company/ir/', label: 'IRニュース', sources: ['sitemap', 'nav'] },
+  { url: 'https://example.test/company/recruit/', label: '採用情報', sources: ['sitemap', 'footer'] },
+  { url: 'https://example.test/aboutus/summary.htm', label: 'アルミ事業部紹介', sources: ['sitemap', 'nav'] },
+  { url: 'https://example.test/company/products/', label: '製品紹介', sources: ['sitemap', 'nav'] },
+  { url: 'https://example.test/company/service/', label: 'サービス一覧', sources: ['sitemap', 'footer'] },
+  { url: 'https://example.test/company/', label: 'お知らせ', sources: ['sitemap', 'nav'] },
+  // Body wording is not candidate evidence; only the discovered link label
+  // and its independent route/source context may select a probe.
+  { url: 'https://example.test/company/news/', label: 'お知らせ', sources: ['sitemap', 'nav'], bodyText: '会社概要' },
+]) assert.strictEqual(isHighConfidenceCompanyProfileCandidate_(candidate), false, candidate.url + ':' + candidate.label);
 assert.strictEqual(isHighConfidenceCompanyProfileCandidate_({
   url: 'https://example.test/profile/', label: '著者プロフィール', sources: ['htmlSitemap', 'nav'], score: 100,
 }), false);
@@ -260,12 +286,39 @@ const legalInfo = extractLegalOperatorInfoFromHtml_('<table><tr><th>所在地</t
 assert.strictEqual(legalInfo.hasOperatorInfo, true);
 assert.strictEqual(legalInfo.sourceType, 'legal');
 
-// Case 5: SaaS uses the same bounded operator-profile probe, while modes
-// without this operator-identity contract remain excluded.
-assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCandidate], 'saas').url, asuzacUrl);
-for (const siteMode of ['shop', 'shop_facility', 'media', 'ec']) {
-  assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCandidate], siteMode), null, siteMode);
+// Case 5: corporate/service/facility modes share the bounded profile-probe
+// contract. Shop/facility still requires explicit relation evidence at the
+// later formal-record stage; selector eligibility alone never confirms it.
+for (const siteMode of ['corporate', 'generic', 'saas', 'shop_facility']) {
+  assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCompanyCandidate], siteMode).url, asuzacUrl, siteMode);
 }
+for (const siteMode of ['shop', 'media', 'ec']) {
+  assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCompanyCandidate], siteMode), null, siteMode);
+}
+// Multiple rendered, same-origin operating-company relations remain bounded
+// probe candidates for a facility site. Selection permits retrieval only; it
+// does not create a confirmed operator record without the later formal
+// evidence and relation checks.
+const facilityRelations = [
+  {
+    url: 'https://facility.example.test/company/', label: '運営会社',
+    sources: ['explicit_body_company_profile_relation'],
+    officialSameOriginOperatorProfile: true,
+    operatorRelationSource: 'explicit_body_company_profile_relation',
+    operatorRelationSourceOrigin: 'https://facility.example.test', score: 90,
+  },
+  {
+    url: 'https://facility.example.test/corporate/outline/', label: '運営会社情報',
+    sources: ['explicit_body_company_profile_relation'],
+    officialSameOriginOperatorProfile: true,
+    operatorRelationSource: 'explicit_body_company_profile_relation',
+    operatorRelationSourceOrigin: 'https://facility.example.test', score: 80,
+  },
+];
+assert.deepStrictEqual(
+  hooks.selectOperatorIdentityProbeCandidates_(facilityRelations, 'shop_facility', 2).map(candidate => candidate.url).sort(),
+  facilityRelations.map(candidate => candidate.url).sort()
+);
 
 // Case 6: company-profile evidence requires a legal entity name in addition to address and phone.
 const nameless = extractOperatorIdentityInfoFromHtml_('<table><tr><th>所在地</th><td>東京都千代田区1-1</td></tr><tr><th>TEL</th><td>03-1234-5678</td></tr></table>', 'https://example.test/company/', { highConfidenceCompanyProfile: true });
