@@ -22177,15 +22177,19 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       signalsFirstLight,
       signalsFirstBalanced
     });
+    const useFirefoxForNtt = (() => {
+      try { return signalsFirstLight && new URL(String(urlToFetch || '')).hostname.toLowerCase() === 'www.ntt.com'; }
+      catch (_) { return false; }
+    })();
     const __timingBrowserStart = Date.now();
     logHeavySiteTopPageAudit('browser_page_setup_start', {
-      step: 'chromium_launch'
+      step: useFirefoxForNtt ? 'firefox_launch' : 'chromium_launch'
     });
     playwrightStarted = true;
-    const launchBrowser = () => chromium.launch({
+    const launchBrowser = () => (useFirefoxForNtt ? playwright.firefox : chromium).launch({
       headless: true,
       // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
-      args: [
+      ...(!useFirefoxForNtt ? { args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
@@ -22194,7 +22198,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         '--no-zygote',
         '--no-first-run',
         '--no-default-browser-check'
-      ]
+      ] } : {})
     });
     browser = signalsFirstLight
       ? await runLightBudgetStage_(lightBudget, 'browser_launch', 30000, launchBrowser, {
