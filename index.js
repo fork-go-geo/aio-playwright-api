@@ -11550,6 +11550,7 @@ function isCorroboratedCorporateSameOriginCompanyProfileRelationV1_(candidate, o
       !normalizeSubpageJsonLdText(identity.companyName || identity.operatorName)) return false;
   const candidateUrl = String(candidate.url || '').trim();
   const sourceOrigin = String(candidate.operatorRelationSourceOrigin || '').trim();
+  let candidatePath = '';
   try {
     const source = new URL(sourceOrigin);
     const target = new URL(candidateUrl);
@@ -11557,6 +11558,7 @@ function isCorroboratedCorporateSameOriginCompanyProfileRelationV1_(candidate, o
     if (source.protocol !== 'https:' || target.protocol !== 'https:' || observed.protocol !== 'https:') return false;
     if (source.origin !== target.origin || target.origin !== observed.origin) return false;
     if (discoverSubpageCandidateKey(observed.toString()) !== discoverSubpageCandidateKey(candidateUrl)) return false;
+    candidatePath = target.pathname || '';
   } catch (_) { return false; }
   const witnesses = Array.isArray(candidate.operatorIdentityNavigationWitnesses)
     ? candidate.operatorIdentityNavigationWitnesses : [];
@@ -11570,7 +11572,11 @@ function isCorroboratedCorporateSameOriginCompanyProfileRelationV1_(candidate, o
     witness.navigationScope === true && witness.footerScope !== true);
   const footerWitness = witnesses.some(witness => isCompanyWitness(witness) && witness.source === 'footer' &&
     witness.footerScope === true && witness.navigationScope !== true);
-  return navWitness && footerWitness;
+  const navOnlyExplicitCompanyProfile = navWitness &&
+    isExplicitCompanyProfileLabelV1_(candidate.label || candidate.operatorRelationLabel || candidate.operatorRelationAnchorLabel || '') &&
+    isCompanyProfileRouteV1_(candidatePath) &&
+    !!normalizeSubpageJsonLdText(identity.address || '');
+  return (navWitness && footerWitness) || navOnlyExplicitCompanyProfile;
 }
 
 function buildObservedCompanyProfileRelationEvidenceV1_(candidate, page, identity, siteMode) {

@@ -24,6 +24,7 @@ function identity(overrides = {}) {
     scope: 'company_profile_page',
     sourceUrl: companyUrl,
     companyName: '架空運営株式会社',
+    address: '東京都港区架空町1-2-3',
     hasCompanyName: true,
     hasAddress: true,
     hasTelephone: false,
@@ -63,14 +64,25 @@ assert.equal(record.identityEvidenceV1.candidateSourceUrl, record.provenance.can
 assert.equal(record.hasOperatorInfo, true);
 
 // Every relaxed-looking case below remains fail-closed.
-assert.equal(evidenceFor(candidate({
+const navOnlyCandidate = candidate({
   sources: ['nav'],
   operatorIdentityNavigationWitnesses: [{ source: 'nav', label: '会社概要', navigationScope: true, footerScope: false }]
-}), identity()), null, 'nav only is not an operating relation');
+});
+const navOnlyEvidence = evidenceFor(navOnlyCandidate, identity());
+assert.ok(navOnlyEvidence, 'an explicit same-origin company-profile nav with fetched name/address is an operating relation');
+const navOnlyFormal = hooks.normalizeOperatorIdentityInfo_(identity(), 'company_profile', { relationEvidence: navOnlyEvidence });
+assert.equal(navOnlyFormal.hasOperatorInfo, true, 'nav-only evidence reaches the existing formal operator record');
 assert.equal(evidenceFor(candidate({
   sources: ['footer'],
   operatorIdentityNavigationWitnesses: [{ source: 'footer', label: '会社概要', navigationScope: false, footerScope: true }]
 }), identity()), null, 'footer only is not an operating relation');
+assert.equal(evidenceFor(candidate({
+  url: `${entryOrigin}/company/news/`,
+  operatorIdentityNavigationWitnesses: [{ source: 'nav', label: '会社概要', navigationScope: true, footerScope: false }]
+}), identity({ sourceUrl: `${entryOrigin}/company/news/` })), null, 'company-named content routes are not company-profile relations');
+assert.equal(evidenceFor(candidate({
+  operatorIdentityNavigationWitnesses: [{ source: 'nav', label: '会社概要', navigationScope: true, footerScope: false }]
+}), identity({ address: '', hasAddress: false })), null, 'nav-only relation requires an observed address');
 assert.equal(evidenceFor(candidate({
   label: 'お知らせ',
   operatorIdentityNavigationWitnesses: [
@@ -180,7 +192,7 @@ const response = (status, text) => ({
     highConfidenceCompanyProfile: true,
     fetchImpl: async url => {
       assert.equal(String(url), companyUrl);
-      return response(200, '<main><h1>会社概要</h1><dl><dt>会社名</dt><dd>架空運営株式会社</dd></dl></main>');
+      return response(200, '<main><h1>会社概要</h1><dl><dt>会社名</dt><dd>架空運営株式会社</dd><dt>所在地</dt><dd>東京都港区架空町1-2-3</dd></dl></main>');
     }
   });
   assert.equal(page.ok, true);
@@ -192,5 +204,10 @@ const response = (status, text) => ({
   const formalRecord = hooks.attachOperatorIdentityProbeProvenance_(formal, positiveCandidate);
   assert.equal(formalRecord.hasOperatorInfo, true);
   assert.equal(formalRecord.identityEvidenceV1.candidateSourceUrl, formalRecord.provenance.candidateSourceUrl);
+  const navOnlyPathEvidence = hooks.buildObservedCompanyProfileRelationEvidenceV1_(navOnlyCandidate, page, page.operatorIdentityInfo, 'corporate');
+  const navOnlyPathFormal = hooks.normalizeOperatorIdentityInfo_(page.operatorIdentityInfo, 'company_profile', { relationEvidence: navOnlyPathEvidence });
+  const navOnlyPathRecord = hooks.attachOperatorIdentityProbeProvenance_(navOnlyPathFormal, navOnlyCandidate);
+  assert.equal(navOnlyPathRecord.hasOperatorInfo, true, 'fetched nav-only company profile reaches the formal operator record');
+  assert.equal(navOnlyPathRecord.identityEvidenceV1.candidateSourceUrl, navOnlyPathRecord.provenance.candidateSourceUrl);
   console.log('operator identity corporate same-origin relation fixtures: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });
