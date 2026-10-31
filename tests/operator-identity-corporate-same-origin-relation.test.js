@@ -72,6 +72,30 @@ const navOnlyEvidence = evidenceFor(navOnlyCandidate, identity());
 assert.ok(navOnlyEvidence, 'an explicit same-origin company-profile nav with fetched name/address is an operating relation');
 const navOnlyFormal = hooks.normalizeOperatorIdentityInfo_(identity(), 'company_profile', { relationEvidence: navOnlyEvidence });
 assert.equal(navOnlyFormal.hasOperatorInfo, true, 'nav-only evidence reaches the existing formal operator record');
+const companyGuideCandidate = candidate({
+  label: '会社案内TOP',
+  sources: ['nav'],
+  operatorIdentityNavigationWitnesses: [{ source: 'nav', label: '会社案内TOP', navigationScope: true, footerScope: false }]
+});
+assert.ok(evidenceFor(companyGuideCandidate, identity()), 'an explicit company-guide nav label reaches the existing same-origin relation');
+assert.ok(evidenceFor(candidate({
+  label: '会社案内',
+  sources: ['nav'],
+  operatorIdentityNavigationWitnesses: [{ source: 'nav', label: '会社案内', navigationScope: true, footerScope: false }]
+}), identity()), 'a company-guide nav label is recognized without a footer witness');
+['サービス案内', '採用案内', 'IR案内', '製品案内'].forEach(label => {
+  assert.equal(evidenceFor(candidate({
+    label,
+    sources: ['nav'],
+    operatorIdentityNavigationWitnesses: [{ source: 'nav', label, navigationScope: true, footerScope: false }]
+  }), identity()), null, `${label} is not a company-profile relation`);
+});
+assert.equal(evidenceFor(candidate({
+  label: 'グループ会社案内', operatorIdentityMixedEntity: true,
+  sources: ['nav'],
+  operatorIdentityNavigationWitnesses: [{ source: 'nav', label: 'グループ会社案内', navigationScope: true, footerScope: false }]
+}), identity()), null, 'mixed-company guide remains fail-closed');
+assert.equal(evidenceFor(companyGuideCandidate, identity(), { page: { ok: false } }), null, 'an unfetched company guide is not evidence');
 assert.equal(evidenceFor(candidate({
   sources: ['footer'],
   operatorIdentityNavigationWitnesses: [{ source: 'footer', label: '会社概要', navigationScope: false, footerScope: true }]

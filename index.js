@@ -3316,7 +3316,7 @@ function isOrganizationInformationContext_(url, text) {
   const path = (() => { try { return new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { return String(url || '').toLowerCase(); } })();
   const hay = `${path} ${String(text || '')}`;
   return /\/(?:guide|organization|information|about|company|corporate|profile|outline|overview)(?:\/|$|-|_)/i.test(path) ||
-    /大学について|基本情報|組織概要|組織情報|法人情報|団体概要|機関概要|運営情報|会社概要|企業情報|運営主体|\b(?:organization|institution|governance|basic\s+information|company|corporate|profile|overview)\b/i.test(hay);
+    /大学について|基本情報|組織概要|組織情報|法人情報|団体概要|機関概要|運営情報|会社概要|会社案内|企業情報|運営主体|\b(?:organization|institution|governance|basic\s+information|company|corporate|profile|overview)\b/i.test(hay);
 }
 
 // A company-looking parent path is only a routing hint.  Keep the semantic
@@ -3339,7 +3339,7 @@ function isExplicitCompanyProfileLabelV1_(label) {
   // Do not infer a company profile from a person/author profile or from a
   // newsroom title that happens to include a corporate word.
   if (/(?:会社|企業|corporate|company).*(?:ニュース|news|ir|採用|recruit|career|製品|product|サービス|service|事業|business)|(?:著者|人物|スタッフ|member|author|team).*(?:プロフィール|profile)/i.test(value)) return false;
-  return /会社概要|会社情報|企業情報|企業概要|法人概要|法人情報|団体概要|組織概要|組織情報|基本情報|事業者情報|運営会社(?:情報)?|運営主体(?:情報)?|運営情報|\b(?:company|corporate)\s*(?:information|profile|overview|outline)\b|\b(?:company|corporate)\b/i.test(value);
+  return /会社概要|会社情報|会社案内(?:\s*top)?|企業情報|企業概要|法人概要|法人情報|団体概要|組織概要|組織情報|基本情報|事業者情報|運営会社(?:情報)?|運営主体(?:情報)?|運営情報|\b(?:company|corporate)\s*(?:information|profile|overview|outline)\b|\b(?:company|corporate)\b/i.test(value);
 }
 
 // Evaluate the existing high-confidence predicate once so the bounded audit
