@@ -20710,6 +20710,10 @@ const LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS = 10000;
 const LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS = 2000;
 const LIGHT_HYDRATION_MAX_MS = 20000;
 const LIGHT_RETRYABLE_SETUP_STAGES = new Set(['browser_launch', 'browser_context', 'page_create', 'init_script']);
+// This is a bounded replacement of a failed entry-browser attempt, never a
+// second observation path. It is admitted by the existing light retry gate.
+const LIGHT_FIREFOX_FALLBACK_STAGE = 'browser_entry_fallback';
+const LIGHT_FIREFOX_FALLBACK_CODE = 'LIGHT_BROWSER_ENTRY_FALLBACK_REQUIRED';
 
 function createLightRequestBudget_(requestStartedAt) {
   const startedAt = Number(requestStartedAt || Date.now()) || Date.now();
@@ -20961,7 +20965,8 @@ async function probeLightDomReadiness_(page, targetUrl, budget, opts = {}) {
     if (assessed.accepted) {
       stableCount = stableUrl === assessed.url ? stableCount + 1 : 1;
       stableUrl = assessed.url;
-      if (stableCount >= 2) return { accepted: true, ms: Math.max(0, now() - startedAt), reason: assessed.reason, url: assessed.url };
+      const requiredStableSamples = opts.requireStable === false ? 1 : 2;
+      if (stableCount >= requiredStableSamples) return { accepted: true, ms: Math.max(0, now() - startedAt), reason: assessed.reason, url: assessed.url };
       lastReason = 'url_stabilizing';
     } else {
       stableUrl = '';
@@ -20979,7 +20984,7 @@ async function probeLightDomReadiness_(page, targetUrl, budget, opts = {}) {
 function lightSetupRetryAdmission_(budget, attempt, stage) {
   const elapsedMs = budget ? Math.max(0, Date.now() - budget.startedAt) : Number.POSITIVE_INFINITY;
   const remainingMs = getLightBudgetRemainingMs_(budget);
-  if (!LIGHT_RETRYABLE_SETUP_STAGES.has(String(stage || ''))) return { allowed: false, reason: 'non_setup_stage', elapsedMs, remainingMs };
+  if (!LIGHT_RETRYABLE_SETUP_STAGES.has(String(stage || '')) && String(stage || '') !== LIGHT_FIREFOX_FALLBACK_STAGE) return { allowed: false, reason: 'non_setup_stage', elapsedMs, remainingMs };
   if (remainingMs < LIGHT_SETUP_RETRY_MIN_REMAINING_MS) return { allowed: false, reason: 'insufficient_remaining', elapsedMs, remainingMs };
   if (!attempt || attempt.cleanupComplete !== true) return { allowed: false, reason: 'cleanup_incomplete', elapsedMs, remainingMs };
   return { allowed: true, reason: 'setup_retry_admitted', elapsedMs, remainingMs };
@@ -21587,9 +21592,10 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
   const executeAttempt = typeof scrapeAttempt === 'function'
     ? scrapeAttempt
     : (options) => scrapeOnce(req, res, lightBudget, options);
+  let attemptOptions = { deferRetryableSetupFailure: true, attemptIndex: 1, browserEngine: 'chromium' };
   for (let index = 0; index < 2; index += 1) {
     try {
-      await executeAttempt({ deferRetryableSetupFailure: true, attemptIndex: index + 1 });
+      await executeAttempt(attemptOptions);
       return;
     } catch (err) {
       const attempt = err && err.lightAttempt || lightBudget.currentAttempt;
@@ -21608,10 +21614,13 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
         lightBudget.resilience.cleanupMs = Math.max(Number(lightBudget.resilience.cleanupMs || 0), Number(cleanup && cleanup.cleanupMs || 0));
         lightBudget.resilience.cleanup = cleanup && cleanup.diagnostics || null;
       }
+      const firefoxFallbackEligible = index === 0 && err && err.firefoxFallbackEligible === true;
       const admission = index === 0
-        ? (code === 'LIGHT_RENDERED_DOM_INCOMPLETE'
+        ? (firefoxFallbackEligible
+          ? lightSetupRetryAdmission_(lightBudget, attempt, LIGHT_FIREFOX_FALLBACK_STAGE)
+          : (code === 'LIGHT_RENDERED_DOM_INCOMPLETE'
           ? lightRenderedDomRetryAdmission_(lightBudget, attempt, renderedDomObservation)
-          : lightSetupRetryAdmission_(lightBudget, attempt, stage))
+          : lightSetupRetryAdmission_(lightBudget, attempt, stage)))
         : { allowed: false, reason: 'retry_limit' };
       if (lightBudget.resilience) lightBudget.resilience.retryAdmission = admission.reason;
       if (index === 0 && admission.allowed && !res.headersSent) {
@@ -21620,6 +21629,11 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
         lightBudget.timedOut = false;
         lightBudget.timeoutStage = '';
         lightBudget.activeStage = 'retry_setup';
+        attemptOptions = {
+          deferRetryableSetupFailure: true,
+          attemptIndex: 2,
+          browserEngine: firefoxFallbackEligible ? 'firefox' : 'chromium'
+        };
         continue;
       }
       if (!res.headersSent) sendLightBudgetTimeout_(res, lightBudget, lightBudget.queueStartedAt || Date.now(), stage);
@@ -22331,19 +22345,19 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       signalsFirstLight,
       signalsFirstBalanced
     });
-    const useFirefoxForNtt = (() => {
-      try { return signalsFirstLight && new URL(String(urlToFetch || '')).hostname.toLowerCase() === 'www.ntt.com'; }
-      catch (_) { return false; }
-    })();
+    // Chromium remains the primary engine. The existing bounded retry wrapper
+    // may select Firefox only after this attempt fails the entry document gate.
+    const useFirefoxForFallback = signalsFirstLight && !authenticatedRun && scrapeOptions.browserEngine === 'firefox';
+    const chromiumFirefoxFallbackEligible = signalsFirstLight && !authenticatedRun && !useFirefoxForFallback;
     const __timingBrowserStart = Date.now();
     logHeavySiteTopPageAudit('browser_page_setup_start', {
-      step: useFirefoxForNtt ? 'firefox_launch' : 'chromium_launch'
+      step: useFirefoxForFallback ? 'firefox_launch' : 'chromium_launch'
     });
     playwrightStarted = true;
-    const launchBrowser = () => (useFirefoxForNtt ? playwright.firefox : chromium).launch({
+    const launchBrowser = () => (useFirefoxForFallback ? playwright.firefox : chromium).launch({
       headless: true,
       // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
-      ...(!useFirefoxForNtt ? { args: [
+      ...(!useFirefoxForFallback ? { args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
@@ -25154,6 +25168,34 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       if (authenticatedRun) assertAuthenticatedFinalOrigin_(page && typeof page.url === 'function' ? page.url() : urlToFetch, executionAuth);
       if (authenticatedRun && resp && typeof resp.status === 'function' && [401, 403].includes(resp.status())) throw authError_('AUTH_FAILED');
       await assertSafeMainNavigationV1_(page, resp);
+      const entryStatus = resp && typeof resp.status === 'function' ? resp.status() : null;
+      if (chromiumFirefoxFallbackEligible && !isSuccessfulEntryStatusV1_(entryStatus)) {
+        const failure = new Error(`browser entry document unavailable: http_${entryStatus === null ? 'unknown' : entryStatus}`);
+        failure.code = LIGHT_FIREFOX_FALLBACK_CODE;
+        failure.lightBudgetStage = LIGHT_FIREFOX_FALLBACK_STAGE;
+        failure.lightAttempt = lightAttempt;
+        failure.lightFailureReason = 'http_failure';
+        failure.firefoxFallbackEligible = true;
+        throw failure;
+      }
+      // A 2xx challenge/error page is not a usable entry document. The
+      // existing DOM gate, rather than H1 or score outcomes, makes that call.
+      if (signalsFirstLight && !authenticatedRun) {
+        const entryGate = await probeLightDomReadiness_(page, urlToFetch, lightBudget, { attempt: lightAttempt, requireStable: false });
+        const retryableEntryFailure = entryGate && ['challenge_or_error_page', 'blank_or_error_document', 'browser_disconnected', 'page_closed'].includes(entryGate.reason);
+        if (retryableEntryFailure) {
+          if (chromiumFirefoxFallbackEligible) {
+            const failure = new Error(`browser entry document unavailable: ${entryGate.reason}`);
+            failure.code = LIGHT_FIREFOX_FALLBACK_CODE;
+            failure.lightBudgetStage = LIGHT_FIREFOX_FALLBACK_STAGE;
+            failure.lightAttempt = lightAttempt;
+            failure.lightFailureReason = entryGate.reason;
+            failure.firefoxFallbackEligible = true;
+            throw failure;
+          }
+          throw createLightBudgetError_('top_page_dom_fallback', `browser entry document unavailable: ${entryGate.reason}`);
+        }
+      }
       if (signalsFirstLight) {
         markLightMainFrameGotoTrace_(lightBudget, page, {
           gotoOutcome: 'success',
@@ -25174,6 +25216,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       // them into a generic light-budget failure before the auth-safe catch
       // can return that code to the authenticated caller.
       if (err && AUTH_ERROR_CODES.has(err.code)) throw err;
+      if (err && (err.code === LIGHT_FIREFOX_FALLBACK_CODE || err.code === UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_)) throw err;
       if (signalsFirstLight && isLightTopGotoTimeoutError_(err)) {
         lightBudget.gotoFallback.gotoTimedOut = true;
         lightBudget.gotoFallback.domFallbackAttempted = true;
@@ -25187,6 +25230,14 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           failure.lightFailureReason = String(fallback && fallback.reason || 'probe_failed');
           throw failure;
         }
+      } else if (signalsFirstLight && chromiumFirefoxFallbackEligible && err && err.code !== 'LIGHT_REQUEST_BUDGET_EXHAUSTED') {
+        const failure = new Error(`browser entry document unavailable: ${String(err && (err.message || err) || 'navigation_failed').slice(0, 180)}`);
+        failure.code = LIGHT_FIREFOX_FALLBACK_CODE;
+        failure.lightBudgetStage = LIGHT_FIREFOX_FALLBACK_STAGE;
+        failure.lightAttempt = lightAttempt;
+        failure.lightFailureReason = 'browser_navigation_failure';
+        failure.firefoxFallbackEligible = true;
+        throw failure;
       } else if (signalsFirstLight) {
         throw createLightBudgetError_('top_page_goto', String(err && (err.message || err) || 'navigation_failed'));
       } else {
@@ -29287,10 +29338,11 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     const failureStage = String(err && err.lightBudgetStage || lightBudget && lightBudget.activeStage || 'unknown');
     const failureCode = String(err && err.code || 'PLAYWRIGHT_SETUP_FAILURE');
     if (signalsFirstLight && scrapeOptions.deferRetryableSetupFailure && !res.headersSent &&
-      LIGHT_RETRYABLE_SETUP_STAGES.has(failureStage)) {
+      (LIGHT_RETRYABLE_SETUP_STAGES.has(failureStage) || failureCode === LIGHT_FIREFOX_FALLBACK_CODE)) {
       markLightAttemptFailure_(lightAttempt, failureStage, failureCode);
       err.lightBudgetStage = failureStage;
       err.lightAttempt = lightAttempt;
+      err.firefoxFallbackEligible = err.firefoxFallbackEligible === true;
       throw err;
     }
     // core light signals が未成立の deadline / navigation failure は static fallback を
