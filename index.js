@@ -17789,12 +17789,48 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           } catch (_) {}
         }
       }
+      // A rendered social icon often has no text or explicit label.  Preserve
+      // a directly supplied label first; otherwise accept one *unambiguous*
+      // heading from the anchor's nearest semantic group only.  This never
+      // inherits page/main/root headings or crosses into an enclosing section.
+      const scopedNearbyLabel = (a) => {
+        if (!a || !a.getAttribute || !a.closest) return '';
+        const explicit = clean(a.getAttribute('data-label') || a.getAttribute('data-context') || '');
+        if (explicit) return explicit;
+        // Existing link-level metadata remains authoritative.  A structural
+        // heading is only evidence for an otherwise unlabeled icon/link.
+        const directMetadata = clean([
+          a.getAttribute('aria-label') || '',
+          a.getAttribute('title') || '',
+          a.innerText || a.textContent || ''
+        ].join(' '));
+        if (directMetadata) return '';
+        const semanticContainers = [];
+        for (let node = a.parentElement; node; node = node.parentElement) {
+          if (node.matches && node.matches('section,article,[role="group"]')) semanticContainers.push(node);
+        }
+        for (const container of semanticContainers) {
+          const headings = Array.from(container.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')).filter((heading) => (
+            heading && heading.closest('section,article,[role="group"]') === container &&
+            clean(heading.innerText || heading.textContent || '')
+          ));
+          // An empty nested group has no competing context, so an enclosing
+          // semantic section may still supply the group label.  A group with
+          // one or more headings is decisive: ambiguity never leaks outward.
+          if (!headings.length) continue;
+          if (headings.length !== 1) return '';
+          const heading = headings[0];
+          if (!(heading.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING)) return '';
+          return clean(heading.innerText || heading.textContent || '');
+        }
+        return '';
+      };
       const anchors = queryAllDeep('a[href]').map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
         ariaLabel: clean(a.getAttribute('aria-label') || ''),
         title: clean(a.getAttribute('title') || ''),
-        nearbyLabel: clean(a.getAttribute('data-label') || a.getAttribute('data-context') || ''),
+        nearbyLabel: scopedNearbyLabel(a),
         navLike: !!a.closest('nav,[role="navigation"],header,footer'),
         footerLike: !!a.closest('footer,[role="contentinfo"]'),
         source: (a.getRootNode && a.getRootNode() instanceof ShadowRoot) ? 'open_shadow_dom' : 'dom'
@@ -17821,7 +17857,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
                   href: absUrl(el.getAttribute('href') || ''),
                   ariaLabel: clean(el.getAttribute('aria-label') || ''),
                   title: clean(el.getAttribute('title') || ''),
-                  nearbyLabel: clean(el.getAttribute('data-label') || el.getAttribute('data-context') || ''),
+                  nearbyLabel: scopedNearbyLabel(el),
                   navLike: !!el.closest('nav,[role="navigation"],header,footer'),
                   footerLike: !!el.closest('footer,[role="contentinfo"]'),
                   source: 'open_shadow_dom'

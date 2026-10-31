@@ -1,0 +1,106 @@
+const assert = require('assert');
+const { chromium } = require('playwright');
+const { buildGeoSignalsV1 } = require('../index.js').__lightBudgetTestHooks;
+
+const PROFILE_URLS = [
+  'https://x.com/example_official',
+  'https://facebook.com/example.official',
+  'https://instagram.com/example_official',
+  'https://youtube.com/channel/exampleofficial',
+  'https://tiktok.com/@example_official'
+];
+
+async function observe(html, name) {
+  const page = await globalThis.__scopedHeadingBrowser.newPage();
+  try {
+    const url = `https://${name}.example.test/`;
+    await page.setContent(`<base href="${url}">${html}`, { waitUntil: 'domcontentloaded' });
+    return await buildGeoSignalsV1(page, url, { balancedMode: false, shortFastMode: false });
+  } finally {
+    await page.close();
+  }
+}
+
+function evidence(signals) {
+  return signals.observed.links.externalProfileLinkEvidence;
+}
+
+function rowByHref(signals, href) {
+  return evidence(signals).find(row => row.href === href);
+}
+
+function iconLinks(urls = PROFILE_URLS) {
+  return urls.map(href => `<a href="${href}"><svg aria-hidden="true"></svg></a>`).join('');
+}
+
+(async () => {
+  globalThis.__scopedHeadingBrowser = await chromium.launch({ headless: true });
+  try {
+    // A. The observed Shimamura-shaped DOM propagates its one section heading
+    // to five unlabeled profile icons. The existing formal matcher does not
+    // equate Japanese "オフィシャル" with its "公式" / English "official"
+    // contract, so this does not independently promote the profiles.
+    const official = await observe(`
+      <section id="snsBlc"><h2>しまむらオフィシャルSNS</h2>
+        <div class="wrapper2022"><div class="flxB"><ul class="iconBlc">${iconLinks()}</ul></div></div>
+      </section>
+    `, 'official');
+    assert.equal(evidence(official).length, 5);
+    assert.ok(evidence(official).every(row => row.nearbyLabel === 'しまむらオフィシャルSNS'));
+    assert.equal(official.externalProfileObservationV1.officialProfileCount, 0);
+    assert.equal(official.externalProfileObservationV1.relationConfirmed, false);
+
+    // An empty nested semantic wrapper may defer to its enclosing section,
+    // but a wrapper with its own heading remains decisive (covered below).
+    const nestedGroup = await observe('<section><h2>公式SNS</h2><div role="group"><ul>' + iconLinks() + '</ul></div></section>', 'nested-group');
+    assert.ok(evidence(nestedGroup).every(row => row.nearbyLabel === '公式SNS'));
+    assert.equal(nestedGroup.externalProfileObservationV1.officialProfileCount, 5);
+
+    // B and I. A product-video section is separate evidence, never part of
+    // the official profile group.
+    const productVideo = await observe(`
+      <section><h2>公式SNS</h2>${iconLinks()}</section>
+      <section><h2>商品紹介動画</h2><a href="https://youtube.com/watch?v=example"><svg></svg></a></section>
+    `, 'product-video');
+    const video = rowByHref(productVideo, 'https://youtube.com/watch?v=example');
+    assert.equal(video.nearbyLabel, '商品紹介動画');
+    assert.equal(productVideo.externalProfileObservationV1.officialProfileCount, 5);
+    assert.equal(productVideo.externalProfileObservationV1.profiles.find(row => row.href === video.href).relationConfirmed, false);
+
+    // C. Page/main headings are not inherited into child sections.
+    const rootOnly = await observe('<main><h2>公式SNS</h2><div><a href="https://x.com/root_only"><svg></svg></a></div></main>', 'root-only');
+    assert.equal(rowByHref(rootOnly, 'https://x.com/root_only').nearbyLabel, '');
+
+    // D. Multiple headings in the same semantic container are ambiguous.
+    const ambiguous = await observe('<section><h2>公式SNS</h2><h3>商品情報</h3><a href="https://x.com/ambiguous"><svg></svg></a></section>', 'ambiguous');
+    assert.equal(rowByHref(ambiguous, 'https://x.com/ambiguous').nearbyLabel, '');
+
+    // E. Existing explicit metadata always wins.
+    const explicit = await observe('<section><h2>公式SNS</h2><a data-label="既存の明示ラベル" href="https://x.com/explicit"><svg></svg></a></section>', 'explicit');
+    assert.equal(rowByHref(explicit, 'https://x.com/explicit').nearbyLabel, '既存の明示ラベル');
+
+    // F. Existing aria metadata is retained and does not gain a conflicting
+    // structural label.
+    const aria = await observe('<section><h2>公式SNS</h2><a aria-label="動画を見る" href="https://youtube.com/channel/aria"><svg></svg></a></section>', 'aria');
+    assert.equal(rowByHref(aria, 'https://youtube.com/channel/aria').ariaLabel, '動画を見る');
+    assert.equal(rowByHref(aria, 'https://youtube.com/channel/aria').nearbyLabel, '');
+
+    // G. No explicit heading preserves existing unlabeled behavior.
+    const noHeading = await observe('<section><a href="https://x.com/no_heading"><svg></svg></a></section>', 'no-heading');
+    assert.equal(rowByHref(noHeading, 'https://x.com/no_heading').nearbyLabel, '');
+
+    // H. A nested, separately labelled brand group cannot inherit the outer
+    // official-SNS heading; only its own nearest section is considered.
+    const otherBrand = await observe(`
+      <section><h2>公式SNS</h2><section><h3>協力ブランド</h3><a href="https://x.com/other_brand"><svg></svg></a></section></section>
+    `, 'other-brand');
+    const other = rowByHref(otherBrand, 'https://x.com/other_brand');
+    assert.equal(other.nearbyLabel, '協力ブランド');
+    assert.equal(otherBrand.externalProfileObservationV1.officialProfileCount, 0);
+    assert.equal(otherBrand.externalProfileObservationV1.relationConfirmed, false);
+  } finally {
+    await globalThis.__scopedHeadingBrowser.close();
+    delete globalThis.__scopedHeadingBrowser;
+  }
+  console.log('external profile scoped heading context: PASS');
+})().catch(error => { console.error(error); process.exitCode = 1; });
