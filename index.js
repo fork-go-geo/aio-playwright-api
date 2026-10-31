@@ -17069,7 +17069,7 @@ function buildExternalProfileObservationV1_(links, opts = {}) {
   const source = links && typeof links === 'object' ? links : {};
   const rows = (Array.isArray(source.externalProfileLinkEvidence) ? source.externalProfileLinkEvidence : [])
     .concat(Array.isArray(opts.officialListingEvidence) ? opts.officialListingEvidence : []);
-  const relationRe = /(?:公式|official|follow\s+us|公式(?:アカウント|sns|ソーシャル)|our\s+(?:social|account))/i;
+  const relationRe = /(?:公式|official|follow\s+us|公式(?:アカウント|sns|ソーシャル)|オフィシャル\s*(?:sns|ＳＮＳ|ソーシャル|アカウント)|our\s+(?:social|account))/i;
   const profiles = [];
   const corporateNameKey = externalProfileCorporateNameKeyV1_(opts.corporateName || '');
   const uniqueRows = []; const seen = new Set();

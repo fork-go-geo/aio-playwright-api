@@ -37,9 +37,8 @@ function iconLinks(urls = PROFILE_URLS) {
   globalThis.__scopedHeadingBrowser = await chromium.launch({ headless: true });
   try {
     // A. The observed Shimamura-shaped DOM propagates its one section heading
-    // to five unlabeled profile icons. The existing formal matcher does not
-    // equate Japanese "オフィシャル" with its "公式" / English "official"
-    // contract, so this does not independently promote the profiles.
+    // to five unlabeled profile icons. "オフィシャルSNS" is an explicit,
+    // bounded Japanese official-social expression.
     const official = await observe(`
       <section id="snsBlc"><h2>しまむらオフィシャルSNS</h2>
         <div class="wrapper2022"><div class="flxB"><ul class="iconBlc">${iconLinks()}</ul></div></div>
@@ -47,14 +46,18 @@ function iconLinks(urls = PROFILE_URLS) {
     `, 'official');
     assert.equal(evidence(official).length, 5);
     assert.ok(evidence(official).every(row => row.nearbyLabel === 'しまむらオフィシャルSNS'));
-    assert.equal(official.externalProfileObservationV1.officialProfileCount, 0);
-    assert.equal(official.externalProfileObservationV1.relationConfirmed, false);
+    assert.equal(official.externalProfileObservationV1.officialProfileCount, 5);
+    assert.equal(official.externalProfileObservationV1.relationConfirmed, true);
 
     // An empty nested semantic wrapper may defer to its enclosing section,
     // but a wrapper with its own heading remains decisive (covered below).
     const nestedGroup = await observe('<section><h2>公式SNS</h2><div role="group"><ul>' + iconLinks() + '</ul></div></section>', 'nested-group');
     assert.ok(evidence(nestedGroup).every(row => row.nearbyLabel === '公式SNS'));
     assert.equal(nestedGroup.externalProfileObservationV1.officialProfileCount, 5);
+
+    // Existing English wording remains accepted.
+    const english = await observe('<section><h2>Official SNS</h2>' + iconLinks() + '</section>', 'english');
+    assert.equal(english.externalProfileObservationV1.officialProfileCount, 5);
 
     // B and I. A product-video section is separate evidence, never part of
     // the official profile group.
@@ -66,6 +69,11 @@ function iconLinks(urls = PROFILE_URLS) {
     assert.equal(video.nearbyLabel, '商品紹介動画');
     assert.equal(productVideo.externalProfileObservationV1.officialProfileCount, 5);
     assert.equal(productVideo.externalProfileObservationV1.profiles.find(row => row.href === video.href).relationConfirmed, false);
+
+    // A sibling section cannot inherit another section's official heading.
+    const separateSection = await observe('<section><h2>オフィシャルSNS</h2></section><section><a href="https://x.com/separate"><svg></svg></a></section>', 'separate-section');
+    assert.equal(rowByHref(separateSection, 'https://x.com/separate').nearbyLabel, '');
+    assert.equal(separateSection.externalProfileObservationV1.officialProfileCount, 0);
 
     // C. Page/main headings are not inherited into child sections.
     const rootOnly = await observe('<main><h2>公式SNS</h2><div><a href="https://x.com/root_only"><svg></svg></a></div></main>', 'root-only');
@@ -92,10 +100,10 @@ function iconLinks(urls = PROFILE_URLS) {
     // H. A nested, separately labelled brand group cannot inherit the outer
     // official-SNS heading; only its own nearest section is considered.
     const otherBrand = await observe(`
-      <section><h2>公式SNS</h2><section><h3>協力ブランド</h3><a href="https://x.com/other_brand"><svg></svg></a></section></section>
+      <section><h2>公式SNS</h2><section><h3>協力ブランドのオフィシャルSNS</h3><a aria-label="協力ブランド SNS" href="https://x.com/other_brand"><svg></svg></a></section></section>
     `, 'other-brand');
     const other = rowByHref(otherBrand, 'https://x.com/other_brand');
-    assert.equal(other.nearbyLabel, '協力ブランド');
+    assert.equal(other.nearbyLabel, '');
     assert.equal(otherBrand.externalProfileObservationV1.officialProfileCount, 0);
     assert.equal(otherBrand.externalProfileObservationV1.relationConfirmed, false);
   } finally {
