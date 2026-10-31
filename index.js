@@ -5225,6 +5225,36 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     };
   })();
   const articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), finalUrl || url, extractArticleVisibleDateCandidatesFromCheerio_($));
+  // Internal-only handoff for the bounded official-account-listing follow-up.
+  // It keeps no HTML and is not part of the persisted Records V2 schema.
+  const pageOrigin = (() => { try { return new URL(finalUrl || url).origin; } catch (_) { return ''; } })();
+  const officialListingLinks = [];
+  const listingSeen = new Set();
+  const listingLabelRe = /(?:公式\s*(?:sns|ソーシャル|アカウント)(?:\s*一覧)?|official\s*(?:social|account))/i;
+  $('a[href]').slice(0, 1200).each((_, el) => {
+    if (officialListingLinks.length >= 1) return;
+    const text = normalizeSubpageJsonLdText($(el).text() || '');
+    const ariaLabel = normalizeSubpageJsonLdText($(el).attr('aria-label') || '');
+    const titleAttr = normalizeSubpageJsonLdText($(el).attr('title') || '');
+    const label = normalizeSubpageJsonLdText([text, ariaLabel, titleAttr].filter(Boolean).join(' '));
+    if (!listingLabelRe.test(label)) return;
+    let target = null; try { target = new URL($(el).attr('href') || '', finalUrl || url); } catch (_) { return; }
+    if (target.protocol !== 'https:' || target.origin !== pageOrigin) return;
+    target.hash = ''; target.search = '';
+    const key = target.toString(); if (listingSeen.has(key)) return; listingSeen.add(key);
+    officialListingLinks.push({ href: key, text: text.slice(0, 160), ariaLabel: ariaLabel.slice(0, 160), title: titleAttr.slice(0, 160), sourceUrl: String(finalUrl || url), sameOrigin: true, observationComplete: true, provenance: 'subpage_html_light' });
+  });
+  const externalProfileLinkEvidence = [];
+  const profileSeen = new Set();
+  const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
+  $('a[href]').slice(0, 1200).each((_, el) => {
+    if (externalProfileLinkEvidence.length >= 10) return;
+    let target = null; try { target = new URL($(el).attr('href') || '', finalUrl || url); } catch (_) { return; }
+    if (target.protocol !== 'https:' || !profileHostRe.test(target.href)) return;
+    target.hash = ''; target.search = '';
+    const key = (target.origin + target.pathname).replace(/\/$/, '').toLowerCase(); if (!key || profileSeen.has(key)) return; profileSeen.add(key);
+    externalProfileLinkEvidence.push({ href: target.toString(), text: normalizeSubpageJsonLdText($(el).text() || '').slice(0, 160), ariaLabel: normalizeSubpageJsonLdText($(el).attr('aria-label') || '').slice(0, 160), title: normalizeSubpageJsonLdText($(el).attr('title') || '').slice(0, 160), nearbyLabel: normalizeSubpageJsonLdText($(el).attr('data-label') || $(el).attr('data-context') || '').slice(0, 160), sourceUrl: String(finalUrl || url), observationComplete: true, provenance: 'subpage_html_light' });
+  });
   let internalLinkCount = 0;
   let externalLinkCount = 0;
   $('a[href]').slice(0, 1200).each((_, el) => {
@@ -5281,6 +5311,8 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     contactSignals,
     formSignals,
     articleSignals,
+    officialListingLinks,
+    externalProfileLinkEvidence,
     error: null,
     parseErrors
   };
@@ -5934,6 +5966,27 @@ async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
     })));
   }
   return { pages };
+}
+
+// Bounded internal follow-up only. The caller supplies the already-observed
+// parent page and its remaining existing subpage budget; this never discovers
+// a URL or follows a second child link.
+async function fetchOfficialAccountListingEvidenceV1_(parentPage, opts = {}) {
+  if (!parentPage || parentPage.ok !== true || parentPage.observationComplete === false || opts.remainingBudget === false) return null;
+  const link = Array.isArray(parentPage.officialListingLinks) ? parentPage.officialListingLinks[0] : null;
+  if (!link || link.sameOrigin !== true || link.observationComplete !== true) return null;
+  let parentUrl = null, target = null;
+  try { parentUrl = new URL(parentPage.finalUrl || parentPage.url); target = new URL(link.href); } catch (_) { return null; }
+  if (parentUrl.origin !== target.origin || target.protocol !== 'https:') return null;
+  const fetched = await fetchSubpageHtmlLightUrls_([target.toString()], Object.assign({}, opts, { remainingBudget: undefined }));
+  const page = fetched && Array.isArray(fetched.pages) ? fetched.pages[0] : null;
+  if (!page || page.ok !== true) return null;
+  return {
+    sourceRunId: String(opts.sourceRunId || ''), entryKey: String(opts.entryKey || ''),
+    parentLink: link, sourceUrl: String(page.finalUrl || page.url || target),
+    observationComplete: true, provenance: 'official_account_listing_followup_v1',
+    externalProfileLinkEvidence: Array.isArray(page.externalProfileLinkEvidence) ? page.externalProfileLinkEvidence.slice(0, 10) : []
+  };
 }
 
 async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
@@ -13363,6 +13416,17 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         discoveryCapped: Array.isArray(discovered.operatorIdentityCandidates) && discovered.operatorIdentityCandidates.length >= 5
       }
     );
+    // Keep the normal request order: the bounded listing follow-up runs only
+    // after coverage has completed a formal operator identity, then updates
+    // the already-created external-profile observation without altering its
+    // Records V2/GAS response shape.
+    await attachOfficialListingExternalProfileObservationV1_(geoSignalsV1, htmlPages, {
+      sourceRunId: opts.sourceRunId,
+      entryKey: opts.entryKey || normalized.topUrl,
+      siteMode,
+      lightBudget,
+      executionAuth: opts.executionAuth
+    });
     const contactSignals = pickBestContactSignals_(observations);
     if (contactSignals) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
@@ -16993,22 +17057,37 @@ function mergeFrameContentObservationIntoGeoSignalsV1_(geoSignalsV1, frameObserv
 // A link can be an official profile only when the analysed site explicitly
 // identifies the relationship in the rendered anchor/context; host or count
 // alone never establishes the relationship.
+function externalProfileNormalizedUrlKeyV1_(value) {
+  try { const u = new URL(String(value || '')); u.hash = ''; u.search = ''; return (u.origin + u.pathname).replace(/\/$/, '').toLowerCase(); } catch (_) { return ''; }
+}
+function externalProfileCorporateNameKeyV1_(value) {
+  return normalizeSubpageJsonLdText(value || '').toLowerCase()
+    .replace(/(?:株式会社|有限会社|合同会社|inc\.?|corp\.?|corporation|co\.?\s*,?\s*ltd\.?|ltd\.?)\s*/gi, '')
+    .replace(/[\s　・._,()（）\-]/g, '');
+}
 function buildExternalProfileObservationV1_(links, opts = {}) {
   const source = links && typeof links === 'object' ? links : {};
-  const rows = Array.isArray(source.externalProfileLinkEvidence)
-    ? source.externalProfileLinkEvidence
-    : [];
+  const rows = (Array.isArray(source.externalProfileLinkEvidence) ? source.externalProfileLinkEvidence : [])
+    .concat(Array.isArray(opts.officialListingEvidence) ? opts.officialListingEvidence : []);
   const relationRe = /(?:公式|official|follow\s+us|公式(?:アカウント|sns|ソーシャル)|our\s+(?:social|account))/i;
   const profiles = [];
-  for (const row of rows.slice(0, 10)) {
+  const corporateNameKey = externalProfileCorporateNameKeyV1_(opts.corporateName || '');
+  const uniqueRows = []; const seen = new Set();
+  for (const row of rows) {
+    const key = externalProfileNormalizedUrlKeyV1_(row && row.href);
+    if (!key || seen.has(key)) continue; seen.add(key); uniqueRows.push(row);
+  }
+  for (const row of uniqueRows.slice(0, 10)) {
     if (!row || typeof row !== 'object') continue;
     const href = String(row.href || '').trim();
     const label = normalizeSubpageJsonLdText([row.text, row.ariaLabel, row.title, row.nearbyLabel].filter(Boolean).join(' '));
     let externalHttps = false;
     try { externalHttps = new URL(href).protocol === 'https:'; } catch (_) {}
     if (!externalHttps) continue;
+    const listingCorporateMatch = row.fromOfficialAccountListing === true && corporateNameKey &&
+      externalProfileCorporateNameKeyV1_(label) === corporateNameKey;
     profiles.push({ href, label: label.slice(0, 160), placement: String(row.placement || 'rendered_dom').slice(0, 40),
-      relationConfirmed: relationRe.test(label) });
+      relationConfirmed: relationRe.test(label) || listingCorporateMatch });
   }
   const complete = opts.linksObserved === true && opts.linksLimited !== true;
   return {
@@ -17022,6 +17101,67 @@ function buildExternalProfileObservationV1_(links, opts = {}) {
     relationConfirmed: profiles.some(item => item.relationConfirmed === true),
     profiles
   };
+}
+
+function buildOfficialListingExternalProfileObservationV1_(links, listing, opts = {}) {
+  const identity = opts.operatorIdentity && typeof opts.operatorIdentity === 'object' ? opts.operatorIdentity : null;
+  const entryKey = String(opts.entryKey || '');
+  const sourceRunId = String(opts.sourceRunId || '');
+  let entryOrigin = ''; try { entryOrigin = new URL(entryKey).origin; } catch (_) {}
+  let listingOrigin = ''; try { listingOrigin = new URL(String(listing && listing.sourceUrl || '')).origin; } catch (_) {}
+  let parentLinkOrigin = ''; let parentLinkHttps = false;
+  try { const parentLinkUrl = new URL(String(listing && listing.parentLink && listing.parentLink.href || '')); parentLinkOrigin = parentLinkUrl.origin; parentLinkHttps = parentLinkUrl.protocol === 'https:'; } catch (_) {}
+  const valid = !!(listing && listing.observationComplete === true && listing.parentLink && listing.parentLink.sameOrigin === true && listing.parentLink.observationComplete === true && parentLinkHttps &&
+    sourceRunId && sourceRunId === String(listing.sourceRunId || '') && entryKey && entryOrigin && entryOrigin === listingOrigin &&
+    parentLinkOrigin === entryOrigin &&
+    opts.operatorIdentityFormal === true && identity && identity.conflict !== true && identity.hasCompanyName === true && String(identity.companyName || '').trim());
+  const listingRows = valid ? (Array.isArray(listing.externalProfileLinkEvidence) ? listing.externalProfileLinkEvidence : []).map(row => Object.assign({}, row, { fromOfficialAccountListing: true, sourceUrl: listing.sourceUrl })) : [];
+  return buildExternalProfileObservationV1_(links, Object.assign({}, opts, { corporateName: valid ? identity.companyName : '', officialListingEvidence: listingRows }));
+}
+
+// This is called only from the normal coverage path, after a formal operator
+// identity is available. It consumes at most one already-budgeted safe HTML
+// fetch and otherwise preserves the entry-page observation unchanged.
+async function attachOfficialListingExternalProfileObservationV1_(geoSignalsV1, parentPages, opts = {}) {
+  const sourceRunId = String(opts.sourceRunId || '');
+  const entryKey = String(opts.entryKey || '');
+  const identity = geoSignalsV1 && geoSignalsV1.trustSignals && geoSignalsV1.trustSignals.operatorIdentityInfo;
+  if (!sourceRunId || !entryKey || !isFormalOperatorIdentityRecord_(identity)) return { attempted: false, reason: 'formal_identity_or_run_missing' };
+  const parentPage = (Array.isArray(parentPages) ? parentPages : []).find(page =>
+    page && page.ok === true && Array.isArray(page.officialListingLinks) && page.officialListingLinks.length > 0
+  );
+  if (!parentPage) return { attempted: false, reason: 'official_listing_link_not_observed' };
+  const timeoutMs = opts.lightBudget
+    ? takeLightBudgetTimeoutMs_(opts.lightBudget, 'coverage_official_account_listing', 1500, LIGHT_RESPONSE_CLEANUP_RESERVE_MS, 1000)
+    : 1500;
+  if (!timeoutMs) return { attempted: false, reason: 'budget_exhausted' };
+  const listing = await fetchOfficialAccountListingEvidenceV1_(parentPage, {
+    sourceRunId,
+    entryKey,
+    remainingBudget: true,
+    timeoutMs,
+    siteMode: opts.siteMode,
+    executionAuth: opts.executionAuth,
+    lightBudget: opts.lightBudget,
+    fetchImpl: opts.fetchImpl
+  });
+  if (!listing) return { attempted: true, reason: 'listing_not_complete' };
+  const prior = geoSignalsV1.externalProfileObservationV1 || {};
+  const observation = buildOfficialListingExternalProfileObservationV1_(
+    geoSignalsV1.observed && geoSignalsV1.observed.links,
+    listing,
+    {
+      sourceRunId,
+      entryKey,
+      linksObserved: prior.checked === true,
+      linksLimited: prior.limited === true,
+      operatorIdentity: identity,
+      operatorIdentityFormal: true
+    }
+  );
+  geoSignalsV1.externalProfileObservationV1 = observation;
+  if (geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object') geoSignalsV1.observed.externalProfileObservationV1 = observation;
+  return { attempted: true, reason: 'listing_applied', listing, observation };
 }
 
 async function buildGeoSignalsV1(page, url, opts = {}) {
@@ -25982,6 +26122,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         debugHeavySite,
         debugHeavySiteStartedAt,
         operatorIdentityNoSaveRedirectDebug,
+        sourceRunId: runId,
+        entryKey: finalUrl || urlToFetch,
         lightBudget: signalsFirstLight ? lightBudget : null
         ,executionAuth
       });
@@ -29490,6 +29632,8 @@ module.exports.__lightBudgetTestHooks = {
   buildHtmlSitemapCoverageSignalV1_,
   attachHtmlSitemapCoverageSignalToGeoSignalsV1_,
   buildExternalProfileObservationV1_,
+  buildOfficialListingExternalProfileObservationV1_,
+  attachOfficialListingExternalProfileObservationV1_,
   coverageObservationV2Common_,
   buildAltObservationV2_,
   classifyAltPurposeV2_,
@@ -29621,6 +29765,7 @@ module.exports.__lightBudgetTestHooks = {
   sendUnsafeNavigationQuarantineV1_,
   fetchSubpageHtmlLightOnce_,
   fetchSubpageHtmlLightUrls_,
+  fetchOfficialAccountListingEvidenceV1_,
   isSubpageHtmlLightObservationSufficient_,
   buildCoverageSignalsV1FromSubpageObservation_,
   buildSubpageSignalsV1FromSubpageObservation_,
