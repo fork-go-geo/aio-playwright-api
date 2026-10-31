@@ -73,6 +73,21 @@ assert.strictEqual(deduped.selected.length, 2);
 assert.strictEqual(deduped.selected.filter(item => /fixture\.invalid\/company\/overview/.test(item.url)).length, 1);
 assert.ok(deduped.selected.some(item => item.url === external.url));
 
+// An eligible company-profile detail stays ahead of its general /about-us hub
+// when both were observed from the same bounded navigation set. This affects
+// probe order only; eligibility and relation evidence remain unchanged.
+const aboutHub = candidate('about-hub', {
+  url: 'https://fixture.invalid/about-us.html', label: '企業情報', source: 'nav',
+  sources: ['nav', 'footer'], score: 100
+});
+const aboutUsDetail = candidate('about-us-detail', {
+  url: 'https://fixture.invalid/about-us/company-profile.html', label: '会社案内TOP', source: 'nav',
+  sources: ['nav'], score: 100
+});
+const aboutUsPlan = hooks.buildOperatorIdentityProbeSelectionPlan_([aboutHub, aboutUsDetail], 'corporate', 2);
+assert.strictEqual(aboutUsPlan.selected[0].url, aboutUsDetail.url);
+assert.strictEqual(aboutUsPlan.selected[1].url, aboutHub.url);
+
 ['corporate', 'generic', 'saas'].forEach(mode => assert.strictEqual(
   hooks.buildOperatorIdentityProbeSelectionPlan_(discovered, mode, 2).selected[0].url, strongAt81.url
 ));

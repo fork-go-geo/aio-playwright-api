@@ -11913,7 +11913,7 @@ function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandi
     // HTML page (for example /company/outline.html). This remains a
     // tie-breaker among already high-confidence candidates only.
     const detailSuffix = '(?:\\/|$|-|_|\\.(?:html?|htm))';
-    if (new RegExp('\\/(?:about(?:us)?|company|corporate)(?:\\/(?:profile|overview|outline|summary|company-info))' + detailSuffix, 'i').test(path)) return 3;
+    if (new RegExp('\\/(?:about(?:-?us)?|company|corporate)(?:\\/(?:company[-_]?profile|profile|overview|outline|summary|company-info))' + detailSuffix, 'i').test(path)) return 3;
     const genericCompanyChild = Array.from(new Set(candidate && candidate.sources || [candidate && candidate.source])).includes('genericRoute') &&
       /\/(?:about(?:us)?|company|corporate)\/(?!index\.(?:html?|htm)\/?$)[^/?#]+(?:\/(?:index\.(?:html?|htm))?)?\/?$/i.test(path) &&
       !/\/(?:csr|contribution|sustainability|safety|security|ir|investor|governance|environment|health|recruit|career|group)(?:\/|$)/i.test(path);
