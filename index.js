@@ -17921,8 +17921,42 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const internal = anchors.filter((a) => {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
-      const externalProfileItems = limit(anchors.filter((a) => profileHostRe.test(a.href)).map((a) => a.href), 10);
-      const externalProfileLinkEvidence = limit(anchors.filter((a) => profileHostRe.test(a.href)).map((a) => ({
+      const normalizedExternalProfileEvidenceKey = (href) => {
+        try {
+          const target = new URL(href);
+          target.search = ''; target.hash = '';
+          return `${target.origin}${target.pathname}`.replace(/\/$/, '').toLowerCase();
+        } catch (_) { return ''; }
+      };
+      const externalProfileEvidenceRank = (anchor) => {
+        const formalRelationRe = /(?:公式|official|follow\s+us|公式(?:アカウント|sns|ソーシャル)|オフィシャル\s*(?:sns|ＳＮＳ|ソーシャル|アカウント)|our\s+(?:social|account))/i;
+        const context = clean(anchor && anchor.nearbyLabel || '');
+        const direct = clean([anchor && anchor.text || '', anchor && anchor.ariaLabel || '', anchor && anchor.title || ''].join(' '));
+        if (context && formalRelationRe.test(context)) return 4;
+        if (direct && formalRelationRe.test(direct)) return 3;
+        if (context) return 2;
+        if (direct) return 1;
+        return 0;
+      };
+      // A responsive/mobile duplicate can precede a labelled desktop anchor.
+      // Preserve the strongest existing evidence for each exact profile URL
+      // before applying the response cap; this does not create context or
+      // alter the formal relation decision.
+      const selectedExternalProfileAnchors = [];
+      const selectedExternalProfileIndex = new Map();
+      anchors.filter((a) => profileHostRe.test(a.href)).forEach((anchor) => {
+        const key = normalizedExternalProfileEvidenceKey(anchor.href);
+        if (!key) return;
+        const priorIndex = selectedExternalProfileIndex.get(key);
+        if (priorIndex == null) {
+          selectedExternalProfileIndex.set(key, selectedExternalProfileAnchors.length);
+          selectedExternalProfileAnchors.push(anchor);
+        } else if (externalProfileEvidenceRank(anchor) > externalProfileEvidenceRank(selectedExternalProfileAnchors[priorIndex])) {
+          selectedExternalProfileAnchors[priorIndex] = anchor;
+        }
+      });
+      const externalProfileItems = limit(selectedExternalProfileAnchors.map((a) => a.href), 10);
+      const externalProfileLinkEvidence = limit(selectedExternalProfileAnchors.map((a) => ({
         href: a.href, text: a.text || '', ariaLabel: a.ariaLabel || '', title: a.title || '',
         nearbyLabel: a.nearbyLabel || '', placement: a.footerLike ? 'footer' : (a.navLike ? 'nav' : 'rendered_dom')
       })), 10);
