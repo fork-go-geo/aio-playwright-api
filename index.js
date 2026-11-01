@@ -16767,13 +16767,18 @@ async function observeCoverageObservationV2Candidates_(context, urls) {
 async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, context) {
   let origin = '';
   try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
+  // Breadcrumb candidates must be descendants of the diagnosed entry path,
+  // not merely of the host.  Passing only `origin` makes a path-based entry
+  // (for example `/brand/`) look like a hierarchical candidate of itself.
+  // The selector already normalizes query/hash and verifies same-origin.
+  const breadcrumbBaseUrl = normalizeCoverageObservationV2Url_(origin, pageUrl) || origin;
   const entry = await readCoverageObservationV2Page_(page);
   entry.faqLinkObserved = entry.faqLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasFaqLink === true || geoSignalsV1.coverage.hasFaqNav === true));
   entry.serviceLinkObserved = entry.serviceLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasServicePageLink === true || geoSignalsV1.coverage.hasServiceNav === true));
   const discoveryComplete = isCoverageObservationV2CompletePage_(entry) && !!origin;
   const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.faqLinks || entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_) : [];
   const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.serviceLinks || entry.links, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
-  const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
+  const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(breadcrumbBaseUrl, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
   const htmlSitemapDiscoveryComplete = isHtmlSitemapCandidateDiscoveryCompleteV1_(entry) && !!origin;
   const sitemapUrls = htmlSitemapDiscoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
   const canOpen = context && typeof context.newPage === 'function';

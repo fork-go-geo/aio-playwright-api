@@ -98,6 +98,18 @@ check('breadcrumb-human-facing-leaflet-routes-are-generic-candidates', selectedL
   'https://fixture.invalid/brand/catalogue/',
   'https://fixture.invalid/brand/campaign/'
 ]);
+const entryScopedBreadcrumb = hooks.selectCoverageObservationV2Candidates_('https://fixture.invalid/brand', [
+  { href:'/brand/', text:'Product landing' },
+  { href:'/brand/featured/a/', text:'Product detail A' },
+  { href:'/brand/featured/b/', text:'Product detail B' },
+  { href:'/brand/flier/?source=nav', text:'Latest leaflet' }
+], 'breadcrumb', 3);
+check('breadcrumb-excludes-normalized-entry-url', entryScopedBreadcrumb.includes('https://fixture.invalid/brand/'), false);
+check('breadcrumb-entry-exclusion-preserves-leaflet-under-cap', entryScopedBreadcrumb, [
+  'https://fixture.invalid/brand/featured/a/',
+  'https://fixture.invalid/brand/featured/b/',
+  'https://fixture.invalid/brand/flier/'
+]);
 const privacyOnlyBreadcrumb = hooks.selectCoverageObservationV2Candidates_('https://fixture.invalid/', [
   { href:'/privacy/', text:'Privacy' }, { href:'/legal/', text:'Legal' }, { href:'/contact/', text:'Contact' }
 ], 'breadcrumb', 3);
