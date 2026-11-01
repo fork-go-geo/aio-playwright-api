@@ -87,6 +87,17 @@ check('breadcrumb-candidate-priority-and-cap', selectedBreadcrumb, [
 ]);
 check('breadcrumb-excludes-faq', selectedBreadcrumb.includes('https://fixture.invalid/faq'), false);
 check('breadcrumb-company-about-is-generic-hierarchical-candidate', selectedBreadcrumb.includes('https://fixture.invalid/company/'), true);
+const selectedLeafletBreadcrumb = hooks.selectCoverageObservationV2Candidates_('https://fixture.invalid/brand/', [
+  { href:'/brand/leaflet/', text:'チラシ' },
+  { href:'/brand/catalogue/', text:'Catalog' },
+  { href:'/brand/campaign/', text:'キャンペーン' },
+  { href:'/brand/privacy/', text:'Privacy' }
+], 'breadcrumb', 3);
+check('breadcrumb-human-facing-leaflet-routes-are-generic-candidates', selectedLeafletBreadcrumb, [
+  'https://fixture.invalid/brand/leaflet/',
+  'https://fixture.invalid/brand/catalogue/',
+  'https://fixture.invalid/brand/campaign/'
+]);
 const privacyOnlyBreadcrumb = hooks.selectCoverageObservationV2Candidates_('https://fixture.invalid/', [
   { href:'/privacy/', text:'Privacy' }, { href:'/legal/', text:'Legal' }, { href:'/contact/', text:'Contact' }
 ], 'breadcrumb', 3);

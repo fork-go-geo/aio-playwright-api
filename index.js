@@ -16467,7 +16467,12 @@ function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
     : target === 'service'
       ? /(?:service|services|product|products|solution|solutions|feature|features|pricing|料金|サービス|製品|商品|機能|ソリューション)/i
       : target === 'breadcrumb'
-        ? /(?:service|product|solution|company|about|detail|category|case|article|post|news|blog|item|guide|store|facility|サービス|製品|商品|会社|事業|施設|事例|記事|ニュース|ブログ|店舗|ガイド)/i
+        // Human-facing leaflets, catalogues, and campaigns are ordinary
+        // hierarchical content routes. They are candidates only: the
+        // rendered subpage still has to satisfy the existing UI observer.
+        // This avoids URL-role inference while preventing the selector from
+        // systematically overlooking non-product content hierarchies.
+        ? /(?:service|product|solution|company|about|detail|category|case|article|post|news|blog|item|guide|store|facility|flyer|flier|leaflet|catalog(?:ue)?|campaign|サービス|製品|商品|会社|事業|施設|事例|記事|ニュース|ブログ|店舗|ガイド|チラシ|カタログ|キャンペーン)/i
         : /(?:sitemap|site[-_\s]?map|サイト\s*マップ)/i;
   const exclude = target === 'service'
     ? /(?:faq|よくある質問|会社概要|company|about|採用|career|privacy|terms|legal|contact|お問い合わせ|login|search|blog|news|article)/i
@@ -16498,7 +16503,7 @@ function selectCoverageObservationV2Candidates_(origin, links, kind, maxCount) {
       // never infers a breadcrumb from the role or URL itself.
       const rankText = text.toLowerCase();
       const rank = /(?:detail|product|item|case|article|post|news|blog|詳細|製品|商品|事例|記事|ニュース|ブログ)/i.test(rankText) ? 0
-        : /(?:service|solution|category|guide|store|facility|サービス|事業|カテゴリ|ガイド|店舗|施設)/i.test(rankText) ? 1
+        : /(?:service|solution|category|guide|store|facility|flyer|flier|leaflet|catalog(?:ue)?|campaign|サービス|事業|カテゴリ|ガイド|店舗|施設|チラシ|カタログ|キャンペーン)/i.test(rankText) ? 1
           : /(?:company|about|会社|企業|概要)/i.test(rankText) ? 2 : 3;
       out.push({ url, rank, ordinal: ordinal++ });
     } else {
@@ -16727,7 +16732,10 @@ async function readCoverageObservationV2Page_(page) {
         serviceLinks, serviceLinkObserved:serviceLinks.length>0,
         sitemapLinks, sitemapLinkDiscoveryComplete:true };
     });
-    return Object.assign({ checked: true, attempted: true, renderComplete: isCoverageObservationV2StableDocumentState_(fact.readyState), frameComplete: !fact.hasFrame, failureKind: null }, fact, {
+    // An embedded widget must not make a complete rendered main document
+    // unusable. Only a frameset or sparse shell requires a child-frame scope.
+    const entryShell = isCoverageObservationV2EntryContentShell_(fact);
+    return Object.assign({ checked: true, attempted: true, renderComplete: isCoverageObservationV2StableDocumentState_(fact.readyState), frameComplete: !entryShell, failureKind: null }, fact, {
       faqContent: detectFaqContentV2_(fact.faqDetector)
     });
   } catch (error) {
