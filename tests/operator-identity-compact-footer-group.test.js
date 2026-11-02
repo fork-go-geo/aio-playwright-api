@@ -8,6 +8,7 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
     const page = await browser.newPage();
     await page.setContent(`
       <div class="visual-footer">
+        <div class="operator-disclosure">当ウェブサイトは<a href="https://predicate-operator-fixture.invalid/">述語形運営株式会社</a>が運営しております。</div>
         <dl>
           <dt>運営会社</dt>
           <dd><ul><li><a href="https://operator-fixture.invalid/">架空運営株式会社</a></li></ul></dd>
@@ -30,15 +31,18 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
     const links = await hooks.collectDiscoverLinksFromPage(page);
     const operatorLink = links.footerLinks.find(item => item.href === 'https://operator-fixture.invalid/');
     const companyLink = links.footerLinks.find(item => item.href === 'https://company-fixture.invalid/');
+    const predicateLink = links.operatorRelationLinks.find(item => item.href === 'https://predicate-operator-fixture.invalid/');
     assert.ok(operatorLink, 'operator link in a compact dl group must be forwarded as a footer link');
     assert.strictEqual(operatorLink.groupHeading, '運営会社');
     assert.ok(companyLink, 'English Company group must be forwarded as a footer link');
     assert.strictEqual(companyLink.groupHeading, 'Company');
+    assert.ok(predicateLink, 'a compact predicate-form operating disclosure must be retained');
+    assert.match(predicateLink.groupHeading, /述語形運営株式会社が運営しております/);
 
     const candidates = hooks.collectOfficialExternalOperatorProfileCandidates_(links, 'https://service-fixture.invalid');
     assert.deepStrictEqual(candidates.map(item => item.url).sort(), [
-      'https://company-fixture.invalid',
-      'https://operator-fixture.invalid'
+      'https://operator-fixture.invalid',
+      'https://predicate-operator-fixture.invalid'
     ]);
     ['https://policy-fixture.invalid/', 'https://youtube.example.invalid/channel', 'https://social.example.invalid/account', 'https://external.example.invalid/']
       .forEach(url => assert.strictEqual(links.footerLinks.some(item => item.href === url), false, `${url} must not be admitted as a compact operator group link`));
@@ -46,7 +50,7 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
     console.log(JSON.stringify({
       pass: true,
       fixture: 'operator_identity_compact_footer_group',
-      cases: 6
+      cases: 8
     }));
   } finally {
     await browser.close();
