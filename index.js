@@ -17838,6 +17838,41 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         }
         return '';
       };
+      // Legacy pages sometimes expose a real footer with a named wrapper
+      // rather than a semantic <footer> landmark. Treat one only when its
+      // footer meaning is explicit, visible, and unambiguous. This is still
+      // a bounded DOM scope; generic bottom-page wrappers are never adopted.
+      const isVisibleFooterContainer = (el) => {
+        if (!el || !el.isConnected) return false;
+        const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse')) return false;
+        if (style && Number(style.opacity) === 0) return false;
+        return !el.getClientRects || el.getClientRects().length > 0;
+      };
+      const hasExplicitFooterMarker = (el) => {
+        if (!el || !el.getAttribute) return false;
+        const marker = clean([
+          el.id || '',
+          typeof el.className === 'string' ? el.className : '',
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('data-region') || '',
+          el.getAttribute('data-footer') || ''
+        ].join(' ')).toLowerCase();
+        return /(?:^|[\s_-])footer(?:[\s_-]|$)|フッター/.test(marker);
+      };
+      const explicitFooterRoots = queryAllDeep('[id],[class],[aria-label],[data-region],[data-footer]')
+        .filter((el) => hasExplicitFooterMarker(el) && isVisibleFooterContainer(el))
+        .filter((el) => {
+          for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+            if (hasExplicitFooterMarker(parent) && isVisibleFooterContainer(parent)) return false;
+          }
+          return true;
+        });
+      const explicitFooterRoot = explicitFooterRoots.length === 1 ? explicitFooterRoots[0] : null;
+      const isFooterLikeAnchor = (anchor) => !!(anchor && (
+        anchor.closest('footer,[role="contentinfo"]') ||
+        (explicitFooterRoot && explicitFooterRoot.contains(anchor))
+      ));
       const anchors = queryAllDeep('a[href]').map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
@@ -17845,7 +17880,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         title: clean(a.getAttribute('title') || ''),
         nearbyLabel: scopedNearbyLabel(a),
         navLike: !!a.closest('nav,[role="navigation"],header,footer'),
-        footerLike: !!a.closest('footer,[role="contentinfo"]'),
+        footerLike: isFooterLikeAnchor(a),
         source: (a.getRootNode && a.getRootNode() instanceof ShadowRoot) ? 'open_shadow_dom' : 'dom'
       })).filter((a) => a.href);
       const shadowTextParts = [];
@@ -17872,7 +17907,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
                   title: clean(el.getAttribute('title') || ''),
                   nearbyLabel: scopedNearbyLabel(el),
                   navLike: !!el.closest('nav,[role="navigation"],header,footer'),
-                  footerLike: !!el.closest('footer,[role="contentinfo"]'),
+                  footerLike: isFooterLikeAnchor(el),
                   source: 'open_shadow_dom'
                 });
               }
@@ -18192,7 +18227,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         return faqRe.test(text || '');
       }) || null;
       const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
-      const footerObserved = footerAnchors.length > 0 || semanticFooterCount > 0;
+      const footerObserved = footerAnchors.length > 0 || semanticFooterCount > 0 || !!explicitFooterRoot;
       const footerSignals = {
         observed: footerObserved,
         linkCount: footerObserved ? footerAnchors.length : null,
@@ -23556,11 +23591,42 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
             walk(document, 0);
             return out;
           };
+          const isVisibleFooterContainer = (el) => {
+            if (!el || !el.isConnected) return false;
+            const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            if (style && (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse')) return false;
+            if (style && Number(style.opacity) === 0) return false;
+            return !el.getClientRects || el.getClientRects().length > 0;
+          };
+          const hasExplicitFooterMarker = (el) => {
+            if (!el || !el.getAttribute) return false;
+            const marker = clean([
+              el.id || '',
+              typeof el.className === 'string' ? el.className : '',
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('data-region') || '',
+              el.getAttribute('data-footer') || ''
+            ].join(' ')).toLowerCase();
+            return /(?:^|[\s_-])footer(?:[\s_-]|$)|フッター/.test(marker);
+          };
+          const explicitFooterRoots = queryAllDeep('[id],[class],[aria-label],[data-region],[data-footer]')
+            .filter((el) => hasExplicitFooterMarker(el) && isVisibleFooterContainer(el))
+            .filter((el) => {
+              for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+                if (hasExplicitFooterMarker(parent) && isVisibleFooterContainer(parent)) return false;
+              }
+              return true;
+            });
+          const explicitFooterRoot = explicitFooterRoots.length === 1 ? explicitFooterRoots[0] : null;
+          const isFooterLikeAnchor = (anchor) => !!(anchor && (
+            anchor.closest('footer,[role="contentinfo"]') ||
+            (explicitFooterRoot && explicitFooterRoot.contains(anchor))
+          ));
           const anchors = queryAllDeep('a[href]').map((a) => ({
             text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
             href: absUrl(a.getAttribute('href') || '').slice(0, 180),
             navLike: !!a.closest('nav,[role="navigation"],header,footer'),
-            footerLike: !!a.closest('footer,[role="contentinfo"]'),
+            footerLike: isFooterLikeAnchor(a),
             source: 'dom'
           })).filter((a) => a.href);
           anchors.forEach((a) => {
@@ -23721,7 +23787,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           return faqRe.test(text || '');
         }) || null;
         const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
-        const footerObserved = footerAnchors.length > 0 || queryAllDeep('footer,[role="contentinfo"]').length > 0;
+        const footerObserved = footerAnchors.length > 0 || queryAllDeep('footer,[role="contentinfo"]').length > 0 || !!explicitFooterRoot;
         const formSignals = (() => {
           const forms = Array.from(document.querySelectorAll('form'));
           const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(location.pathname || '');
