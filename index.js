@@ -11913,6 +11913,20 @@ function buildOperatorIdentityInfoFromObservedCompanyProfiles_(pages) {
   };
 }
 
+// A conflicting record reused from representative-page observation is never a
+// formal identity source.  It must not, however, suppress a separately
+// bounded probe whose candidate carries an explicit current-site relation to
+// the operator.  The detail page still has to establish every formal field.
+function canAttemptRelationBackedOperatorIdentityProbeV1_(operatorIdentityInfo, observedCompanyProfileReason, candidates) {
+  if (operatorIdentityInfo) return false;
+  if (String(observedCompanyProfileReason || '').indexOf('conflict') < 0) return true;
+  return (Array.isArray(candidates) ? candidates : []).some(candidate => {
+    const relation = buildExplicitOperatorIdentityRelationEvidenceV1_(candidate);
+    return relation && (relation.kind === 'explicit_external_operator_relation' ||
+      relation.kind === 'explicit_same_origin_company_profile_relation');
+  });
+}
+
 const OPERATOR_IDENTITY_PRESELECTION_INPUT_MAX_V1_ = 240;
 const OPERATOR_IDENTITY_PRESELECTION_EVALUATION_MAX_V1_ = 80;
 const OPERATOR_IDENTITY_PRIORITY_LANE_SCAN_MAX_V1_ = 2048;
@@ -12950,8 +12964,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       discovered.operatorIdentitySelectionPlan.version === 'operator_identity_probe_selection_v1'
       ? discovered.operatorIdentitySelectionPlan
       : buildOperatorIdentityProbeSelectionPlan_(discovered.operatorIdentityAuditCandidates, siteMode, 2);
-    if (!operatorIdentityInfo && observedCompanyProfileIdentity.reason.indexOf('conflict') < 0) {
-      const operatorCandidates = operatorSelectionPlan.selected;
+    const operatorCandidates = operatorSelectionPlan.selected;
+    if (canAttemptRelationBackedOperatorIdentityProbeV1_(
+      operatorIdentityInfo,
+      observedCompanyProfileIdentity.reason,
+      operatorCandidates
+    )) {
       const operatorCandidate = operatorCandidates[0] || null;
       if (operatorCandidate) {
         selectedOperatorIdentityCandidate = operatorCandidate;
@@ -29947,6 +29965,7 @@ module.exports.__lightBudgetTestHooks = {
   isObservedCompanyProfileScope_,
   operatorIdentityScopeKey_,
   buildOperatorIdentityInfoFromObservedCompanyProfiles_,
+  canAttemptRelationBackedOperatorIdentityProbeV1_,
   evaluateHighConfidenceCompanyProfileCandidate_,
   isHighConfidenceCompanyProfileCandidate_,
   evaluateBoundedOperatorIdentityProbeCandidate_,
