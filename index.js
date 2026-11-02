@@ -4496,6 +4496,19 @@ function selectOperatorCompanyProfileFollowupV1_(operatorPage, candidate, firstI
   return detail ? { role: 'detail', link: detail } : null;
 }
 
+// An explicitly related external corporate root may expose its sole formal
+// company-profile page directly. This route is already bounded by the
+// root-specific selector and does not rely on a redirect recovery.
+function selectOperatorIdentityLandingFollowupV1_(operatorPage, candidate, firstIdentity) {
+  const rootDetail = selectExternalOperatorRootCompanyProfileDetailLink_(
+    operatorPage,
+    candidate,
+    !!(firstIdentity && firstIdentity.hasOperatorInfo === true)
+  );
+  if (rootDetail) return { role: 'detail', link: rootDetail };
+  return selectOperatorCompanyProfileFollowupV1_(operatorPage, candidate, firstIdentity);
+}
+
 // Company-profile pages reached through one bounded hub/detail chain can
 // legitimately describe different offices or contact desks of the same legal
 // operator. Under the operator-identity contract, those are disclosure
@@ -13212,7 +13225,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         };
         const landingFollowup = operatorIdentityProbe.fallbackProbeAttempted === true
           ? null
-          : selectOperatorCompanyProfileFollowupV1_(operatorPage, operatorCandidate, incompleteIdentity);
+          : selectOperatorIdentityLandingFollowupV1_(operatorPage, operatorCandidate, incompleteIdentity);
         const hubLink = landingFollowup && landingFollowup.role === 'hub' ? landingFollowup.link : null;
         const directDetailLink = landingFollowup && landingFollowup.role === 'detail' ? landingFollowup.link : null;
         if (hubLink && hubLink.url) {
@@ -29927,6 +29940,7 @@ module.exports.__lightBudgetTestHooks = {
   selectOperatorSecondPageCompanyProfileDetailLink_,
   selectOperatorCompanyProfileHubLink_,
   selectOperatorCompanyProfileFollowupV1_,
+  selectOperatorIdentityLandingFollowupV1_,
   classifyOperatorIdentityFieldConflictsV1_,
   operatorIdentityFieldsConflict_,
   buildOperatorIdentityFieldExtractionAuditV1_,

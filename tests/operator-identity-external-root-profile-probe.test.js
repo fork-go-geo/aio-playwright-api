@@ -4,6 +4,8 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
 const {
   collectExplicitCompanyProfileDetailLinksFromHtml_,
   selectExternalOperatorRootCompanyProfileDetailLink_,
+  selectOperatorCompanyProfileFollowupV1_,
+  selectOperatorIdentityLandingFollowupV1_,
   operatorIdentityFieldsConflict_,
   extractOperatorIdentityInfoFromHtml_,
   normalizeOperatorIdentityInfo_,
@@ -41,6 +43,15 @@ const selected = selectExternalOperatorRootCompanyProfileDetailLink_(
   { ok: true, externalCompanyProfileDetailLinks: links }, externalRootCandidate, false
 );
 assert.strictEqual(selected.url, links[0].url);
+// The generic follow-up deliberately rejects an external root without an
+// HTTPS-recovery redirect. The landing selector must use the existing
+// root-specific bounded route instead.
+assert.strictEqual(selectOperatorCompanyProfileFollowupV1_(
+  { ok: true, finalUrl: rootUrl, companyProfileDetailLinks: links }, externalRootCandidate, { hasOperatorInfo: false }
+), null);
+assert.deepStrictEqual(selectOperatorIdentityLandingFollowupV1_(
+  { ok: true, finalUrl: rootUrl, externalCompanyProfileDetailLinks: links, companyProfileDetailLinks: links }, externalRootCandidate, { hasOperatorInfo: false }
+), { role: 'detail', link: links[0] });
 const detail = extractOperatorIdentityInfoFromHtml_(profileHtml, selected.url, { highConfidenceCompanyProfile: true });
 assert.strictEqual(detail.hasOperatorInfo, true);
 const record = attachOperatorIdentityProbeProvenance_(normalizeOperatorIdentityInfo_(detail, 'company_profile', {
