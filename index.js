@@ -3389,7 +3389,7 @@ function evaluateHighConfidenceCompanyProfileCandidate_(candidate) {
     const sourceOrigin = String(candidate.operatorRelationSourceOrigin || '');
     let candidateOrigin = '';
     try { candidateOrigin = new URL(url).origin; } catch (_) {}
-    const explicitOperatorRelation = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i.test(label);
+    const explicitOperatorRelation = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i.test(label);
     result.labelMatched = explicitOperatorRelation;
     if (!sourceOrigin || !candidateOrigin || candidateOrigin === sourceOrigin) result.rejectionReasons.push('external_origin_not_distinct');
     if (!explicitOperatorRelation) result.rejectionReasons.push('external_operator_relation_label_missing');
@@ -3888,8 +3888,8 @@ function buildOperatorIdentityDiscoverLinkAuditV1_(links, origin) {
   const allLinks = Array.isArray(links && links.allLinks) ? links.allLinks : [];
   const navLinks = Array.isArray(links && links.navLinks) ? links.navLinks : [];
   const footerLinks = Array.isArray(links && links.footerLinks) ? links.footerLinks : [];
-  const anchorRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
-  const groupRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|\bcompany\b|corporate\s+(?:info|information|profile)/i;
+  const anchorRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
+  const groupRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|\boperator\b|\bcompany\b|corporate\s+(?:info|information|profile)/i;
   const seen = new Set();
   const matches = [];
   const inspect = (link, source) => {
@@ -6878,8 +6878,8 @@ function collectOfficialExternalOperatorProfileCandidates_(links, origin) {
   const out = [];
   const seen = new Set();
   const sourceOrigin = String(origin || '');
-  const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
-  const groupRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|\bcompany\b|corporate\s+(?:info|information|profile)/i;
+  const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
+  const groupRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|\boperator\b|\bcompany\b|corporate\s+(?:info|information|profile)/i;
   const add = (raw, source) => {
     if (out.length >= 2 || !raw || !sourceOrigin) return;
     const anchorLabel = normalizeSubpageJsonLdText([raw.text, raw.ariaLabel, raw.title].filter(Boolean).join(' '));
@@ -6950,8 +6950,8 @@ function collectOfficialSameOriginOperatorProfileCandidates_(links, origin) {
   const out = [];
   const seen = new Set();
   const sourceOrigin = String(origin || '');
-  const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
-  const groupRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|\bcompany\b|corporate\s+(?:info|information|profile)/i;
+  const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|operator|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
+  const groupRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|\boperator\b|\bcompany\b|corporate\s+(?:info|information|profile)/i;
   const add = raw => {
     if (out.length >= 2 || !raw || !sourceOrigin) return;
     const anchorLabel = normalizeSubpageJsonLdText([raw.text, raw.ariaLabel, raw.title].filter(Boolean).join(' '));
@@ -7582,7 +7582,8 @@ async function collectDiscoverLinksFromPage(page) {
       return out;
     };
     const groupHeadingFor = (a) => {
-      const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|\bcompany\b/i;
+      const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|\boperator\b|\bcompany\b/i;
+      const headingRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|\bcompany\b/i;
       const boundary = a.closest('footer,[role="contentinfo"],nav,[role="navigation"],header');
       let node = a.parentElement;
       // Inspect only the link's own compact grouping ancestors.  We never use
@@ -7592,8 +7593,13 @@ async function collectDiscoverLinksFromPage(page) {
           .filter(child => child !== a && child.matches && child.matches('h1,h2,h3,h4,h5,h6,[role="heading"],dt,strong,b'))
           .map(child => clean(child.innerText || child.textContent || ''))
           .filter(Boolean);
-        const direct = headings.find(value => relationRe.test(value));
+        const direct = headings.find(value => headingRelationRe.test(value));
         if (direct) return direct.slice(0, 120);
+        const compactGroupText = clean(node.innerText || node.textContent || '');
+        const compactGroupLinkCount = node.querySelectorAll ? node.querySelectorAll('a[href]').length : 0;
+        if (compactGroupLinkCount === 1 && compactGroupText.length <= 240 && relationRe.test(compactGroupText)) {
+          return compactGroupText.slice(0, 120);
+        }
         const parent = node.parentElement;
         if (!parent) continue;
         const siblings = Array.from(parent.children || []);
@@ -7602,7 +7608,7 @@ async function collectDiscoverLinksFromPage(page) {
           const sibling = siblings[index];
           if (!sibling || !sibling.matches || !sibling.matches('h1,h2,h3,h4,h5,h6,[role="heading"],dt,strong,b,p,span,div')) continue;
           const value = clean(sibling.innerText || sibling.textContent || '');
-          if (relationRe.test(value)) return value.slice(0, 120);
+          if (headingRelationRe.test(value)) return value.slice(0, 120);
         }
       }
       return '';
@@ -7625,7 +7631,7 @@ async function collectDiscoverLinksFromPage(page) {
     // scan of already-rendered DOM only; it neither fetches URLs nor widens
     // coverage discovery. Its entries are later subject to the same origin,
     // candidate-eligibility, safe-fetch, and formal-field contracts.
-    const operatorRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
+    const operatorRelationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|運営(?:して(?:おり)?ます|している|する)|operating\s+company|\boperator\b|company\s+(?:info|information|profile)|corporate\s+(?:info|information|profile)/i;
     const operatorRelationSeen = new Set();
     const operatorRelationLinks = queryAllDeep('a[href]', { maxNodes: 2048 })
       .map(linkFrom)

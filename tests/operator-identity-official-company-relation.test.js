@@ -30,6 +30,22 @@ const transport = routes => async url => {
   assert.strictEqual(officialExternal[0].source, 'explicit_body_operator_relation');
   assert.strictEqual(hooks.evaluateBoundedOperatorIdentityProbeCandidate_(officialExternal[0]).probeEligible, true);
 
+  // A company-name anchor may be the subject of a visible predicate rather
+  // than carry a noun-form label such as "運営会社".  The compact group remains
+  // an explicit relation and may use the same bounded external-root route.
+  const predicateFormExternal = hooks.collectOfficialExternalOperatorProfileCandidates_({
+    operatorRelationLinks: [{
+      href: 'https://operator.fixture.invalid/',
+      text: 'フィクスチャ運営株式会社',
+      groupHeading: '当ウェブサイトはフィクスチャ運営株式会社が運営しております。'
+    }],
+    navLinks: [], footerLinks: [], allLinks: []
+  }, sourceOrigin);
+  assert.strictEqual(predicateFormExternal.length, 1);
+  assert.strictEqual(predicateFormExternal[0].officialExternalOperatorProfile, true);
+  assert.strictEqual(predicateFormExternal[0].source, 'explicit_body_operator_relation');
+  assert.strictEqual(hooks.evaluateBoundedOperatorIdentityProbeCandidate_(predicateFormExternal[0]).probeEligible, true);
+
   // A direct, same-origin rendered relation must not disappear merely because
   // the ordinary discovery map already contains sitemap candidates. It remains
   // bounded to two metadata-only candidates and requires formal page fields.
