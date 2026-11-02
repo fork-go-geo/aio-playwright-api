@@ -17104,14 +17104,14 @@ function buildExternalProfileObservationV1_(links, opts = {}) {
   for (const row of uniqueRows.slice(0, 10)) {
     if (!row || typeof row !== 'object') continue;
     const href = String(row.href || '').trim();
-    const label = normalizeSubpageJsonLdText([row.text, row.ariaLabel, row.title, row.nearbyLabel].filter(Boolean).join(' '));
+    const label = normalizeSubpageJsonLdText([row.text, row.imageAlt, row.ariaLabel, row.title, row.nearbyLabel].filter(Boolean).join(' '));
     let externalHttps = false;
     try { externalHttps = new URL(href).protocol === 'https:'; } catch (_) {}
     if (!externalHttps) continue;
     const listingCorporateMatch = row.fromOfficialAccountListing === true && corporateNameKey &&
       externalProfileCorporateNameKeyV1_(label) === corporateNameKey;
     profiles.push({ href, label: label.slice(0, 160), placement: String(row.placement || 'rendered_dom').slice(0, 40),
-      relationConfirmed: relationRe.test(label) || listingCorporateMatch });
+      relationConfirmed: row.articleLike !== true && (relationRe.test(label) || listingCorporateMatch) });
   }
   const complete = opts.linksObserved === true && opts.linksLimited !== true;
   return {
@@ -17829,6 +17829,24 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           a.innerText || a.textContent || ''
         ].join(' '));
         if (directMetadata) return '';
+        // A social-icon list may be named by a preceding text element rather
+        // than a heading. Accept that context only when it explicitly states
+        // the official relationship, the list contains multiple profile-host
+        // links, and the link is not part of an article body.
+        if (!a.closest('article')) {
+          const list = a.closest('ul,ol,[role="list"]');
+          const profileHrefRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
+          const officialRelationRe = /(?:公式|official|follow\s+us|公式(?:アカウント|sns|ソーシャル)|オフィシャル\s*(?:sns|ＳＮＳ|ソーシャル|アカウント)|our\s+(?:social|account))/i;
+          if (list) {
+            const profileKeys = new Set(Array.from(list.querySelectorAll('a[href]')).map((link) => absUrl(link.getAttribute('href') || '')).filter((href) => profileHrefRe.test(href)));
+            const siblings = Array.from(list.parentElement && list.parentElement.children || []);
+            const listIndex = siblings.indexOf(list);
+            const labels = siblings.slice(0, listIndex).filter((node) => node.matches && node.matches('h1,h2,h3,h4,h5,h6,[role="heading"],p,span'))
+              .map((node) => clean(node.innerText || node.textContent || '')).filter((label) => label && officialRelationRe.test(label));
+            if (profileKeys.size >= 2 && labels.length === 1) return labels[0];
+          }
+        }
+        if (a.closest('article')) return '';
         const semanticContainers = [];
         for (let node = a.parentElement; node; node = node.parentElement) {
           if (node.matches && node.matches('section,article,[role="group"]')) semanticContainers.push(node);
@@ -17886,10 +17904,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       ));
       const anchors = queryAllDeep('a[href]').map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+        imageAlt: clean(Array.from(a.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ')),
         href: absUrl(a.getAttribute('href') || ''),
         ariaLabel: clean(a.getAttribute('aria-label') || ''),
         title: clean(a.getAttribute('title') || ''),
         nearbyLabel: scopedNearbyLabel(a),
+        articleLike: !!a.closest('article'),
         navLike: !!a.closest('nav,[role="navigation"],header,footer'),
         footerLike: isFooterLikeAnchor(a),
         source: (a.getRootNode && a.getRootNode() instanceof ShadowRoot) ? 'open_shadow_dom' : 'dom'
@@ -17913,10 +17933,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
               if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
                 anchors.push({
                   text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')),
+                  imageAlt: clean(Array.from(el.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(' ')),
                   href: absUrl(el.getAttribute('href') || ''),
                   ariaLabel: clean(el.getAttribute('aria-label') || ''),
                   title: clean(el.getAttribute('title') || ''),
                   nearbyLabel: scopedNearbyLabel(el),
+                  articleLike: !!el.closest('article'),
                   navLike: !!el.closest('nav,[role="navigation"],header,footer'),
                   footerLike: isFooterLikeAnchor(el),
                   source: 'open_shadow_dom'
@@ -18016,7 +18038,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       });
       const externalProfileItems = limit(selectedExternalProfileAnchors.map((a) => a.href), 10);
       const externalProfileLinkEvidence = limit(selectedExternalProfileAnchors.map((a) => ({
-        href: a.href, text: a.text || '', ariaLabel: a.ariaLabel || '', title: a.title || '',
+        href: a.href, text: a.text || '', imageAlt: a.imageAlt || '', ariaLabel: a.ariaLabel || '', title: a.title || '', articleLike: a.articleLike === true,
         nearbyLabel: a.nearbyLabel || '', placement: a.footerLike ? 'footer' : (a.navLike ? 'nav' : 'rendered_dom')
       })), 10);
       const footerExternalProfileItems = limit(anchors.filter((a) => a.footerLike && profileHostRe.test(a.href)).map((a) => a.href), 10);
