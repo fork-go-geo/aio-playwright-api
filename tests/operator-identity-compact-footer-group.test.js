@@ -8,7 +8,9 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
     const page = await browser.newPage();
     await page.setContent(`
       <div class="visual-footer">
-        <div class="operator-disclosure">当ウェブサイトは<a href="https://predicate-operator-fixture.invalid/">述語形運営株式会社</a>が運営しております。</div>
+        <div class="operator-disclosure">当ウェブサイトは<a href="https://predicate-operator-fixture.invalid/">述語形運営株式会社</a>が運営しております。<a href="/terms/">利用規約</a></div>
+        <div class="unrelated-pair"><a href="https://unrelated-pair-fixture.invalid/">関連サイト</a><a href="/privacy/">個人情報保護方針</a></div>
+        <div class="too-many-links">当ウェブサイトは<a href="https://too-many-fixture.invalid/">候補外運営株式会社</a>が運営しております。<a href="/terms/">利用規約</a><a href="/privacy/">個人情報保護方針</a></div>
         <dl>
           <dt>運営会社</dt>
           <dd><ul><li><a href="https://operator-fixture.invalid/">架空運営株式会社</a></li></ul></dd>
@@ -32,12 +34,16 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
     const operatorLink = links.footerLinks.find(item => item.href === 'https://operator-fixture.invalid/');
     const companyLink = links.footerLinks.find(item => item.href === 'https://company-fixture.invalid/');
     const predicateLink = links.operatorRelationLinks.find(item => item.href === 'https://predicate-operator-fixture.invalid/');
+    const unrelatedPair = links.operatorRelationLinks.find(item => item.href === 'https://unrelated-pair-fixture.invalid/');
+    const tooManyLinks = links.operatorRelationLinks.find(item => item.href === 'https://too-many-fixture.invalid/');
     assert.ok(operatorLink, 'operator link in a compact dl group must be forwarded as a footer link');
     assert.strictEqual(operatorLink.groupHeading, '運営会社');
     assert.ok(companyLink, 'English Company group must be forwarded as a footer link');
     assert.strictEqual(companyLink.groupHeading, 'Company');
     assert.ok(predicateLink, 'a compact predicate-form operating disclosure must be retained');
     assert.match(predicateLink.groupHeading, /述語形運営株式会社が運営しております/);
+    assert.strictEqual(unrelatedPair, undefined, 'an unrelated two-link group must not become an operator relation');
+    assert.strictEqual(tooManyLinks, undefined, 'a three-link group must remain outside the compact relation scope');
 
     const candidates = hooks.collectOfficialExternalOperatorProfileCandidates_(links, 'https://service-fixture.invalid');
     assert.deepStrictEqual(candidates.map(item => item.url).sort(), [
@@ -50,7 +56,7 @@ const hooks = require('../index.js').__lightBudgetTestHooks;
     console.log(JSON.stringify({
       pass: true,
       fixture: 'operator_identity_compact_footer_group',
-      cases: 8
+      cases: 10
     }));
   } finally {
     await browser.close();

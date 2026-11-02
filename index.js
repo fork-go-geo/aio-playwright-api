@@ -7597,7 +7597,7 @@ async function collectDiscoverLinksFromPage(page) {
         if (direct) return direct.slice(0, 120);
         const compactGroupText = clean(node.innerText || node.textContent || '');
         const compactGroupLinkCount = node.querySelectorAll ? node.querySelectorAll('a[href]').length : 0;
-        if (compactGroupLinkCount === 1 && compactGroupText.length <= 240 && relationRe.test(compactGroupText)) {
+        if (compactGroupLinkCount <= 2 && compactGroupText.length <= 240 && relationRe.test(compactGroupText)) {
           return compactGroupText.slice(0, 120);
         }
         const parent = node.parentElement;
