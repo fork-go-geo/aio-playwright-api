@@ -15039,6 +15039,7 @@ function collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin) {
   try { expectedOrigin = new URL(String(origin || '')).origin; } catch (_) {}
   const seen = new Set();
   return pages.reduce((rows, page) => {
+    if (!page || page.observationLimited === true || page.renderComplete === false || page.frameComplete === false) return rows;
     const url = String(page && (page.finalUrl || page.url) || '');
     let parsed = null;
     try { parsed = new URL(url); } catch (_) { return rows; }
@@ -15168,11 +15169,21 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   const faqRows = canOpen ? await observeCoverageObservationV2Candidates_(context, faqUrls) : [];
   const serviceRows = canOpen ? await observeCoverageObservationV2Candidates_(context, serviceUrls) : [];
   const directBreadcrumbRows = canOpen ? await observeCoverageObservationV2Candidates_(context, breadcrumbUrls) : [];
-  const reusableBreadcrumbRows = !breadcrumbUrls.length
+  const directBreadcrumbComplete = directBreadcrumbRows.length > 0 &&
+    directBreadcrumbRows.every(isCoverageObservationV2CompletePage_);
+  // The bounded representative-page pass has already produced completed,
+  // same-origin hierarchical observations in this run.  When the separate
+  // lexical breadcrumb pass is absent or partly fails, reuse that existing
+  // authority rather than discarding it solely because an extra fetch did not
+  // complete.  Completed direct rows remain in the sample so a confirmed UI
+  // positive is never lost; incomplete rows are never treated as negative.
+  const reusableBreadcrumbRows = (!breadcrumbUrls.length || !directBreadcrumbComplete)
     ? collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin)
     : [];
   const usingReusableBreadcrumbRows = reusableBreadcrumbRows.length > 0;
-  const breadcrumbRows = usingReusableBreadcrumbRows ? reusableBreadcrumbRows : directBreadcrumbRows;
+  const breadcrumbRows = usingReusableBreadcrumbRows
+    ? reusableBreadcrumbRows.concat(directBreadcrumbRows.filter(isCoverageObservationV2CompletePage_))
+    : directBreadcrumbRows;
   const candidateComplete = discoveryComplete && canOpen;
   const observations = {
     faqObservationV2: buildFaqObservationV2_(entry, faqRows, candidateComplete),
