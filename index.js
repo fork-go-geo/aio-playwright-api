@@ -13464,6 +13464,13 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       lightBudget,
       executionAuth: opts.executionAuth
     });
+    await attachRelatedEntityProfileClassificationV1_(geoSignalsV1, {
+      sourceRunId: opts.sourceRunId,
+      entryKey: opts.entryKey || normalized.topUrl,
+      siteMode,
+      lightBudget,
+      executionAuth: opts.executionAuth
+    });
     const contactSignals = pickBestContactSignals_(observations);
     if (contactSignals) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
@@ -17126,12 +17133,39 @@ function externalProfileCorporateNameKeyV1_(value) {
     .replace(/(?:株式会社|有限会社|合同会社|inc\.?|corp\.?|corporation|co\.?\s*,?\s*ltd\.?|ltd\.?)\s*/gi, '')
     .replace(/[\s　・._,()（）\-]/g, '');
 }
+function externalProfileSubjectTokenV1_(href, isProfile) {
+  try {
+    const parsed = new URL(String(href || ''));
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '').split('.')[0] || '';
+    const path = parsed.pathname.split('/').filter(Boolean).join('_');
+    const raw = isProfile === true ? path : host;
+    return String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  } catch (_) { return ''; }
+}
+function externalProfileHostV1_(href) {
+  try { return /(?:^|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)$/i.test(new URL(String(href || '')).hostname); } catch (_) { return false; }
+}
+function isRelatedEntityProfileMatchV1_(profileHref, entityHref) {
+  const profileToken = externalProfileSubjectTokenV1_(profileHref, true);
+  const entityToken = externalProfileSubjectTokenV1_(entityHref, false);
+  // A five-character minimum avoids treating short, generic handles as an
+  // entity match. This merely selects an already-linked entity root for the
+  // existing bounded HTML probe; it never establishes official ownership.
+  return entityToken.length >= 5 && profileToken.length >= entityToken.length && profileToken.indexOf(entityToken) === 0;
+}
 function buildExternalProfileObservationV1_(links, opts = {}) {
   const source = links && typeof links === 'object' ? links : {};
   const rows = (Array.isArray(source.externalProfileLinkEvidence) ? source.externalProfileLinkEvidence : [])
     .concat(Array.isArray(opts.officialListingEvidence) ? opts.officialListingEvidence : []);
   const relationRe = /(?:公式|official|follow\s+us|公式(?:アカウント|sns|ソーシャル)|オフィシャル\s*(?:sns|ＳＮＳ|ソーシャル|アカウント)|our\s+(?:social|account))/i;
   const profiles = [];
+  const expectedRunId = String(opts.sourceRunId || '');
+  const expectedEntryKey = String(opts.entryKey || '');
+  const relatedEvidence = Array.isArray(opts.relatedEntityProfileEvidence) ? opts.relatedEntityProfileEvidence : [];
+  const relatedByKey = new Map(relatedEvidence.filter(item => item && item.observationComplete === true &&
+    (!expectedRunId || String(item.sourceRunId || '') === expectedRunId) &&
+    (!expectedEntryKey || String(item.entryKey || '') === expectedEntryKey))
+    .map(item => [externalProfileNormalizedUrlKeyV1_(item.href), item]).filter(item => !!item[0]));
   const corporateNameKey = externalProfileCorporateNameKeyV1_(opts.corporateName || '');
   const uniqueRows = []; const seen = new Set();
   for (const row of rows) {
@@ -17147,8 +17181,16 @@ function buildExternalProfileObservationV1_(links, opts = {}) {
     if (!externalHttps) continue;
     const listingCorporateMatch = row.fromOfficialAccountListing === true && corporateNameKey &&
       externalProfileCorporateNameKeyV1_(label) === corporateNameKey;
+    const relationConfirmed = row.articleLike !== true && (relationRe.test(label) || listingCorporateMatch);
+    const relatedEvidenceItem = relatedByKey.get(externalProfileNormalizedUrlKeyV1_(href)) || null;
+    const relatedBrandOrFacility = relationConfirmed !== true && !!relatedEvidenceItem;
     profiles.push({ href, label: label.slice(0, 160), placement: String(row.placement || 'rendered_dom').slice(0, 40),
-      relationConfirmed: row.articleLike !== true && (relationRe.test(label) || listingCorporateMatch) });
+      relationConfirmed,
+      subjectClassification: relationConfirmed ? 'entity_official' : (relatedBrandOrFacility ? 'related_brand_or_facility' : 'unresolved'),
+      subjectEvidence: relatedBrandOrFacility ? {
+        sourceRunId: String(relatedEvidenceItem.sourceRunId || ''), entryKey: String(relatedEvidenceItem.entryKey || ''),
+        entityUrl: String(relatedEvidenceItem.entityUrl || ''), provenance: String(relatedEvidenceItem.provenance || '')
+      } : null });
   }
   const complete = opts.linksObserved === true && opts.linksLimited !== true;
   return {
@@ -17157,11 +17199,41 @@ function buildExternalProfileObservationV1_(links, opts = {}) {
     checked: opts.linksObserved === true,
     completeness: complete ? 'complete' : (opts.linksObserved === true ? 'partial' : 'unavailable'),
     limited: !complete,
-    candidateCount: profiles.length,
+    // A completed, separately linked entity site can account for a profile
+    // without making it the evaluated entity's profile. Preserve it in
+    // `profiles` while excluding it from the unresolved-candidate gate.
+    candidateCount: profiles.filter(item => item.subjectClassification !== 'related_brand_or_facility').length,
+    relatedProfileCount: profiles.filter(item => item.subjectClassification === 'related_brand_or_facility').length,
     officialProfileCount: profiles.filter(item => item.relationConfirmed === true).length,
     relationConfirmed: profiles.some(item => item.relationConfirmed === true),
     profiles
   };
+}
+
+async function fetchRelatedEntityProfileEvidenceV1_(links, opts = {}) {
+  const sourceRunId = String(opts.sourceRunId || '');
+  const entryKey = String(opts.entryKey || '');
+  const profiles = Array.isArray(links && links.externalProfileLinkEvidence) ? links.externalProfileLinkEvidence : [];
+  const entities = Array.isArray(links && links.externalEntityLinkEvidence) ? links.externalEntityLinkEvidence : [];
+  if (!sourceRunId || !entryKey || opts.remainingBudget === false || !profiles.length || !entities.length) return null;
+  const entity = entities.find(item => item && externalProfileHostV1_(item.href) === false &&
+    profiles.some(profile => profile && isRelatedEntityProfileMatchV1_(profile.href, item.href)));
+  if (!entity) return null;
+  let entryOrigin = ''; let entityUrl = null;
+  try { entryOrigin = new URL(entryKey).origin; entityUrl = new URL(String(entity.href || '')); } catch (_) { return null; }
+  if (!entryOrigin || entityUrl.protocol !== 'https:' || entityUrl.origin === entryOrigin) return null;
+  entityUrl.pathname = '/'; entityUrl.search = ''; entityUrl.hash = '';
+  const fetched = await fetchSubpageHtmlLightUrls_([entityUrl.toString()], Object.assign({}, opts, { remainingBudget: undefined }));
+  const page = fetched && Array.isArray(fetched.pages) ? fetched.pages[0] : null;
+  if (!page || page.ok !== true || page.observationComplete === false) return null;
+  const discovered = Array.isArray(page.externalProfileLinkEvidence) ? page.externalProfileLinkEvidence : [];
+  const discoveredKeys = new Set(discovered.map(row => externalProfileNormalizedUrlKeyV1_(row && row.href)).filter(Boolean));
+  const matched = profiles.filter(profile => profile && isRelatedEntityProfileMatchV1_(profile.href, entity.href) &&
+    discoveredKeys.has(externalProfileNormalizedUrlKeyV1_(profile.href)))
+    .map(profile => ({ href: String(profile.href || ''), observationComplete: true, subjectClassification: 'related_brand_or_facility' }));
+  if (!matched.length) return null;
+  return { sourceRunId, entryKey, entityUrl: entityUrl.toString(), observationComplete: true,
+    provenance: 'linked_entity_profile_root_v1', profiles: matched };
 }
 
 function buildOfficialListingExternalProfileObservationV1_(links, listing, opts = {}) {
@@ -17223,6 +17295,48 @@ async function attachOfficialListingExternalProfileObservationV1_(geoSignalsV1, 
   geoSignalsV1.externalProfileObservationV1 = observation;
   if (geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object') geoSignalsV1.observed.externalProfileObservationV1 = observation;
   return { attempted: true, reason: 'listing_applied', listing, observation };
+}
+
+// Reuse the existing bounded HTML fetch only when an unresolved profile's
+// handle matches a separately linked external entity root. The external root
+// must publish that exact profile itself. This is classification evidence, not
+// a new profile discovery route and never promotes a profile to official.
+async function attachRelatedEntityProfileClassificationV1_(geoSignalsV1, opts = {}) {
+  const prior = geoSignalsV1 && geoSignalsV1.externalProfileObservationV1;
+  if (!prior || prior.checked !== true || prior.completeness !== 'complete' || prior.limited === true ||
+    !Number.isInteger(prior.candidateCount) || prior.candidateCount < 1) {
+    return { attempted: false, reason: 'no_complete_unresolved_profile' };
+  }
+  const timeoutMs = opts.lightBudget
+    ? takeLightBudgetTimeoutMs_(opts.lightBudget, 'coverage_related_entity_profile', 1500, LIGHT_RESPONSE_CLEANUP_RESERVE_MS, 1000)
+    : 1500;
+  if (!timeoutMs) return { attempted: false, reason: 'budget_exhausted' };
+  const linkedEntity = await fetchRelatedEntityProfileEvidenceV1_(geoSignalsV1.observed && geoSignalsV1.observed.links, {
+    sourceRunId: opts.sourceRunId,
+    entryKey: opts.entryKey,
+    remainingBudget: true,
+    timeoutMs,
+    siteMode: opts.siteMode,
+    executionAuth: opts.executionAuth,
+    lightBudget: opts.lightBudget,
+    fetchImpl: opts.fetchImpl
+  });
+  if (!linkedEntity) return { attempted: true, reason: 'linked_entity_not_complete' };
+  const observation = buildExternalProfileObservationV1_(geoSignalsV1.observed && geoSignalsV1.observed.links, {
+    linksObserved: prior.checked === true,
+    linksLimited: prior.limited === true,
+    sourceRunId: opts.sourceRunId,
+    entryKey: opts.entryKey,
+    relatedEntityProfileEvidence: linkedEntity.profiles.map(profile => Object.assign({}, profile, {
+      sourceRunId: linkedEntity.sourceRunId,
+      entryKey: linkedEntity.entryKey,
+      entityUrl: linkedEntity.entityUrl,
+      provenance: linkedEntity.provenance
+    }))
+  });
+  geoSignalsV1.externalProfileObservationV1 = observation;
+  if (geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object') geoSignalsV1.observed.externalProfileObservationV1 = observation;
+  return { attempted: true, reason: 'linked_entity_applied', linkedEntity, observation };
 }
 
 async function buildGeoSignalsV1(page, url, opts = {}) {
@@ -18078,6 +18192,19 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         href: a.href, text: a.text || '', imageAlt: a.imageAlt || '', ariaLabel: a.ariaLabel || '', title: a.title || '', articleLike: a.articleLike === true,
         nearbyLabel: a.nearbyLabel || '', placement: a.footerLike ? 'footer' : (a.navLike ? 'nav' : 'rendered_dom')
       })), 10);
+      // Keep a small, already-rendered pool of non-profile HTTPS entity links
+      // so an unresolved social handle can be checked against the linked
+      // entity's own profile list by the existing bounded HTML fetch.
+      const externalEntityLinkEvidence = limit(anchors.filter((a) => {
+        try {
+          const target = new URL(a.href);
+          return target.protocol === 'https:' && target.origin !== location.origin && !profileHostRe.test(a.href) &&
+            !!clean([a.text, a.imageAlt, a.ariaLabel, a.title].join(' '));
+        } catch (_) { return false; }
+      }).map((a) => ({
+        href: a.href, text: a.text || '', imageAlt: a.imageAlt || '', ariaLabel: a.ariaLabel || '', title: a.title || '',
+        placement: a.footerLike ? 'footer' : (a.navLike ? 'nav' : 'rendered_dom')
+      })), 10);
       const footerExternalProfileItems = limit(anchors.filter((a) => a.footerLike && profileHostRe.test(a.href)).map((a) => a.href), 10);
       const semanticHeaderCount = queryAllDeep('header,[role="banner"]').length;
       const semanticNavCount = queryAllDeep('nav,[role="navigation"]').length;
@@ -18573,6 +18700,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           canonicalNavigationLinkObservation: { checked: true, complete: true, sourceScope: 'rendered_dom_visible_same_origin_primary_routes' },
           internalLinksSample: internal.slice(0, 50),
           externalProfileLinkEvidence,
+          externalEntityLinkEvidence,
           externalProfileLinksSample: externalProfileItems.slice(0, 10),
           socialLinksSample: externalProfileItems.slice(0, 10),
           footerExternalLinksSample: footerExternalProfileItems.slice(0, 10),
@@ -19586,6 +19714,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           canonicalNavigationLinkObservation: observed.links && observed.links.canonicalNavigationLinkObservation || null,
           internalLinksSample: observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.slice(0, 50) : [],
           externalProfileLinkEvidence: observed.links && Array.isArray(observed.links.externalProfileLinkEvidence) ? observed.links.externalProfileLinkEvidence.slice(0, 10) : [],
+          externalEntityLinkEvidence: observed.links && Array.isArray(observed.links.externalEntityLinkEvidence) ? observed.links.externalEntityLinkEvidence.slice(0, 10) : [],
           externalProfileLinksSample: observed.links && Array.isArray(observed.links.externalProfileLinksSample) ? observed.links.externalProfileLinksSample.slice(0, 10) : [],
           socialLinksSample: observed.links && Array.isArray(observed.links.socialLinksSample) ? observed.links.socialLinksSample.slice(0, 10) : [],
           footerExternalLinksSample: observed.links && Array.isArray(observed.links.footerExternalLinksSample) ? observed.links.footerExternalLinksSample.slice(0, 10) : [],
@@ -22025,6 +22154,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     navTextsSample: arr(links.navTextsSample, 10, 'geoSignalsV1.observed.links.navTextsSample', (v) => str(v, 100)),
     internalLinksSample: arr(links.internalLinksSample, 10, 'geoSignalsV1.observed.links.internalLinksSample', linkSample),
     externalProfileLinkEvidence: arr(links.externalProfileLinkEvidence, 10, 'geoSignalsV1.observed.links.externalProfileLinkEvidence', linkSample),
+    externalEntityLinkEvidence: arr(links.externalEntityLinkEvidence, 10, 'geoSignalsV1.observed.links.externalEntityLinkEvidence', linkSample),
     externalProfileLinksSample: arr(links.externalProfileLinksSample, 10, 'geoSignalsV1.observed.links.externalProfileLinksSample', (v) => str(v, 180)),
     socialLinksSample: arr(links.socialLinksSample, 10, 'geoSignalsV1.observed.links.socialLinksSample', (v) => str(v, 180)),
     footerExternalLinksSample: arr(links.footerExternalLinksSample, 10, 'geoSignalsV1.observed.links.footerExternalLinksSample', (v) => str(v, 180)),
@@ -29905,6 +30035,8 @@ module.exports.__lightBudgetTestHooks = {
   buildExternalProfileObservationV1_,
   buildOfficialListingExternalProfileObservationV1_,
   attachOfficialListingExternalProfileObservationV1_,
+  fetchRelatedEntityProfileEvidenceV1_,
+  attachRelatedEntityProfileClassificationV1_,
   coverageObservationV2Common_,
   buildAltObservationV2_,
   classifyAltPurposeV2_,
