@@ -17225,6 +17225,24 @@ async function attachOfficialListingExternalProfileObservationV1_(geoSignalsV1, 
   return { attempted: true, reason: 'listing_applied', listing, observation };
 }
 
+function finalizeMainLandmarkObservation_(input = {}) {
+  const hasDomMain = input.hasDomMain === true;
+  const hasA11yMain = input.hasA11yMain === true;
+  const complete = input.shortFastMode !== true &&
+    input.semanticElementsObserved === true &&
+    input.hasMainElement === false &&
+    input.a11yObserved === true &&
+    !input.a11yError &&
+    input.mainLandmarkCandidateFound !== true;
+  const hasMainLandmarkFinal = hasDomMain || hasA11yMain
+    ? true
+    : (complete ? false : null);
+  return {
+    hasMainLandmarkFinal,
+    mainLandmarkObservationLimited: !hasDomMain && !hasA11yMain && !complete
+  };
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
@@ -19046,17 +19064,18 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       typeof observed.coverage.semanticElements === 'object'
       ? observed.coverage.semanticElements
       : {};
-    const mainLandmarkObservationComplete = shortFastMode !== true &&
-      semanticMainObservation.semanticElementsObserved === true &&
-      semanticMainObservation.hasMainElement === false &&
-      a11yMain.observed === true &&
-      !a11yMain.error &&
-      mainLandmarkCandidateFound !== true;
-    const hasMainLandmarkFinal = hasDomMain || hasA11yMain
-      ? true
-      : (mainLandmarkObservationComplete ? false : null);
-    const mainLandmarkObservationLimited = !hasDomMain && !hasA11yMain &&
-      !mainLandmarkObservationComplete;
+    const mainLandmarkResolution = finalizeMainLandmarkObservation_({
+      hasDomMain,
+      hasA11yMain,
+      shortFastMode,
+      semanticElementsObserved: semanticMainObservation.semanticElementsObserved === true,
+      hasMainElement: semanticMainObservation.hasMainElement,
+      a11yObserved: a11yMain.observed === true,
+      a11yError: a11yMain.error,
+      mainLandmarkCandidateFound
+    });
+    const hasMainLandmarkFinal = mainLandmarkResolution.hasMainLandmarkFinal;
+    const mainLandmarkObservationLimited = mainLandmarkResolution.mainLandmarkObservationLimited;
     const structuredDataStart = Date.now();
     logHeavySiteBuildGeoAudit('jsonld_parse_start', {
       source: 'html_content_and_same_origin_script_src'
@@ -24072,6 +24091,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         return {
           hasMainLandmark: confirmedMain ? true : null,
           hasMainLandmark_final: confirmedMain ? true : null,
+          semanticElementsObserved: true,
+          hasMainElement: !!confirmedMain,
           mainLandmarkSource: main ? 'dom_main_light' : (roleMain ? 'dom_role_main_light' : 'not_observed'),
           mainLandmarkCandidateFound: !confirmedMain && !!appCandidate,
           mainLandmarkCandidateSource: !confirmedMain && appCandidate ? 'dom_app_candidate_light' : 'not_observed',
@@ -24130,24 +24151,29 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       }, 2000);
 
       await runPhase('optionalA11y', async () => {
-        if (!unifiedBalancedObserverProbe) {
+        const lightShortFastMode = balancedShortFastResponse === true || probeMode === 'shortfastphases';
+        if (lightShortFastMode) {
           return {
             skipped: true,
-            reason: 'not_unified_balanced_observer_probe'
+            limited: true,
+            reason: 'skipped_short_fast'
           };
         }
-        const headings = await page.getByRole('heading').evaluateAll((els) => els.slice(0, 20).map((el) => ({
-          text: String(el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 160),
-          ariaLevel: el && el.getAttribute ? el.getAttribute('aria-level') : null,
-          tagName: String(el && el.tagName || '').toLowerCase()
-        }))).catch(() => []);
-        const mainCount = await page.getByRole('main').count().catch(() => null);
+        const headings = unifiedBalancedObserverProbe
+          ? await page.getByRole('heading').evaluateAll((els) => els.slice(0, 20).map((el) => ({
+            text: String(el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+            ariaLevel: el && el.getAttribute ? el.getAttribute('aria-level') : null,
+            tagName: String(el && el.tagName || '').toLowerCase()
+          }))).catch(() => [])
+          : [];
+        const mainCount = await page.getByRole('main').count();
         return {
           skipped: false,
-          limited: true,
+          limited: false,
           headingCount: Array.isArray(headings) ? headings.length : 0,
           headings: Array.isArray(headings) ? headings.filter((h) => h && h.text).slice(0, 10) : [],
-          mainCount
+          mainCount,
+          mainObserved: true
         };
       }, 2000);
 
@@ -24208,6 +24234,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       const landmarksLight = phaseResult('landmarksLight');
       const enhancedShadow = phaseResult('optionalEnhancedShadow');
       const optionalA11y = phaseResult('optionalA11y');
+      const landmarksLightPhase = phaseByName('landmarksLight');
+      const optionalA11yPhase = phaseByName('optionalA11y');
       const unifiedBodyTextLength = Math.max(
         Number(basicDom.bodyTextLength || 0),
         Number(hydrationGuardedWait.bodyTextAfterWait || 0)
@@ -24215,9 +24243,17 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       const unifiedBodyTextSample = typeof basicDom.bodyTextSample === 'string' && basicDom.bodyTextSample.trim()
         ? basicDom.bodyTextSample.replace(/\s+/g, ' ').trim().slice(0, 800)
         : '';
-      const mainLandmarkFinal = Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') && landmarksLight.hasMainLandmark_final != null
-        ? landmarksLight.hasMainLandmark_final
-        : null;
+      const mainLandmarkResolution = finalizeMainLandmarkObservation_({
+        hasDomMain: landmarksLight.hasMainLandmark === true,
+        hasA11yMain: Number(optionalA11y.mainCount || 0) > 0,
+        shortFastMode: balancedShortFastResponse === true || probeMode === 'shortfastphases',
+        semanticElementsObserved: !!landmarksLightPhase.ok && landmarksLight.semanticElementsObserved === true,
+        hasMainElement: landmarksLight.hasMainElement,
+        a11yObserved: !!optionalA11yPhase.ok && optionalA11y.mainObserved === true,
+        a11yError: optionalA11yPhase.errorMessage || null,
+        mainLandmarkCandidateFound: landmarksLight.mainLandmarkCandidateFound === true
+      });
+      const mainLandmarkFinal = mainLandmarkResolution.hasMainLandmarkFinal;
       const mainLandmarkSource = mainLandmarkFinal === true
         ? (landmarksLight.mainLandmarkSource && landmarksLight.mainLandmarkSource !== 'not_observed'
           ? landmarksLight.mainLandmarkSource
@@ -24584,9 +24620,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           mainLandmarkCandidateSource: landmarksLight.mainLandmarkCandidateSource || 'not_observed',
           mainLandmarkCandidateConfidence: landmarksLight.mainLandmarkCandidateFound ? 'low' : 'low',
           mainLandmarkCandidateTextsSample: [],
-          mainLandmarkObservationLimited: mainLandmarkFinal !== true,
-          a11yObserved: !!unifiedBalancedObserverProbe,
-          a11yMainCount: unifiedBalancedObserverProbe && typeof optionalA11y.mainCount === 'number' ? optionalA11y.mainCount : 0
+          mainLandmarkObservationLimited: mainLandmarkResolution.mainLandmarkObservationLimited,
+          a11yObserved: !!optionalA11yPhase.ok && optionalA11y.mainObserved === true,
+          a11yMainCount: typeof optionalA11y.mainCount === 'number' ? optionalA11y.mainCount : 0
         },
         multimodalSignals: {
           checked: multimodalObserved,
@@ -29944,6 +29980,7 @@ module.exports.__lightBudgetTestHooks = {
   validateHumanVisibleHtmlSitemapV1_,
   HTML_SITEMAP_STANDARD_PATHS_V1_,
   detectBreadcrumbUiFromCheerio_,
+  finalizeMainLandmarkObservation_,
   buildGeoSignalsV1,
   buildBalancedShortResponsePayload,
   normalizeFrameContentUrlV1_,

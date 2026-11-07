@@ -1,6 +1,9 @@
 const assert = require('assert');
 const { chromium } = require('playwright');
-const { buildGeoSignalsV1 } = require('../index.js').__lightBudgetTestHooks;
+const {
+  buildGeoSignalsV1,
+  finalizeMainLandmarkObservation_
+} = require('../index.js').__lightBudgetTestHooks;
 
 function semanticElementsFor(signals) {
   return signals && signals.coverage && signals.coverage.semanticElements;
@@ -56,6 +59,34 @@ async function observe(html, name) {
     const withRoleMain = await observe('<div role="main">Role main content</div>', 'with-role-main');
     assert.strictEqual(withRoleMain.landmarks.hasMainLandmark_final, true);
     assert.strictEqual(withRoleMain.landmarks.mainLandmarkObservationLimited, false);
+
+    // The signals-first light route uses this same completion gate after its
+    // rendered-DOM and existing Playwright role probe both finish.
+    const lightCompleteMissing = finalizeMainLandmarkObservation_({
+      hasDomMain: false,
+      hasA11yMain: false,
+      shortFastMode: false,
+      semanticElementsObserved: true,
+      hasMainElement: false,
+      a11yObserved: true,
+      a11yError: null,
+      mainLandmarkCandidateFound: false
+    });
+    assert.strictEqual(lightCompleteMissing.hasMainLandmarkFinal, false);
+    assert.strictEqual(lightCompleteMissing.mainLandmarkObservationLimited, false);
+
+    const lightPartialMissing = finalizeMainLandmarkObservation_({
+      hasDomMain: false,
+      hasA11yMain: false,
+      shortFastMode: false,
+      semanticElementsObserved: true,
+      hasMainElement: false,
+      a11yObserved: false,
+      a11yError: 'a11y_probe_failed',
+      mainLandmarkCandidateFound: false
+    });
+    assert.strictEqual(lightPartialMissing.hasMainLandmarkFinal, null);
+    assert.strictEqual(lightPartialMissing.mainLandmarkObservationLimited, true);
 
     const shortFastPage = await globalThis.__semanticElementsTestBrowser.newPage();
     try {
