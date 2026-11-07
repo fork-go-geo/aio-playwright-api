@@ -56,6 +56,18 @@ async function observe(html, name) {
     assert.strictEqual(sandenLike.landmarks.hasMainLandmark_final, false);
     assert.strictEqual(sandenLike.landmarks.mainLandmarkObservationLimited, false);
 
+    // Reproduces the production light-route failure: a long page without a
+    // main landmark must still run the existing ARIA probe and settle false.
+    const longBodyWithoutMain = await observe(`<section>${'content '.repeat(180)}</section>`, 'long-body-without-main');
+    assert.strictEqual(longBodyWithoutMain.landmarks.hasMainLandmark_final, false);
+    assert.strictEqual(longBodyWithoutMain.landmarks.mainLandmarkObservationLimited, false);
+    assert.strictEqual(longBodyWithoutMain.landmarks.a11yObserved, true);
+    assert.strictEqual(longBodyWithoutMain.landmarks.a11yError, null);
+
+    const longBodyWithRoleMain = await observe(`<div role="main">${'content '.repeat(180)}</div>`, 'long-body-with-role-main');
+    assert.strictEqual(longBodyWithRoleMain.landmarks.hasMainLandmark_final, true);
+    assert.strictEqual(longBodyWithRoleMain.landmarks.mainLandmarkObservationLimited, false);
+
     const withRoleMain = await observe('<div role="main">Role main content</div>', 'with-role-main');
     assert.strictEqual(withRoleMain.landmarks.hasMainLandmark_final, true);
     assert.strictEqual(withRoleMain.landmarks.mainLandmarkObservationLimited, false);
@@ -87,6 +99,32 @@ async function observe(html, name) {
     });
     assert.strictEqual(lightPartialMissing.hasMainLandmarkFinal, null);
     assert.strictEqual(lightPartialMissing.mainLandmarkObservationLimited, true);
+
+    const unresolvedCandidate = finalizeMainLandmarkObservation_({
+      hasDomMain: false,
+      hasA11yMain: false,
+      shortFastMode: false,
+      semanticElementsObserved: true,
+      hasMainElement: false,
+      a11yObserved: true,
+      a11yError: null,
+      mainLandmarkCandidateFound: true
+    });
+    assert.strictEqual(unresolvedCandidate.hasMainLandmarkFinal, null);
+    assert.strictEqual(unresolvedCandidate.mainLandmarkObservationLimited, true);
+
+    const budgetLimited = finalizeMainLandmarkObservation_({
+      hasDomMain: false,
+      hasA11yMain: false,
+      shortFastMode: false,
+      semanticElementsObserved: false,
+      hasMainElement: null,
+      a11yObserved: false,
+      a11yError: 'budget_exhausted',
+      mainLandmarkCandidateFound: false
+    });
+    assert.strictEqual(budgetLimited.hasMainLandmarkFinal, null);
+    assert.strictEqual(budgetLimited.mainLandmarkObservationLimited, true);
 
     const shortFastPage = await globalThis.__semanticElementsTestBrowser.newPage();
     try {

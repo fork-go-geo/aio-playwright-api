@@ -18996,19 +18996,18 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       error: null
     };
     const bodyTextLengthForMain = Number(observed && observed.body && observed.body.textLength || 0);
-    const domHasMainLikeElement = !!(
+    const domHasMainOrCandidate = !!(
       domLandmarks.hasMainLandmark === true ||
-      domLandmarks.mainLandmarkCandidateFound === true ||
-      bodyTextLengthForMain >= 800
+      domLandmarks.mainLandmarkCandidateFound === true
     );
     if (shortFastMode) {
       a11yMain.error = 'skipped_short_fast';
-    } else if (domHasMainLikeElement) {
-      a11yMain.error = 'skipped_dom_main_or_body_text_already_observed';
+    } else if (domHasMainOrCandidate) {
+      a11yMain.error = 'skipped_dom_main_or_candidate_already_observed';
       logHeavySiteBuildGeoAudit('main_a11y_skip', {
-        reason: 'dom_main_or_body_text_already_observed',
+        reason: 'dom_main_or_candidate_already_observed',
         bodyTextLength: bodyTextLengthForMain,
-        hasMainLikeElement: domHasMainLikeElement,
+        hasMainOrCandidate: domHasMainOrCandidate,
         hasMain: domLandmarks.hasMainLandmark === true,
         hasArticle: domLandmarks.mainLandmarkSource === 'dom_article',
         hasRoleMain: domLandmarks.mainLandmarkSource === 'dom_role_main',
@@ -19022,7 +19021,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           source: 'a11y_get_by_role_main'
         });
         const mainLocator = page.getByRole('main');
-        const mainTexts = await mainLocator.allTextContents().catch(() => []);
+        const mainTexts = await mainLocator.allTextContents();
         a11yMain.texts = uniqueHeadingTexts(mainTexts.map((v) => String(v || '').slice(0, 220)), 3);
         a11yMain.count = a11yMain.texts.length;
         a11yMain.observed = true;
