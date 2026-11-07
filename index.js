@@ -19038,10 +19038,25 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const mainLandmarkCandidateTextsSample = Array.isArray(domLandmarks.mainLandmarkCandidateTextsSample)
       ? domLandmarks.mainLandmarkCandidateTextsSample.slice(0, 3)
       : [];
+    // A missing landmark is final only after both existing rendered-DOM and
+    // accessibility probes completed without a candidate.  In particular, a
+    // skipped/failed A11Y query, short-fast route, or unresolved main-like
+    // candidate must remain limited rather than becoming a negative result.
+    const semanticMainObservation = observed.coverage && observed.coverage.semanticElements &&
+      typeof observed.coverage.semanticElements === 'object'
+      ? observed.coverage.semanticElements
+      : {};
+    const mainLandmarkObservationComplete = shortFastMode !== true &&
+      semanticMainObservation.semanticElementsObserved === true &&
+      semanticMainObservation.hasMainElement === false &&
+      a11yMain.observed === true &&
+      !a11yMain.error &&
+      mainLandmarkCandidateFound !== true;
     const hasMainLandmarkFinal = hasDomMain || hasA11yMain
       ? true
-      : null;
-    const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
+      : (mainLandmarkObservationComplete ? false : null);
+    const mainLandmarkObservationLimited = !hasDomMain && !hasA11yMain &&
+      !mainLandmarkObservationComplete;
     const structuredDataStart = Date.now();
     logHeavySiteBuildGeoAudit('jsonld_parse_start', {
       source: 'html_content_and_same_origin_script_src'

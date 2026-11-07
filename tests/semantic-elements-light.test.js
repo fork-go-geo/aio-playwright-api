@@ -50,6 +50,25 @@ async function observe(html, name) {
     assert.strictEqual(sandenSemantic.footerCount, 1);
     assert.strictEqual(sandenSemantic.semanticElementsObserved, true);
     assert.strictEqual(sandenSemantic.source, 'rendered_dom_light');
+    assert.strictEqual(sandenLike.landmarks.hasMainLandmark_final, false);
+    assert.strictEqual(sandenLike.landmarks.mainLandmarkObservationLimited, false);
+
+    const withRoleMain = await observe('<div role="main">Role main content</div>', 'with-role-main');
+    assert.strictEqual(withRoleMain.landmarks.hasMainLandmark_final, true);
+    assert.strictEqual(withRoleMain.landmarks.mainLandmarkObservationLimited, false);
+
+    const shortFastPage = await globalThis.__semanticElementsTestBrowser.newPage();
+    try {
+      await shortFastPage.setContent('<section>Short fast route</section>', { waitUntil: 'domcontentloaded' });
+      const shortFast = await buildGeoSignalsV1(shortFastPage, 'https://short-fast.example.test/', {
+        balancedMode: false,
+        shortFastMode: true
+      });
+      assert.strictEqual(shortFast.landmarks.hasMainLandmark_final, null);
+      assert.strictEqual(shortFast.landmarks.mainLandmarkObservationLimited, true);
+    } finally {
+      await shortFastPage.close();
+    }
 
     console.log('semantic-elements-light: ok');
   } finally {
