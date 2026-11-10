@@ -122,11 +122,14 @@ assert.equal(incompleteSummary.jsonldCount, 1);
 assert.ok(incompleteGeo.diagnostics.observationProvenanceV1.merge.appliedFields.includes('h1'));
 
 const staticOnly = hooks.buildStaticFallbackGeoSignalsPayload_(
-  'https://fixture.invalid/', staticResult(200, true), { playwrightFailed: true }
+  'https://fixture.invalid/', staticResult(200, true, { imgCount: 3 }), { playwrightFailed: true }
 );
 assert.equal(staticOnly.geoSignalsV1.diagnostics.staticFallbackOnly, true);
 assert.equal(staticOnly.geoSignalsV1.diagnostics.playwrightFailed, true);
 assert.equal(staticOnly.geoSignalsV1.diagnostics.observationProvenanceV1.sources.static_only_fallback, true);
+assert.equal(staticOnly.geoSignalsV1.multimodalSignals.imgCount, 3);
+assert.equal(staticOnly.geoSignalsV1.multimodalSignals.observationLimited, true);
+assert.equal(staticOnly.geoSignalsV1.observed.multimodalSignals, staticOnly.geoSignalsV1.multimodalSignals);
 
 console.log(JSON.stringify({
   pass: true,

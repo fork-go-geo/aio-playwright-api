@@ -20158,6 +20158,7 @@ function extractTopPageStaticSignalsFromHtml_(url, finalUrl, status, html) {
     footerTextsSample: [],
     footerExternalLinksSample: [],
     bodyTextLength: 0,
+    imgCount: 0,
     htmlLength: String(html || '').length,
     source: 'top_page_static_html_fetch'
   };
@@ -20214,6 +20215,7 @@ function extractTopPageStaticSignalsFromHtml_(url, finalUrl, status, html) {
       return href;
     }).get().filter(Boolean).slice(0, 10);
     out.bodyTextLength = clean($('body').text()).length;
+    out.imgCount = $('img').length;
     out.parseSucceeded = true;
     out.success = !!(out.title || out.metaDescription || out.h1Count || out.hasSemanticStructure || out.jsonLdCount);
     return out;
@@ -20306,6 +20308,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
   const hasJsonLd = Number(signals.jsonLdCount || 0) > 0 || jsonLdTypes.length > 0;
   const headingTexts = Array.isArray(signals.h1Texts) ? signals.h1Texts.slice(0, 10) : [];
   const h1Count = Number(signals.h1Count || 0);
+  const imgCount = Math.max(0, Number(signals.imgCount || 0) || 0);
   const hasMain = signals.hasMainElement === true;
   const headObservations = buildHeadObservations_(signals, {
     observationCompleted: !!(staticFetchResult && staticFetchResult.success === true && signals.parseSucceeded === true),
@@ -20337,6 +20340,16 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
       observationScope: 'static_html_only'
     },
     articleSignals,
+    // This is intentionally a limited observation: it records only the
+    // completed static HTML fetch, and must never be treated as rendered-DOM
+    // evidence for absence assertions downstream.
+    multimodalSignals: {
+      checked: true,
+      hasImage: imgCount > 0,
+      imgCount,
+      source: 'top_page_static_html_fetch',
+      observationLimited: true
+    },
     headings: {
       h1Count,
       h2Count: 0,
@@ -20412,6 +20425,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
         observed: true
       },
       structuredData: null,
+      multimodalSignals: null,
       articleSignals: null,
       coverage: null,
       landmarks: null,
@@ -20441,6 +20455,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
   geoSignalsV1.observed.landmarks = geoSignalsV1.landmarks;
   geoSignalsV1.observed.coverage = geoSignalsV1.coverage;
   geoSignalsV1.observed.structuredData = geoSignalsV1.structuredData;
+  geoSignalsV1.observed.multimodalSignals = geoSignalsV1.multimodalSignals;
   geoSignalsV1.observed.articleSignals = articleSignals;
   const lightweightSummary = {
     title: signals.title || null,
@@ -29509,27 +29524,32 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       err.firefoxFallbackEligible = err.firefoxFallbackEligible === true;
       throw err;
     }
-    // core light signals が未成立の deadline / navigation failure は static fallback を
-    // 正常診断材料として返さない。GAS 側は既存の失敗経路で停止する。
+    // A successful static fetch is still an observation, even when a rendered
+    // DOM cannot be completed within the light-request deadline. Return it as
+    // an explicitly limited fallback so downstream rules keep uncertain DOM
+    // assertions unobserved rather than turning a recoverable site into a
+    // generic request failure.
     if (signalsFirstLight && err && (err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED' || err.code === 'LIGHT_CORE_SIGNALS_UNAVAILABLE') && !res.headersSent) {
       const deadlineExceeded = err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
-      if (deadlineExceeded) {
-        sendLightBudgetTimeout_(res, lightBudget, t0, err.lightBudgetStage || (lightBudget && lightBudget.activeStage) || 'unknown');
-        return;
+      if (!(topPageStaticFetchResult && topPageStaticFetchResult.success)) {
+        if (deadlineExceeded) {
+          sendLightBudgetTimeout_(res, lightBudget, t0, err.lightBudgetStage || (lightBudget && lightBudget.activeStage) || 'unknown');
+          return;
+        }
+        return res.status(502).json({
+          ok: false,
+          error: 'light_scrape_core_signals_unavailable',
+          code: err.code,
+          stage: err.lightBudgetStage || 'unknown',
+          message: String(err.message || err).slice(0, 240),
+          diagnostics: Object.assign({
+            qualityStatus: 'failed',
+            coreSignalsReady: false,
+            deadlineExceeded,
+            elapsedMs
+          }, lightRequestTiming() || {})
+        });
       }
-      return res.status(deadlineExceeded ? 504 : 502).json({
-        ok: false,
-        error: deadlineExceeded ? 'light_scrape_timeout' : 'light_scrape_core_signals_unavailable',
-        code: err.code,
-        stage: err.lightBudgetStage || 'unknown',
-        message: String(err.message || err).slice(0, 240),
-        diagnostics: Object.assign({
-          qualityStatus: 'failed',
-          coreSignalsReady: false,
-          deadlineExceeded,
-          elapsedMs
-        }, lightRequestTiming() || {})
-      });
     }
     if ((signalsFirstLight || signalsFirstBalanced) && topPageStaticFetchResult && topPageStaticFetchResult.success && !res.headersSent) {
       const fallback = buildStaticFallbackGeoSignalsPayload_(urlToFetch, topPageStaticFetchResult, {
