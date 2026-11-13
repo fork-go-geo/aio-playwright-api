@@ -1,0 +1,86 @@
+運営主体テキスト抽出の過剰除外・検証runId契約の修正
+2026-11-13 / 親commit 02db815cfe4ec4a11c98176c6e2c0a8a609d693a
+
+配布コード
+index.jsのextractLegalOperatorInfoFromHtml_内のみ +17/-2行。
+ラベルをリンク外に必須とした条件と、次行要素の親一致条件が過剰だった。
+リンク化されたラベルは、リンク全文が既存のラベルと一致し、値全体が同じ
+ブロックのリンク外テキストに存在する場合だけ既存フォールバックで採用する。
+別divのフィールドは、単一子要素かつ直接の追加本文がない表示用divだけを
+同じ階層として扱う。li、section、article、tableの境界は緩めない。
+既存のnavigation判定、表/dt/dd優先、正規化、正式関係検証、会社名競合判定、
+住所・電話、会社情報スコープを再利用。resolverやサイト固有の例外はない。
+主経路maxObserveは2のまま。APIのrunId契約は変更していない。
+
+反証と回帰
+変更前の2ケースは両方とも会社名が空になることを保存した。
+変更後は「検証組織」を採用。法人格なしの値で確認している。
+会社名リンク、ラベルリンク、単純/多段div、table/dlを含む正常20ケース、
+拒否28ケース、拒否候補後の正常候補採用28ケースが成功。
+section/liを越す借用、複数子要素のラッパー、リンク全体が案内文字列のケース、
+ラベルリンクの次行にある別項目は引き続き拒否。
+保存実HTMLは companyName=''。リンクを1件だけ除いたHTMLでも空。
+「クラシコムのご紹介」「採用情報」は採用せず、本文から推測補完しない。
+実HTMLの住所・電話・scopeとその他全parser出力は変更前との一致を確認。
+
+既存オフライン34実行: 全PASS。会社名以外の比較29ケース: 全一致。
+別会社名の正式フィールドはfalse/競合のまま。住所差のみは正式確認を妨げない。
+明示関係なし、currentRun不一致、provenance、取得失敗、候補なし、旧run排除は
+既存fixtureを再利用して確認。
+保存利用規約+合成正式プロフィールの2/5比較は、今回の両条件ともtrue。
+これは実サイトの新規比較結果ではない。
+
+検証スクリプト
+既存の通常ターミナル用スクリプトをscripts/run-operator-live-audit.pyへ収録。
+旧スクリプト/既存結果は変更せず、別パッケージへコピーして使用する。
+build_request_paramsが各診断にUUID v4を生成し、URLのqueryにrunIdを送信。
+レスポンスrunIdとentryNavigationV1.runIdは要求runIdとの厳密一致を要求。
+欠落、不正UUID、不一致、既出ID、別entry/siteModeをFAILにし、その診断の
+request/response/失敗理由を保存して次の条件・サイトへ進まず停止する。
+currentRun=trueはrunId照合の代用にしない。
+EC2/5は会社名・所在地・根拠URLの相互一致も要求する。
+ブラウザ/抽出/GAS契約fixtureすべてがPASSした場合のみ実取得へ進む。
+
+runId検証: Python 7テスト成功。
+UUID生成・query送信・一致、欠落、不一致、大文字化、nav不一致、旧run、別サイト/
+modeを検証。実際の検証ドライバをDocker/HTTPスタブで動かし、欠落/不一致なら
+EC-2の1リクエストで停止し、EC-5を呼ばないことまで確認した。
+テストのcurrentRun/explicitはtrueのまま、runId欠落を拒否する。
+
+GASの確認範囲
+安定版3479ad0240c987f93b17425205fc6911e5082098を読み取り、既存11契約テスト成功。
+operator_info、current-run、会社概要bridge、サマリー、tristate、score gate、
+保存run、snapshot隔離、PDF保存観測入力などの既存ローカル契約を確認。
+この変更の実取得結果をGASへ渡した5軸採点・カード・LLMサマリー・ポジション
+比較・保存revision・PDF/Markdown実出力のE2E検証は行っていない。
+GAS本番への読み書き、デプロイ、GitHub pushはない。
+
+実機実行の状況
+今回のDockerソケット確認は権限拒否、DNS確認は解決失敗。各1回で停止。
+今回の改訂コードによるEC/残り4種別の実取得とブラウザfixtureは未実施。
+前回02db815ではEC2/5とも正式根拠付きtrue、Docker47チェックPASSだったが、
+runId未送信で実行間照合は未完了だった。これを今回のPASS扱いに流用しない。
+今回のローカル実行はNode v24.5.0。対応Node18～22での実行は新パッケージに残す。
+
+残る制約
+DOM上の明示ラベルと単純なフィールド配置を扱う。任意の複雑レイアウトや
+class/idの誤用を意味解析するものではなく、保守的な未採用は残り得る。
+ナビとして使われた構造化dl/tableや、無関係な別会社の明示フィールドの
+運営関係まで新たに解決する変更は含まない。
+新しいUNKNOWN/誤認が全サイトでなくなったとは断定しない。
+5件化の本番採用判断は保留。未取得の実機比較と下流E2Eが必要。
+
+証跡（新規保存先）
+/private/tmp/geo-operator-boundary-audit-20261113-G4z4p5/artifacts/overexclusion-before.json
+/private/tmp/geo-operator-boundary-audit-20261113-G4z4p5/artifacts/navigation.log
+/private/tmp/geo-operator-boundary-audit-20261113-G4z4p5/artifacts/suite/summary.json
+/private/tmp/geo-operator-boundary-audit-20261113-G4z4p5/artifacts/runid-tests.log
+/private/tmp/geo-operator-boundary-audit-20261113-G4z4p5/artifacts/gas/summary.json
+/private/tmp/geo-operator-boundary-audit-20261113-G4z4p5/artifacts/live-audit-script.diff
+
+次工程
+新しい通常ターミナル用パッケージを一度実行する。固定commitと入力hashを
+事前照合し、元Dockerfile/lockから新規タグの2イメージを作る。
+差は主経路maxObserveと対応ログの2→5のみ。予算170秒、施設shop_facility。
+全fixture→EC2/5のUUID/正式根拠/後続観測ゲート→残り4種別の順に実行する。
+結果は新規resultsに保存。旧結果の上書き・本番採用は行わない。

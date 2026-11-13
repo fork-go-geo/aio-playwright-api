@@ -4193,7 +4193,16 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       return {
         navigation: parts.some(part => isNavigation(part.parent)),
         nonLinkText: normalizeSubpageJsonLdText(parts.filter(part => !$(part.parent).closest('a').length).map(part => part.text).join('')),
-        blocks: Array.from(new Set(parts.map(part => $(part.parent).closest('p,div,li,dt,dd,th,td,section,article,h1,h2,h3,h4,h5,h6,body')[0]).filter(Boolean)))
+        links: Array.from(new Set(parts.map(part => $(part.parent).closest('a')[0]).filter(Boolean))),
+        blocks: Array.from(new Set(parts.map(part => {
+          let block = $(part.parent).closest('p,div,li,dt,dd,th,td,section,article,h1,h2,h3,h4,h5,h6,body')[0];
+          // A single-child div is presentation wrapping, not a new field.
+          // Never unwrap list items or semantic section/table boundaries.
+          while (block && /^(?:div|p|h[1-6])$/.test(block.name) && block.parent && block.parent.name === 'div' &&
+            $(block.parent).children().length === 1 &&
+            !(block.parent.children || []).some(node => node.type === 'text' && normalizeSubpageJsonLdText(node.data))) block = block.parent;
+          return block;
+        }).filter(Boolean)))
       };
     };
 
@@ -4216,9 +4225,15 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
         const label = canonicalLabel(line, kind);
         if (!label || !labelRe.test(line)) continue;
         const operatorContext = kind === 'operator' ? operatorLineContext(i) : null;
-        if (operatorContext && (operatorContext.navigation || canonicalLabel(operatorContext.nonLinkText, kind) !== label)) continue;
         const afterLabel = normalizeSubpageJsonLdText(line.replace(new RegExp(`^.*?${label}\\s*[：:：]?\\s*`), ''));
         const inlineValue = afterLabel && !genericStopRe.test(afterLabel);
+        // A linked label is still explicit when its entire value is plain
+        // text in the same block; a whole navigation link never qualifies.
+        const linkedLabel = operatorContext && inlineValue && operatorContext.blocks.length === 1 &&
+          operatorContext.links.length === 1 && normalizeSubpageJsonLdText($(operatorContext.links[0]).text()) === label &&
+          operatorContext.nonLinkText.replace(/^[：:\s]+/, '') === afterLabel;
+        if (operatorContext && (operatorContext.navigation ||
+          (canonicalLabel(operatorContext.nonLinkText, kind) !== label && !linkedLabel))) continue;
         const value = inlineValue
           ? afterLabel
           : normalizeSubpageJsonLdText(lines[i + 1] || '');

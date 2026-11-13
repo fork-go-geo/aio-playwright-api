@@ -37,6 +37,11 @@ const positive = {
   footer_structured: '<footer><dl><dt>会社名</dt><dd><a href="/company">検証組織</a></dd></dl></footer>',
   header_structured: '<header><table><tr><th>会社名</th><td>検証組織</td></tr></table></header>',
   whitespace: '<p>\n  運営会社　： <span>検証組織</span>\n</p>',
+  linked_label: '<p><a href="/glossary/operator">運営会社</a>：検証組織</p>',
+  linked_label_nested: '<p><a href="/glossary/operator"><span>運営会社</span></a>：<strong>検証組織</strong></p>',
+  separate_wrappers: '<div><h2>運営会社</h2></div><div><p>検証組織</p></div>',
+  nested_wrappers: '<div><div><h2>運営会社</h2></div></div><div><div><p>検証組織</p></div></div>',
+  wrapped_link_value: '<div><h2>運営会社</h2></div><div><p><a href="/company">検証組織</a></p></div>',
 };
 for (const [kind, html] of Object.entries(positive)) {
   assert.equal(extract(profile(html)).companyName, name, kind);
@@ -50,6 +55,13 @@ const negative = {
   nested_list: '<h2>運営会社</h2><ul><li><a href="/recruit">募集案内</a></li></ul>',
   section_boundary: '<section><h2>運営会社</h2></section><section><p>別の本文</p></section>',
   unrelated_prose: '<p>検証組織がこの店舗を運営します。</p>',
+  linked_label_next_item: '<p><a href="/company">運営会社</a></p><p>募集案内</p>',
+  linked_whole_field: '<p><a href="/company">運営会社：検証組織</a></p>',
+  linked_guide_label: '<p><a href="/company">運営会社のご紹介</a>：検証組織</p>',
+  linked_label_and_navigation: '<p><a href="/company">運営会社</a>：<a href="/jobs">募集案内</a></p>',
+  wrapped_section_boundary: '<section><div><h2>運営会社</h2></div></section><section><div><p>別の本文</p></div></section>',
+  wrapped_list_boundary: '<ul><li><div><h2>運営会社</h2></div></li><li><div><p>募集案内</p></div></li></ul>',
+  nontransparent_wrapper: '<div><h2>運営会社</h2><img alt="補足図"></div><div><p>別の本文</p></div>',
 };
 for (const tag of ['nav', 'header', 'footer', 'menu']) negative[tag] = `<${tag}><p>運営会社</p><p><a href="/recruit">募集案内</a></p></${tag}>`;
 for (const role of ['navigation', 'banner', 'contentinfo', 'menu', 'menubar']) negative['role_' + role] = `<div role="${role}"><p>運営会社</p><p>募集案内</p></div>`;
