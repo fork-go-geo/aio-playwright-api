@@ -20,13 +20,13 @@ const profileHtml = [
 ].join('');
 
 // The bounded candidate contract is shared by corporate/service/facility
-// modes. EC and media remain deliberately outside it.
-for (const mode of ['corporate', 'generic', 'saas', 'shop_facility']) {
+// modes, including EC and media with the same formal relation requirements.
+for (const mode of ['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media']) {
   const selected = hooks.selectOperatorIdentityProbeCandidate_([candidate], mode);
   assert.ok(selected, `${mode} must select an explicit operator candidate`);
   assert.strictEqual(selected.url, candidate.url);
 }
-for (const mode of ['ec', 'media']) {
+for (const mode of ['shop', 'unsupported']) {
   assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_([candidate], mode), null);
 }
 
@@ -43,14 +43,21 @@ const formal = hooks.attachOperatorIdentityProbeProvenance_(
 assert.strictEqual(formal.hasOperatorInfo, true);
 assert.strictEqual(formal.provenance.scope, 'company_profile_page');
 
-const observation = hooks.buildOperatorIdentityObservationV1_(formal, {
-  attempted: true,
-  observationComplete: true,
-  sourceUrl: selected.url,
-  reason: 'company_profile_fetched'
-}, { siteMode: 'shop_facility', candidates: [candidate], discoveryComplete: true });
-assert.strictEqual(observation.applicability, 'applicable');
-assert.strictEqual(observation.signalState, 'true');
+for (const siteMode of ['shop_facility', 'ec', 'media']) {
+  const observation = hooks.buildOperatorIdentityObservationV1_(formal, {
+    attempted: true,
+    observationComplete: true,
+    sourceUrl: selected.url,
+    reason: 'company_profile_fetched'
+  }, { siteMode, candidates: [candidate], discoveryComplete: true });
+  assert.strictEqual(observation.applicability, 'applicable', siteMode);
+  assert.strictEqual(observation.signalState, 'true', siteMode);
+  const failed = hooks.buildOperatorIdentityObservationV1_(null, {
+    attempted: true, observationComplete: false, sourceUrl: selected.url, reason: 'fetch_failed'
+  }, { siteMode, candidates: [candidate], discoveryComplete: true });
+  assert.strictEqual(failed.scopeComplete, false, siteMode);
+  assert.strictEqual(failed.signalState, 'false', siteMode);
+}
 
 const legal = hooks.extractLegalOperatorInfoFromHtml_(
   '<dl><dt>所在地</dt><dd>東京都千代田区架空町1-1</dd><dt>電話番号</dt><dd>03-0000-0000</dd></dl>',
@@ -113,6 +120,6 @@ console.log(JSON.stringify({
     fetchFailureRemainsUnknown: true,
     conflictRemainsUnknown: true,
     shortTransportRetainsFormalRecord: true,
-    ecAndMediaUnchanged: true
+    ecAndMediaBoundedProbe: true
   }
 }));

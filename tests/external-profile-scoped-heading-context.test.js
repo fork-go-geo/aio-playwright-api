@@ -99,6 +99,21 @@ function iconLinks(urls = PROFILE_URLS) {
     assert.ok(evidence(nestedGroup).every(row => row.nearbyLabel === '公式SNS'));
     assert.equal(nestedGroup.externalProfileObservationV1.officialProfileCount, 5);
 
+    // Compact paragraph-labelled groups are observed evidence, including a
+    // later duplicate with a stronger label. Platform names alone remain
+    // insufficient, and labels cannot cross unrelated navigation/sections.
+    const paragraphGroup = await observe('<div><p>メガロス公式SNS</p><ul><li>' + iconLinks() + '</li></ul></div>', 'paragraph-group');
+    assert.equal(paragraphGroup.externalProfileObservationV1.officialProfileCount, 5);
+    const followGroup = await observe('<nav>' + iconLinks() + '</nav><div><p>FOLLOW US</p><ul><li>' + iconLinks() + '</li></ul></div>', 'follow-group');
+    assert.equal(followGroup.externalProfileObservationV1.officialProfileCount, 5);
+    for (const [name, html] of [
+      ['unrelated-navigation', '<div><p>公式SNS</p><a href="/contact/">お問い合わせ</a>' + iconLinks() + '</div>'],
+      ['separate-paragraph', '<div><p>公式SNS</p><section>' + iconLinks() + '</section></div>'],
+      ['ambiguous-paragraph', '<div><p>公式SNS</p><p>協力会社</p>' + iconLinks() + '</div>'],
+      ['following-paragraph', '<div>' + iconLinks() + '<p>公式SNS</p></div>'],
+      ['platform-only', '<div><p>X</p>' + iconLinks() + '</div>']
+    ]) assert.equal((await observe(html, name)).externalProfileObservationV1.officialProfileCount, 0, name);
+
     // Existing English wording remains accepted.
     const english = await observe('<section><h2>Official SNS</h2>' + iconLinks() + '</section>', 'english');
     assert.equal(english.externalProfileObservationV1.officialProfileCount, 5);

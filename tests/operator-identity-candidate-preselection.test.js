@@ -88,10 +88,10 @@ const aboutUsPlan = hooks.buildOperatorIdentityProbeSelectionPlan_([aboutHub, ab
 assert.strictEqual(aboutUsPlan.selected[0].url, aboutUsDetail.url);
 assert.strictEqual(aboutUsPlan.selected[1].url, aboutHub.url);
 
-['corporate', 'generic', 'saas'].forEach(mode => assert.strictEqual(
+['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].forEach(mode => assert.strictEqual(
   hooks.buildOperatorIdentityProbeSelectionPlan_(discovered, mode, 2).selected[0].url, strongAt81.url
 ));
-['ec', 'media'].forEach(mode => assert.deepStrictEqual(
+['shop', 'unsupported'].forEach(mode => assert.deepStrictEqual(
   hooks.buildOperatorIdentityProbeSelectionPlan_(discovered, mode, 2).selected, []
 ));
 

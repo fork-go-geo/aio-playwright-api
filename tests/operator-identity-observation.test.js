@@ -289,10 +289,10 @@ assert.strictEqual(legalInfo.sourceType, 'legal');
 // Case 5: corporate/service/facility modes share the bounded profile-probe
 // contract. Shop/facility still requires explicit relation evidence at the
 // later formal-record stage; selector eligibility alone never confirms it.
-for (const siteMode of ['corporate', 'generic', 'saas', 'shop_facility']) {
+for (const siteMode of ['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media']) {
   assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCompanyCandidate], siteMode).url, asuzacUrl, siteMode);
 }
-for (const siteMode of ['shop', 'media', 'ec']) {
+for (const siteMode of ['shop', 'unsupported']) {
   assert.strictEqual(selectOperatorIdentityProbeCandidate_([asuzacCompanyCandidate], siteMode), null, siteMode);
 }
 // Multiple rendered, same-origin operating-company relations remain bounded

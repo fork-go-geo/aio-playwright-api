@@ -3844,7 +3844,7 @@ function buildOperatorIdentityCandidateAuditV1_(candidates, siteMode, selectedCa
       secondProbeAttempted: opts.secondProbeAttempted === true,
       secondProbeCandidateKey: typeof opts.secondProbeUrl === 'string' ? candidateKey(opts.secondProbeUrl) : null,
       secondProbeResult: typeof opts.secondProbeResult === 'string' ? opts.secondProbeResult : null,
-      noCandidateReason: selected ? null : (opts.noCandidateReason || (mode === 'corporate' || mode === 'generic' ? 'no_high_confidence_candidate' : 'site_mode_not_applicable'))
+      noCandidateReason: selected ? null : (opts.noCandidateReason || (['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].includes(mode) ? 'no_high_confidence_candidate' : 'site_mode_not_applicable'))
     }
   };
 }
@@ -4056,7 +4056,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       if (/販売業者/.test(compact)) return '販売業者';
       if (/運営会社/.test(compact)) return '運営会社';
       if (/^名称$/i.test(compact)) return '名称';
-      if (/^商号$/i.test(compact)) return '商号';
+      if (/^(?:会社商号|商号)$/i.test(compact)) return compact;
       if (/本社所在地/.test(compact)) return '本社所在地';
       if (/^本社事務所$/i.test(compact)) return '本社事務所';
       // "本社" is a valid address field only as a complete table/dl label
@@ -4084,7 +4084,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     const stripLeadingLabel = (value, kind) => {
       const text = normalizeSubpageJsonLdText(value);
       const labelRe = kind === 'operator'
-        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|社名|名称|商号)\s*[：:：]?\s*/
+        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名|会社商号|社名|名称|商号)\s*[：:：]?\s*/
         : (kind === 'address'
             ? /^(?:本社所在地|本社事務所|本社|所在地|住所)\s*[：:：]?\s*/
             : /^(?:連絡先|電話番号|電話|TEL|Tel|お客様相談室)\s*[：:：]?\s*/);
@@ -4225,7 +4225,27 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     };
 
     const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|社名|名称|商号/i, 'operator');
-    const address = labelValueFromText(/本社所在地|本社事務所|本社|所在地|住所/i, 'address');
+    const labelledAddress = labelValueFromText(/本社所在地|本社事務所|本社|所在地|住所/i, 'address');
+    // A company profile may disclose offices in a nested dt/dd list inside
+    // its explicitly labelled 事業所 row. Keep each address in its own dd;
+    // this establishes an office location, never an inferred headquarters.
+    const officeAddress = { value: '', label: '' };
+    if (!labelledAddress.value && sourceType==='company_profile' &&
+        /株式会社|有限会社|合同会社|法人|\b(?:Inc|Ltd|Corp)\b/i.test(operator.value || '')) {
+      $('tr').each((_, row) => {
+        if (officeAddress.value || normalizeSubpageJsonLdText($(row).children('th,td').first().text())!=='事業所') return;
+        $(row).children('td').find('dt').each((__, dt) => {
+          if (officeAddress.value || $(dt).closest('tr')[0]!==row) return;
+          const label=normalizeSubpageJsonLdText($(dt).text());
+          if (!/(?:オフィス|営業所|支社|本社|本店|office|headquarters)$/i.test(label)) return;
+          const dd=$(dt).next('dd').clone();dd.find('a,script,style').remove();
+          const value=extractJapaneseAddress(dd.text());
+          if (!hasJapaneseAddressEvidence(value)) return;
+          officeAddress.value=value;officeAddress.label='事業所（'+label+'）';
+        });
+      });
+    }
+    const address = labelledAddress.value ? labelledAddress : officeAddress;
     const directTelephone = labelValueFromText(/電話番号|電話|TEL(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?|Tel|連絡先|お客様相談室/i, 'telephone');
     const structuredTelephone = telephoneFromStructuredAddressValue();
     const telephone = directTelephone.value
@@ -4456,7 +4476,7 @@ function selectOperatorSecondPageCompanyProfileDetailLink_(operatorPage, candida
   const recoveredExternalRelation = !!(operatorPage && operatorPage.redirectAuditV1 &&
     operatorPage.redirectAuditV1.httpsRecovery && operatorPage.redirectAuditV1.httpsRecovery.accepted === true);
   if (!operatorPage || operatorPage.ok !== true || !candidate ||
-    (candidate.officialExternalOperatorProfile === true && !recoveredExternalRelation)) return null;
+    (candidate.officialExternalOperatorProfile === true && !recoveredExternalRelation && !buildExplicitOperatorIdentityRelationEvidenceV1_(candidate))) return null;
   if (candidate.operatorIdentityProbeSourceType !== 'company_profile') return null;
   if (!firstIdentity || firstIdentity.hasOperatorInfo === true || firstIdentity.conflict === true) return null;
   const links = Array.isArray(operatorPage.companyProfileDetailLinks)
@@ -4466,7 +4486,8 @@ function selectOperatorSecondPageCompanyProfileDetailLink_(operatorPage, candida
   try {
     const source = new URL(String(operatorPage.finalUrl || operatorPage.url || candidate.url || ''));
     const target = new URL(String(first.url));
-    if (target.origin !== source.origin || target.toString() === source.toString()) return null;
+    if (target.protocol !== 'https:' || target.origin !== source.origin || target.toString() === source.toString()) return null;
+    if (candidate.officialExternalOperatorProfile === true && (source.origin !== new URL(candidate.url).origin || (!recoveredExternalRelation && first.source !== 'explicit_company_profile_link'))) return null;
   } catch (_) { return null; }
   return first;
 }
@@ -4475,7 +4496,7 @@ function selectOperatorCompanyProfileHubLink_(operatorPage, candidate, firstIden
   const recoveredExternalRelation = !!(operatorPage && operatorPage.redirectAuditV1 &&
     operatorPage.redirectAuditV1.httpsRecovery && operatorPage.redirectAuditV1.httpsRecovery.accepted === true);
   if (!operatorPage || operatorPage.ok !== true || !candidate ||
-    (candidate.officialExternalOperatorProfile === true && !recoveredExternalRelation)) return null;
+    (candidate.officialExternalOperatorProfile === true && !recoveredExternalRelation && !buildExplicitOperatorIdentityRelationEvidenceV1_(candidate))) return null;
   if (candidate.operatorIdentityProbeSourceType !== 'company_profile') return null;
   if (!firstIdentity || firstIdentity.hasOperatorInfo === true || firstIdentity.conflict === true) return null;
   const links = Array.isArray(operatorPage.companyProfileHubLinks) ? operatorPage.companyProfileHubLinks : [];
@@ -4484,7 +4505,8 @@ function selectOperatorCompanyProfileHubLink_(operatorPage, candidate, firstIden
   try {
     const source = new URL(String(operatorPage.finalUrl || operatorPage.url || candidate.url || ''));
     const target = new URL(String(first.url));
-    if (target.origin !== source.origin || target.toString() === source.toString()) return null;
+    if (target.protocol !== 'https:' || target.origin !== source.origin || target.toString() === source.toString()) return null;
+    if (candidate.officialExternalOperatorProfile === true && (source.origin !== new URL(candidate.url).origin || first.source !== 'explicit_company_profile_hub_link')) return null;
   } catch (_) { return null; }
   return first;
 }
@@ -4548,7 +4570,7 @@ function buildOperatorIdentityFieldExtractionAuditV1_(html, meta = {}, identity)
   };
   const labelMatches = (field, label) => {
     const raw = normalize(label), compact = normalizeLabel(label);
-    if (field === 'companyName') return /事業者名/.test(compact) || /販売業者/.test(compact) || /運営会社/.test(compact) || /^(?:名称|商号)$/i.test(compact) || /^(?:会社名|社名)$/.test(raw);
+    if (field === 'companyName') return /事業者名/.test(compact) || /販売業者/.test(compact) || /運営会社/.test(compact) || /^(?:名称|会社商号|商号)$/i.test(compact) || /^(?:会社名|社名)$/.test(raw);
     if (field === 'address') return /本社所在地/.test(compact) || /^本社事務所$/.test(compact) || /^本社(?:\s*[（(](?:所在地|事務所)[）)])?$/i.test(raw) || /所在地/.test(compact) || /住所/.test(compact);
     return /^電話番号(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^電話$/i.test(compact) || /^tel(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^連絡先$/i.test(raw) || /お客様相談室/.test(compact);
   };
@@ -4586,6 +4608,8 @@ function buildOperatorIdentityFieldExtractionAuditV1_(html, meta = {}, identity)
     // Every explicit table/dl label is audit evidence for each field.  This
     // makes an unrelated or newly-seen label distinguishable from absence
     // without changing the extractor's much narrower matching predicates.
+    const officeLabel=(result.evidenceLabels||[]).find(label=>/^事業所（.+）$/.test(label));
+    if (result.hasAddress===true && officeLabel) add('address','structured_office',officeLabel,result.address,{labelMatched:true,validationPassed:true});
     rows.forEach(row => Object.keys(fields).forEach(field => { if (normalizeLabel(row.label)) add(field, row.sourceType, row.label, row.value); }));
     const body = $('body').clone(); body.find('script,style,noscript,svg').remove(); body.find('br,p,div,li,tr,dt,dd,th,td,section,article').append('\n');
     body.text().split(/\n+/).map(normalize).filter(Boolean).forEach(line => {
@@ -5490,7 +5514,8 @@ async function requestValidatedSubpageHtmlV1_(target, opts = {}) {
         hostname: parsed.hostname,
         port: parsed.port || undefined,
         path: `${parsed.pathname || '/'}${parsed.search || ''}`,
-        method: 'GET',
+        // HEAD is used only to observe a server-declared entry redirect.
+        method: opts.method === 'HEAD' ? 'HEAD' : 'GET',
         agent: false,
         lookup: safeLookup,
         headers: Object.assign({
@@ -6118,8 +6143,18 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
     }
     const status = response && typeof response.status === 'function' ? response.status() : null;
     const finalUrl = typeof page.url === 'function' ? page.url() || url : url;
+    if (opts.operatorIdentitySourceType==='company_profile' && opts.highConfidenceCompanyProfile===true) {
+      if (!status || status<200 || status>=300 || new URL(finalUrl).origin!==new URL(url).origin) throw new Error('operator_render_response_not_eligible');
+      await page.waitForLoadState('domcontentloaded',{timeout:Math.max(1,Math.min(4000,(opts.timeout||8000)-(Date.now()-pageStartedAt)))});
+      await page.waitForLoadState('networkidle',{timeout:Math.max(1,Math.min(2500,(opts.timeout||8000)-(Date.now()-pageStartedAt)))}).catch(()=>{});
+      const renderedUrl=page.url();
+      if (new URL(renderedUrl).origin!==new URL(url).origin) throw new Error('operator_render_origin_changed');
+      const html=await page.content();
+      if (Buffer.byteLength(html,'utf8')>SUBPAGE_HTML_MAX_BYTES_V1_) throw new Error('html_body_too_large');
+      return Object.assign(parseSubpageJsonLdLightHtml(url,renderedUrl,status,html,opts.siteMode,opts),{observationMethod:'playwright_scoped_operator_landing',observationSource:'same_run_rendered_operator_landing'});
+    }
     const extractStartedAt = Date.now();
-    emitScopedAudit('scoped_extract_start', { targetUrl: url, finalUrl, status });
+    emitScopedAudit('scoped_extract_start' , { targetUrl: url, finalUrl, status });
     emitScopedExtractionAudit('extract_start', { finalUrl, status });
     const observed = await page.evaluate(() => {
       const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -7583,33 +7618,26 @@ async function collectDiscoverLinksFromPage(page) {
     };
     const groupHeadingFor = (a) => {
       const relationRe = /運営会社|運営元|運営者情報|運営主体|事業者情報|operating\s+company|\boperator\b|\bcompany\b/i;
+      const compactLabel = el => {
+        if (!el || el.contains(a) || el.querySelector('a,button,input,ul,ol,dl,section,nav')) return '';
+        const value = clean(el.innerText || el.textContent || '');
+        return value.length <= 80 && relationRe.test(value) ? value : '';
+      };
       const boundary = a.closest('footer,[role="contentinfo"],nav,[role="navigation"],header');
-      let node = a.parentElement;
-      // Inspect only the link's own compact grouping ancestors.  We never use
-      // the entire footer/nav text as a relation label.
-      for (let depth = 0; node && node !== boundary && depth < 4; depth += 1, node = node.parentElement) {
-        const headings = Array.from(node.children || [])
-          .filter(child => child !== a && child.matches && child.matches('h1,h2,h3,h4,h5,h6,[role="heading"],dt,strong,b'))
-          .map(child => clean(child.innerText || child.textContent || ''))
-          .filter(Boolean);
-        const direct = headings.find(value => relationRe.test(value));
-        if (direct) return direct.slice(0, 120);
-        const parent = node.parentElement;
-        if (!parent) continue;
-        const siblings = Array.from(parent.children || []);
-        const at = siblings.indexOf(node);
-        for (let index = at - 1; index >= 0 && index >= at - 3; index -= 1) {
-          const sibling = siblings[index];
-          if (!sibling || !sibling.matches || !sibling.matches('h1,h2,h3,h4,h5,h6,[role="heading"],dt,strong,b,p,span,div')) continue;
-          const value = clean(sibling.innerText || sibling.textContent || '');
-          if (relationRe.test(value)) return value.slice(0, 120);
+      for (let node=a.parentElement, depth=0; node && node!==boundary && depth<4; node=node.parentElement, depth++) {
+        const labels=Array.from(node.children || []).filter(el=>!el.contains(a) && clean(el.innerText || el.textContent || ''));
+        if (labels.length===1) {
+          const label=compactLabel(labels[0]);
+          if (label && (labels[0].compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING)) return label;
         }
+        // A definition-list label belongs only to its immediately following dd.
+        if (node.matches('dd') && node.previousElementSibling && node.previousElementSibling.matches('dt')) return compactLabel(node.previousElementSibling);
       }
       return '';
     };
     const linkFrom = (a) => ({
       href: absUrl(a.getAttribute && a.getAttribute('href') || ''),
-      text: clean(a.innerText || a.textContent || ''),
+      text: clean(a.innerText || a.textContent || '') || clean(Array.from(a.querySelectorAll('img[alt]:not([aria-hidden="true"])')).map(img=>img.alt).join(' ')),
       ariaLabel: clean(a.getAttribute && a.getAttribute('aria-label') || ''),
       title: clean(a.getAttribute && a.getAttribute('title') || ''),
       groupHeading: groupHeadingFor(a),
@@ -11649,6 +11677,18 @@ function buildObservedCompanyProfileRelationEvidenceV1_(candidate, page, identit
 // direct-relation contract intact while allowing a formal detail page to be
 // used for the already-bounded hub/detail traversal.
 function buildObservedCompanyProfileHubDetailRelationEvidenceV1_(hubCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode) {
+  const externalRelation = buildExplicitOperatorIdentityRelationEvidenceV1_(hubCandidate);
+  if (externalRelation && externalRelation.kind === 'explicit_external_operator_relation') {
+    try {
+      const landing=new URL(hubCandidate.url), hub=new URL(hubPage.finalUrl||hubPage.url), target=new URL(detailLink.url), detail=new URL(detailPage.finalUrl||detailPage.url), identity=new URL(detailIdentity.sourceUrl);
+      if (hubPage.ok===true && detailPage.ok===true && detailIdentity.observed===true && detailIdentity.conflict!==true && detailIdentity.scope==='company_profile_page' &&
+          detailLink.source==='explicit_company_profile_link' && [landing,hub,target,detail,identity].every(u=>u.protocol==='https:'&&u.origin===landing.origin) &&
+          discoverSubpageCandidateKey(target.href)===discoverSubpageCandidateKey(detail.href) && discoverSubpageCandidateKey(detail.href)===discoverSubpageCandidateKey(identity.href)) {
+        return Object.assign({},externalRelation,{candidateSourceUrl:detail.href,relationSource:'explicit_external_operator_profile_detail',parentSourceUrl:hub.href,landingSourceUrl:landing.href});
+      }
+    } catch (_) {}
+    return null;
+  }
   if (String(siteMode || '').toLowerCase() !== 'corporate') return null;
   if (!hubCandidate || !hubPage || hubPage.ok !== true || !detailLink || !detailPage || detailPage.ok !== true) return null;
   if (!detailIdentity || detailIdentity.observed !== true || detailIdentity.conflict === true ||
@@ -11768,7 +11808,7 @@ function buildOperatorIdentityObservationV1_(operatorIdentityInfo, operatorIdent
   const info = operatorIdentityInfo && typeof operatorIdentityInfo === 'object' ? operatorIdentityInfo : null;
   const probe = operatorIdentityProbe && typeof operatorIdentityProbe === 'object' ? operatorIdentityProbe : {};
   const mode = String(opts.siteMode || '').toLowerCase();
-  const applicable = mode === 'corporate' || mode === 'generic' || mode === 'saas' || mode === 'shop_facility';
+  const applicable = ['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].includes(mode);
   const candidateCount = Array.isArray(opts.candidates) ? opts.candidates.length : 0;
   const selectedCount = probe.attempted === true ? 1 : 0;
   const conflict = /conflict/i.test(String(probe.reason || ''));
@@ -11947,13 +11987,13 @@ function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandi
   // except for a bounded, directly-labelled same-origin operator relation.
   // The second result is only a fallback after the first landing fails.
   const mode = String(siteMode || '').toLowerCase();
-  // Shop/facility sites use the same bounded, explicitly-labelled operator
+  // Facility, EC, and media sites use the same bounded, explicitly-labelled operator
   // candidate contract as corporate/service sites.  Their representative
   // coverage plan is different, but it is not an identity authority and must
   // not be the only way to reach a formal operating-company record.
   const input = Array.isArray(candidates) ? candidates : [];
   const plan = { version: 'operator_identity_probe_selection_v1', strategy: 'bounded_metadata_priority_before_eligibility_v1', inputCandidateCount: input.length, preselectionInputCount: 0, priorityLaneScanCount: 0, priorityLaneRetainedCount: 0, normalizedCandidateCount: 0, eligibilityEvaluationCount: 0, eligibleCandidateCount: 0, selected: [] };
-  if (mode !== 'corporate' && mode !== 'generic' && mode !== 'saas' && mode !== 'shop_facility') return plan;
+  if (!['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].includes(mode)) return plan;
   const profilePathSpecificity = candidate => {
     const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || '') || '');
     const path = (() => {
@@ -12982,11 +13022,21 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           allowExplicitExternalCompanyRedirect: operatorCandidate.operatorIdentityAllowExplicitExternalCompanyRedirect === true,
           allowExplicitOperatorHttpsDowngradeRecovery,
           operatorIdentityNoSaveRedirectDebug: opts.operatorIdentityNoSaveRedirectDebug === true,
-          collectOperatorSecondPageCompanyProfileLink: operatorProbeSourceType === 'company_profile' &&
-            (operatorCandidate.officialExternalOperatorProfile !== true || allowExplicitOperatorHttpsDowngradeRecovery)
+          collectOperatorSecondPageCompanyProfileLink: operatorProbeSourceType === 'company_profile'
         });
-        const operatorPage = operatorProbeResult && Array.isArray(operatorProbeResult.pages) ? operatorProbeResult.pages[0] : null;
+        let operatorPage = operatorProbeResult && Array.isArray(operatorProbeResult.pages) ? operatorProbeResult.pages[0] : null;
         operatorIdentityProbe.totalOperatorProbeCount = 1;
+        if (operatorProbeSourceType==='company_profile' && operatorRelationEvidence && operatorPage && operatorPage.ok===true &&
+            !(operatorPage.operatorIdentityInfo && operatorPage.operatorIdentityInfo.hasOperatorInfo===true) &&
+            !(operatorPage.companyProfileDetailLinks||[]).length && !(operatorPage.companyProfileHubLinks||[]).length && opts.context) {
+          const renderMs=lightBudget ? takeLightBudgetTimeoutMs_(lightBudget,'operator_landing_render',8000,LIGHT_RESPONSE_CLEANUP_RESERVE_MS,1000) : 8000;
+          if (renderMs>0) {
+            operatorIdentityProbe.renderedLandingAttempted=true;
+            const rendered=await fetchSubpagePlaywrightScopedLight(operatorPage.finalUrl||operatorCandidate.url,{context:opts.context,siteMode,timeout:renderMs,operatorIdentitySourceType:'company_profile',highConfidenceCompanyProfile:true,collectOperatorSecondPageCompanyProfileLink:true});
+            operatorIdentityProbe.renderedLandingResult=rendered&&rendered.ok===true?'fetched':'failed';
+            if (rendered && rendered.ok===true) operatorPage=rendered;
+          }
+        }
         operatorIdentityProbe.observationComplete = !!(operatorPage && operatorPage.ok === true);
         operatorIdentityProbe.reason = operatorPage && operatorPage.ok === true
           ? `${operatorProbeSourceType}_fetched`
@@ -13287,7 +13337,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           }
         }
       } else {
-        operatorIdentityCandidateNoCandidateReason = (String(siteMode || '').toLowerCase() === 'corporate' || String(siteMode || '').toLowerCase() === 'generic' || String(siteMode || '').toLowerCase() === 'saas' || String(siteMode || '').toLowerCase() === 'shop_facility')
+        operatorIdentityCandidateNoCandidateReason = ['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].includes(String(siteMode || '').toLowerCase())
           ? 'no_high_confidence_candidate'
           : 'site_mode_not_applicable';
       }
@@ -16175,7 +16225,7 @@ function buildHtmlSitemapCoverageSignalV1_(origin, observations = [], options = 
   };
 }
 
-async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 1500, executionAuth = null) {
+async function collectHtmlSitemapCoverageSignalV1_(pageUrl, page, timeoutMs = 4500, executionAuth = null) {
   let origin = '';
   try { origin = new URL(String(pageUrl || '')).origin; } catch (_) {}
   if (!origin || typeof fetch !== 'function') return buildHtmlSitemapCoverageSignalV1_('', []);
@@ -16242,7 +16292,9 @@ function classifyAltPurposeV2_(input) {
   return { decorative, contextCovered, informative: !decorative && !contextCovered, altPresent: !!alt };
 }
 const PRIMARY_MESSAGE_OBSERVATION_V2_AUTHORITY_ = 'cloud_run_geoSignalsV1_primaryMessageObservationV2';
-const COVERAGE_OBSERVATION_V2_PAGE_TIMEOUT_MS_ = 7000;
+// Two bounded workers allow ordinary slow documents to finish without
+// multiplying the total request deadline by every observation role.
+const COVERAGE_OBSERVATION_V2_PAGE_TIMEOUT_MS_ = 12000;
 const COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_ = 3;
 const COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_ = 3;
 const COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_ = 3;
@@ -16580,6 +16632,7 @@ function buildServiceContentObservationV2_(entry, candidates, discoveryComplete)
     completedPageCount: rows.filter(isCoverageObservationV2CompletePage_).length,
     limitedPageCount: rows.filter(row => !isCoverageObservationV2CompletePage_(row) || row.mainContentObserved !== true || row.serviceRegionCertain !== true).length,
     mainTextLength, serviceTextLength,
+    pageObservations: rows.map(row=>({url:row.url||'',checked:row.checked===true,renderComplete:row.renderComplete===true,mainContentObserved:row.mainContentObserved===true,mainContentSource:row.mainContentSource||null,serviceRegionCertain:row.serviceRegionCertain===true,mainTextLength:row.mainTextLength??null,serviceTextLength:row.serviceTextLength??null,failureKind:row.failureKind||null})),
     failureKind: discoveryConsistent ? null : 'service_link_candidate_unresolved'
   });
 }
@@ -16684,7 +16737,13 @@ async function readCoverageObservationV2Page_(page) {
   try {
     const fact = await page.evaluate(() => {
       const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-      const mainElement = document.querySelector('main, [role="main"]');
+      const semanticMain = document.querySelector('main, [role="main"]');
+      const namedMains = Array.from(document.querySelectorAll('[id],[class]')).filter(el =>
+        /(?:^|[\s_-])main(?:[-_](?:container|content))?(?:$|[\s_-])/i.test(`${el.id || ''} ${typeof el.className==='string'?el.className:''}`) &&
+        !el.closest('header,footer,nav,aside,[role="navigation"],[hidden],[aria-hidden="true"]') &&
+        el.getClientRects().length > 0 && clean(el.innerText).length > 0);
+      const outerMains = namedMains.filter(el=>!namedMains.some(other=>other!==el&&other.contains(el)));
+      const mainElement = semanticMain || (outerMains.length===1 ? outerMains[0] : null);
       const main = mainElement || document.body;
       const mainText = clean(main && main.innerText);
       // Candidate discovery deliberately shares the broad rendered-link scope
@@ -16722,12 +16781,13 @@ async function readCoverageObservationV2Page_(page) {
       const faqDetector = { mainObserved:!!mainElement, faqHeading, faqContainer, faqStructuredData, pairCount:faqPairs, questionCount };
       const breadcrumb = !!document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="パンくず" i], [class*="breadcrumb" i], [id*="breadcrumb" i], ol.breadcrumb, ul.breadcrumb');
       const serviceNodes = Array.from(main.querySelectorAll('section, article, [class], [id], [aria-label]')).filter(el => /(?:service|product|solution|feature|pricing|サービス|製品|商品|機能|料金)/i.test(`${el.id || ''} ${el.className || ''} ${el.getAttribute('aria-label') || ''}`));
-      const serviceText = clean(serviceNodes.map(el => el.innerText || '').join(' '));
-      return { readyState: document.readyState, hasFrame: !!document.querySelector('frame, frameset, iframe'), hasFrameset: !!document.querySelector('frameset'), mainContentObserved: !!mainElement, mainTextLength: mainText.length,
+      const distinctServiceNodes = serviceNodes.filter(el=>!serviceNodes.some(other=>other!==el&&other.contains(el)));
+      const serviceText = clean(distinctServiceNodes.map(el => el.innerText || '').join(' '));
+      return { url: location.href, mainContentSource: semanticMain ? 'semantic_main' : (mainElement ? 'unique_named_main_container' : null), readyState: document.readyState, hasFrame: !!document.querySelector('frame, frameset, iframe'), hasFrameset: !!document.querySelector('frameset'), mainContentObserved: !!mainElement, mainTextLength: mainText.length,
         // A zero-length text region is still a finite observation when the
         // rendered service region exists. Null is reserved for an unobserved
         // region and must not accompany completeness='complete'.
-        serviceTextLength: serviceNodes.length > 0 ? serviceText.length : null, serviceRegionCertain: serviceNodes.length > 0,
+        serviceTextLength: mainElement ? serviceText.length : null, serviceRegionCertain: !!mainElement,
         faqDetector, breadcrumbUi: breadcrumb, links: all.slice(0, 120), faqLinks, faqLinkObserved:faqLinks.length>0,
         serviceLinks, serviceLinkObserved:serviceLinks.length>0,
         sitemapLinks, sitemapLinkDiscoveryComplete:true };
@@ -16751,7 +16811,7 @@ async function observeCoverageObservationV2Candidates_(context, urls) {
     let candidate = null;
     try {
       candidate = await context.newPage();
-      const response = await candidate.goto(url, { waitUntil: 'load', timeout: COVERAGE_OBSERVATION_V2_PAGE_TIMEOUT_MS_ });
+      const response = await candidate.goto(url, { waitUntil: 'domcontentloaded', timeout: COVERAGE_OBSERVATION_V2_PAGE_TIMEOUT_MS_ });
       const status = response && typeof response.status === 'function' ? response.status() : null;
       if (status === 401 || status === 403) rows.push({ checked: false, attempted: true, renderComplete: false, frameComplete: false, failureKind: 'access_denied' });
       else if (status != null && status >= 500) rows.push({ checked: false, attempted: true, renderComplete: false, frameComplete: false, failureKind: 'server_error' });
@@ -16782,9 +16842,27 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   const htmlSitemapDiscoveryComplete = isHtmlSitemapCandidateDiscoveryCompleteV1_(entry) && !!origin;
   const sitemapUrls = htmlSitemapDiscoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
   const canOpen = context && typeof context.newPage === 'function';
-  const faqRows = canOpen ? await observeCoverageObservationV2Candidates_(context, faqUrls) : [];
-  const serviceRows = canOpen ? await observeCoverageObservationV2Candidates_(context, serviceUrls) : [];
-  const directBreadcrumbRows = canOpen ? await observeCoverageObservationV2Candidates_(context, breadcrumbUrls) : [];
+  // Observe each candidate once within this invocation. A page can be both
+  // an FAQ/service candidate and a breadcrumb candidate; reloading it for
+  // each role wasted the request deadline and produced inconsistent facts.
+  // Two workers bound browser pressure. The map is never shared across runs.
+  const candidateFacts = new Map();
+  if (canOpen) {
+    const urls = Array.from(new Set([...faqUrls, ...serviceUrls, ...breadcrumbUrls]));
+    let next = 0;
+    async function worker() {
+      while (next < urls.length) {
+        const candidateUrl = urls[next++];
+        const rows = await observeCoverageObservationV2Candidates_(context, [candidateUrl]);
+        candidateFacts.set(candidateUrl, rows[0]);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(2, urls.length) }, () => worker()));
+  }
+  const rowsFor = urls => canOpen ? urls.map(url => candidateFacts.get(url)) : [];
+  const faqRows = rowsFor(faqUrls);
+  const serviceRows = rowsFor(serviceUrls);
+  const directBreadcrumbRows = rowsFor(breadcrumbUrls);
   const reusableBreadcrumbRows = !breadcrumbUrls.length
     ? collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin)
     : [];
@@ -16903,7 +16981,7 @@ async function collectFrameContentObservationV1_(page, entryUrl) {
       const uniq = values => Array.from(new Set((values || []).filter(Boolean)));
       const limit = (values, max) => uniq(values).slice(0, max);
       const links = Array.from(document.querySelectorAll('a[href]')).map(a => ({
-        text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+        text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')) || clean(Array.from(a.querySelectorAll('img[alt]:not([aria-hidden="true"])')).map(img=>img.alt).join(' ')),
         href: (() => { try { return new URL(a.getAttribute('href') || '', location.href).toString(); } catch (_) { return ''; } })(),
         inNav: !!a.closest('nav,[role="navigation"],header,footer'),
         inFooter: !!a.closest('footer')
@@ -17806,6 +17884,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       // a directly supplied label first; otherwise accept one *unambiguous*
       // heading from the anchor's nearest semantic group only.  This never
       // inherits page/main/root headings or crosses into an enclosing section.
+      const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
       const scopedNearbyLabel = (a) => {
         if (!a || !a.getAttribute || !a.closest) return '';
         const explicit = clean(a.getAttribute('data-label') || a.getAttribute('data-context') || '');
@@ -17835,6 +17914,27 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           const heading = headings[0];
           if (!(heading.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING)) return '';
           return clean(heading.innerText || heading.textContent || '');
+        }
+        // Some sites group social icons under a short paragraph label rather
+        // than a semantic heading. Accept only a compact, social-only group
+        // with one preceding direct-child label. Never borrow page/footer
+        // text, a sibling section, or an unrelated link's description.
+        const relationLabelRe = /(?:公式|official|follow\s+us|オフィシャル\s*(?:sns|ＳＮＳ|ソーシャル|アカウント)|our\s+(?:social|account))/i;
+        let depth = 0;
+        for (let group = a.parentElement; group && depth < 5; group = group.parentElement, depth++) {
+          if (group.matches('section,article,main,body,html,header,footer,nav,[role="group"],[role="main"],[role="navigation"],[role="contentinfo"]')) break;
+          const groupLinks = Array.from(group.querySelectorAll('a[href]'));
+          if (groupLinks.length > 20 || groupLinks.some(link => !profileHostRe.test(link.href))) break;
+          const labels = Array.from(group.children).filter(child =>
+            !child.contains(a) && !child.querySelector('a,button,input') &&
+            clean(child.innerText || child.textContent || '')
+          );
+          if (!labels.length) continue;
+          if (labels.length !== 1) return '';
+          const label = clean(labels[0].innerText || labels[0].textContent || '');
+          if (label.length > 160 || !relationLabelRe.test(label) ||
+              !(labels[0].compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING)) return '';
+          return label;
         }
         return '';
       };
@@ -17874,7 +17974,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         (explicitFooterRoot && explicitFooterRoot.contains(anchor))
       ));
       const anchors = queryAllDeep('a[href]').map((a) => ({
-        text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+        text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')) || clean(Array.from(a.querySelectorAll('img[alt]:not([aria-hidden="true"])')).map(img=>img.alt).join(' ')),
         href: absUrl(a.getAttribute('href') || ''),
         ariaLabel: clean(a.getAttribute('aria-label') || ''),
         title: clean(a.getAttribute('title') || ''),
@@ -17924,7 +18024,6 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         const hit = anchors.find((a) => re.test(textHref(a)));
         return hit ? { text: hit.text, href: hit.href } : null;
       };
-      const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
       const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
       // Semantic landmarks are preferred, but many legacy corporate sites use
       // generic wrappers for their visible global routes.  This collection is
@@ -18908,10 +19007,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       error: null
     };
     const bodyTextLengthForMain = Number(observed && observed.body && observed.body.textLength || 0);
+    // Body length is content evidence, not a main-landmark observation.
+    // When no DOM candidate exists, finish the role scan even on long pages.
     const domHasMainLikeElement = !!(
       domLandmarks.hasMainLandmark === true ||
-      domLandmarks.mainLandmarkCandidateFound === true ||
-      bodyTextLengthForMain >= 800
+      domLandmarks.mainLandmarkCandidateFound === true
     );
     if (shortFastMode) {
       a11yMain.error = 'skipped_short_fast';
@@ -21505,6 +21605,7 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
     processingMs: Math.max(0, now - Number(processingStartedAt || now)),
     totalRequestMs: Math.max(0, now - budget.startedAt),
     overallBudgetMs: budget.budgetMs,
+    entryNavigationV1: budget.entryNavigationV1 ? Object.assign({}, budget.entryNavigationV1) : null,
     remainingMs: getLightBudgetRemainingMs_(budget),
     skippedDueToBudget: Array.from(new Set(budget.skipped || [])),
     topPageStaticFetchMs: Number(budget.stageMs && budget.stageMs.topPageStaticFetchMs || 0),
@@ -21561,6 +21662,74 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
     }
   };
 }
+function createLightEntryHttpFailureV1_(status) {
+  const error = new Error('entry document HTTP response is unavailable');
+  error.code = 'LIGHT_ENTRY_HTTP_FAILURE';
+  error.lightBudgetStage = 'top_page_goto';
+  error.entryHttpStatus = Number(status) || null;
+  return error;
+}
+function sendLightEntryHttpFailureV1_(res, error, timing) {
+  return res.status(502).json({
+    ok: false,
+    error: 'light_entry_http_failure',
+    code: 'LIGHT_ENTRY_HTTP_FAILURE',
+    stage: 'top_page_goto',
+    entryHttpStatus: error.entryHttpStatus,
+    diagnostics: Object.assign({}, timing || {}, {
+      qualityStatus: 'failed', coreSignalsReady: false, deadlineExceeded: false
+    })
+  });
+}
+
+// Navigation can reuse only a redirect observed in this execution. Never
+// guess /index.html, borrow another run's URL, or treat an HTTP error as HTML.
+async function resolveLightEntryNavigationV1_(requestedUrl, staticResult, opts = {}) {
+  const original = String(requestedUrl || '');
+  const unchanged = { requestedUrl: original, navigationUrl: original, source: 'requested_url', headStatus: null };
+  if (opts.authenticatedRun) return unchanged;
+  const initial = validateSafeSubpageFetchUrlV1_(original);
+  if (!initial.ok) return unchanged;
+  const validateTarget = async (value, source, status) => {
+    let target;
+    try { target = new URL(String(value || ''), initial.url); } catch (_) { return null; }
+    const policy = validateSafeSubpageFetchUrlV1_(target);
+    if (!policy.ok || target.origin !== initial.url.origin || target.href === initial.url.href) return null;
+    const validated = await validateOutboundHttpUrlV1_(target, {dnsLookup:opts.dnsLookup});
+    if (!validated.ok) return null;
+    return { requestedUrl: original, navigationUrl: target.href, source, headStatus: status };
+  };
+  if (staticResult && staticResult.success === true && staticResult.finalUrl) {
+    return await validateTarget(staticResult.finalUrl, 'same_run_static_redirect', null) || unchanged;
+  }
+  // A HEAD redirect supplies metadata from the target itself when the GET
+  // entry response was denied. A HEAD 200 or another 403 supplies no redirect.
+  if (!staticResult || Number(staticResult.status) !== 403) return unchanged;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timeout = setTimeout(abort, Math.max(1, Math.min(5000, Number(opts.timeoutMs || 5000))));
+  if (opts.signal) {
+    if (opts.signal.aborted) controller.abort();
+    else opts.signal.addEventListener('abort', abort, {once:true});
+  }
+  try {
+    const request = opts.requestImpl || requestValidatedSubpageHtmlV1_;
+    const response = await request(initial.url, {
+      method:'HEAD', signal:controller.signal, maxBytes:4096, dnsLookup:opts.dnsLookup
+    });
+    unchanged.headStatus = Number(response && response.status) || null;
+    if (![301,302,303,307,308].includes(unchanged.headStatus)) return unchanged;
+    const location = responseHeaderValueV1_(response.headers, 'location');
+    if (!location) return unchanged;
+    return await validateTarget(location, 'same_run_head_redirect', unchanged.headStatus) || unchanged;
+  } catch (_) {
+    return unchanged;
+  } finally {
+    clearTimeout(timeout);
+    if (opts.signal) opts.signal.removeEventListener('abort', abort);
+  }
+}
+
 function createLightBudgetError_(stage, message) {
   const error = new Error(message || `light request budget exhausted at ${stage}`);
   error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
@@ -22493,6 +22662,14 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       signalsFirstLight,
       signalsFirstBalanced
     });
+    let entryNavigation = { requestedUrl: String(urlToFetch || ''), navigationUrl: String(urlToFetch || ''), source:'requested_url', headStatus:null };
+    if (signalsFirstLight && !authenticatedRun) {
+      entryNavigation = await runLightBudgetStage_(lightBudget, 'entry_redirect_resolution', 6000,
+        timeoutMs => resolveLightEntryNavigationV1_(urlToFetch, topPageStaticFetchResult, {
+          timeoutMs: Math.min(5000, timeoutMs), signal:lightAttempt && lightAttempt.controller && lightAttempt.controller.signal
+        }));
+      lightBudget.entryNavigationV1 = Object.assign({requestId:lightBudget.requestId, runId}, entryNavigation);
+    }
     // Chromium remains the primary engine. The existing bounded retry wrapper
     // may select Firefox only after this attempt fails the entry document gate.
     const useFirefoxForFallback = signalsFirstLight && !authenticatedRun && scrapeOptions.browserEngine === 'firefox';
@@ -25343,7 +25520,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     });
     let resp;
     try {
-      resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
+      resp = await page.goto(entryNavigation.navigationUrl, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
       if (authenticatedRun) assertAuthenticatedFinalOrigin_(page && typeof page.url === 'function' ? page.url() : urlToFetch, executionAuth);
       if (authenticatedRun && resp && typeof resp.status === 'function' && [401, 403].includes(resp.status())) throw authError_('AUTH_FAILED');
       await assertSafeMainNavigationV1_(page, resp);
@@ -25356,6 +25533,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         failure.lightFailureReason = 'http_failure';
         failure.firefoxFallbackEligible = true;
         throw failure;
+      }
+      if (signalsFirstLight && !authenticatedRun && !isSuccessfulEntryStatusV1_(entryStatus)) {
+        throw createLightEntryHttpFailureV1_(entryStatus);
       }
       // A 2xx challenge/error page is not a usable entry document. The
       // existing DOM gate, rather than H1 or score outcomes, makes that call.
@@ -25395,6 +25575,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       // them into a generic light-budget failure before the auth-safe catch
       // can return that code to the authenticated caller.
       if (err && AUTH_ERROR_CODES.has(err.code)) throw err;
+      if (err && err.code === 'LIGHT_ENTRY_HTTP_FAILURE') throw err;
       if (err && (err.code === LIGHT_FIREFOX_FALLBACK_CODE || err.code === UNSAFE_NAVIGATION_QUARANTINE_CODE_V1_)) throw err;
       if (signalsFirstLight && isLightTopGotoTimeoutError_(err)) {
         lightBudget.gotoFallback.gotoTimedOut = true;
@@ -26266,7 +26447,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       // attachCoverageSignalsToGeoSignalsLight_ rebuilds coverageSignals below.
       // Retain this completed Cloud Run observation and re-attach it afterwards
       // so both the coverage and coverageSignals authority paths survive.
-      const htmlSitemapCoverageSignal = await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page, 1500, executionAuth);
+      const htmlSitemapCoverageSignal = await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page, 4500, executionAuth);
       attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, htmlSitemapCoverageSignal);
       if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'build_geo_signals_end');
       if (signalsFirstLight) {
@@ -26871,7 +27052,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       logSfMemory('signals_only_early_before_geo_signals');
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
       attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(finalUrl || urlToFetch, 1500, executionAuth));
-      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page, 1500, executionAuth));
+      attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(finalUrl || urlToFetch, page, 4500, executionAuth));
       logSf('SIGNALS_ONLY_EARLY_AFTER_GEO_SIGNALS', {
         hasGeoSignals: !!geoSignalsV1,
         error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -29178,7 +29359,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
   logSfMemory('before_geo_signals');
   const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch, { siteMode });
   attachAiPolicyTrustSignalToGeoSignalsV1_(geoSignalsV1, await collectAiPolicyTrustSignalV1_(urlToFetch, 1500, executionAuth));
-  attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(urlToFetch, page, 1500, executionAuth));
+  attachHtmlSitemapCoverageSignalToGeoSignalsV1_(geoSignalsV1, await collectHtmlSitemapCoverageSignalV1_(urlToFetch, page, 4500, executionAuth));
   logSf('AFTER_GEO_SIGNALS', {
     hasGeoSignals: !!geoSignalsV1,
     error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -29524,6 +29705,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       err.firefoxFallbackEligible = err.firefoxFallbackEligible === true;
       throw err;
     }
+    if (signalsFirstLight && err && err.code === 'LIGHT_ENTRY_HTTP_FAILURE' &&
+        !(topPageStaticFetchResult && topPageStaticFetchResult.success) && !res.headersSent) {
+      return sendLightEntryHttpFailureV1_(res, err, lightRequestTiming());
+    }
     // A successful static fetch is still an observation, even when a rendered
     // DOM cannot be completed within the light-request deadline. Return it as
     // an explicitly limited fallback so downstream rules keep uncertain DOM
@@ -29859,6 +30044,10 @@ if (require.main === module) {
 }
 
 module.exports.__lightBudgetTestHooks = {
+  resolveLightEntryNavigationV1_,
+  createLightEntryHttpFailureV1_,
+  sendLightEntryHttpFailureV1_,
+  observeCoverageObservationV2Candidates_,
   app,
   parseExecutionAuth_,
   authHeadersForUrl_,
@@ -29941,6 +30130,7 @@ module.exports.__lightBudgetTestHooks = {
   normalizeOperatorIdentityProbeErrorCodeV1_,
   buildOperatorIdentityDiscoverLinkAuditV1_,
   applyCompanyProfileHubCorroboration_,
+  fetchSubpagePlaywrightScopedLight,
   collectDiscoverLinksFromPage,
   collectOfficialExternalOperatorProfileCandidates_,
   collectOfficialSameOriginOperatorProfileCandidates_,

@@ -23,10 +23,10 @@ assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'saas
   'SaaS may use the same already-high-confidence company profile probe');
 assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'shop_facility').url, houjinGaiyo.url,
   'shop/facility shares the bounded formal-profile probe contract');
-assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'ec'), null,
-  'EC remains outside the dedicated operator profile probe contract');
-assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'media'), null,
-  'media remains outside the dedicated operator profile probe contract');
+assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'ec').url, houjinGaiyo.url,
+  'EC uses the bounded formal-profile probe contract');
+assert.strictEqual(hooks.selectOperatorIdentityProbeCandidate_(candidates, 'media').url, houjinGaiyo.url,
+  'media uses the bounded formal-profile probe contract');
 const identityHtml = '<table><tr><th>会社名</th><td>Fixture株式会社</td></tr><tr><th>所在地</th><td>東京都千代田区1-1</td></tr><tr><th>電話番号</th><td>03-0000-0000</td></tr></table>';
 const formalBefore = hooks.normalizeOperatorIdentityInfo_(
   hooks.extractOperatorIdentityInfoFromHtml_(identityHtml, eligibleCompany.url, { highConfidenceCompanyProfile: true }),
