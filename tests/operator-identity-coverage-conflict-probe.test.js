@@ -37,13 +37,17 @@ const route = source.slice(source.indexOf("logHeavySiteTopPageAudit('attachCover
 const limits = [...route.slice(0, route.indexOf('sourceRunId: runId')).matchAll(/maxObserve: (\d)/g)].map(m => +m[1]);
 assert.equal(limits.length, 2, 'main path log and call remain the only limit changes');
 assert.equal(limits[0], limits[1]);
-const maxObserve = limits[1];
+// Exercise both observation counts through the existing orchestrator option;
+// never rewrite the production route or the historical comparison sources.
+const maxObserve = Number(process.env.OPERATOR_FIXTURE_MAX_OBSERVE || limits[1]);
 assert.ok([2, 5].includes(maxObserve));
 const legacy = process.env.EXPECT_COVERAGE_CONFLICT_BLOCK === '1';
+const navigationBug = process.env.EXPECT_NAVIGATION_NAME_BUG === '1';
 const origin = 'https://brand.example.test';
 const landing = 'https://operator.example.test/company/';
 const detail = 'https://operator.example.test/company/profile/';
-const name = 'Example株式会社';
+const realTerms = process.env.OPERATOR_TERMS_HTML_PATH ? fs.readFileSync(process.env.OPERATOR_TERMS_HTML_PATH, 'utf8') : null;
+const name = realTerms ? '株式会社クラシコム' : 'Example株式会社';
 const profile = (company, address = '東京都千代田区1-1') =>
   `<dl><dt>会社名</dt><dd>${company}</dd><dt>所在地</dt><dd>${address}</dd></dl>`;
 const html = (title, body) => `<title>${title}</title><main><h1>${title}</h1>${body}<p>${'検証本文。'.repeat(100)}</p></main>`;
@@ -67,6 +71,11 @@ async function run(kind, siteMode = 'ec', signals = {}) {
   documents.set(candidates[3].url, html(candidates[3].label, profile(
     kind === 'other_coverage_company' ? 'Other株式会社' : name, '東京都千代田区一丁目1番地'
   )));
+  if (kind === 'real_terms') documents.set(candidates[3].url, realTerms);
+  if (kind === 'navigation_company') documents.set(candidates[3].url, html(candidates[3].label,
+    '<div class="local-navigation"><a href="/company">運営会社 Other株式会社</a></div><footer><p><a href="/company">運営会社</a></p><p><a href="/jobs">募集案内</a></p></footer>'));
+  if (kind === 'linked_other_company') documents.set(candidates[3].url, html(candidates[3].label,
+    '<p>運営会社：<a href="/company">Other株式会社</a></p><p>所在地：東京都千代田区1-1</p>'));
   const landingFields = kind === 'formal_company_conflict' ? '<dl><dt>会社名</dt><dd>Other株式会社</dd></dl>' : '';
   documents.set(landing, html('企業情報', landingFields + '<a href="/company/profile/">会社概要</a>'));
   documents.set(detail, html('会社概要', profile(kind === 'missing_name' ? '' : name)));
@@ -92,15 +101,48 @@ async function run(kind, siteMode = 'ec', signals = {}) {
   assert.equal(representativeCalls.length, maxObserve);
   const aggregate = hooks.buildOperatorIdentityInfoFromObservedCompanyProfiles_(representativeCalls.map(url =>
     hooks.compactSubpageJsonLdObservation_(hooks.parseSubpageJsonLdLightHtml(url, url, 200, documents.get(url), siteMode))));
-  if (maxObserve === 5) assert.equal(aggregate.reason, 'company_profile_field_conflict', 'coverage conflict is retained');
+  if (maxObserve === 5 && kind !== 'navigation_company') assert.equal(aggregate.reason, 'company_profile_field_conflict', 'coverage conflict is retained');
   const observation = signals.operatorIdentityObservationV1;
   const record = signals.trustSignals && signals.trustSignals.operatorIdentityInfo;
   const formalCalls = calls.filter(c => c.formal).map(c => c.url);
-  rows.push({ kind, siteMode, maxObserve, formalCalls: formalCalls.length, state: observation.signalState });
+  const representatives = representativeCalls.map(url => {
+    const page = hooks.parseSubpageJsonLdLightHtml(url, url, 200, documents.get(url), siteMode);
+    const { operatorIdentityInfo, ...otherObservations } = page;
+    return { url, companyName: operatorIdentityInfo && operatorIdentityInfo.companyName || '',
+      nonIdentitySha256: require('node:crypto').createHash('sha256').update(JSON.stringify(otherObservations)).digest('hex') };
+  });
+  rows.push({ kind, siteMode, maxObserve, formalCalls: formalCalls.length, state: observation.signalState,
+    reason: signals.trustSignals && signals.trustSignals.operatorIdentityProbe && signals.trustSignals.operatorIdentityProbe.reason ||
+      signals.operatorIdentityCandidateAuditV1.selection.noCandidateReason,
+    aggregateReason: aggregate.reason, failureReasons: observation.failureReasons,
+    companyName: record && record.companyName || null, provenance: record && record.provenance || null,
+    currentRun: record && record.identityEvidenceV1 && record.identityEvidenceV1.currentRun || false,
+    explicit: record && record.identityEvidenceV1 && record.identityEvidenceV1.explicit || false,
+    representatives,
+    coverageSha256: require('node:crypto').createHash('sha256').update(JSON.stringify(coverage)).digest('hex') });
   return { signals, observation, record, formalCalls, aggregate };
 }
 
 (async () => {
+  if (realTerms) {
+    const real = await run('real_terms');
+    const expected = maxObserve === 2 ? 'true' : legacy ? 'unknown' : navigationBug ? 'false' : 'true';
+    assert.equal(real.observation.signalState, expected, 'saved terms through the real coverage and formal-probe flow');
+    if (expected === 'true') {
+      assert.equal(real.record.companyName, name);
+      assert.equal(real.record.identityEvidenceV1.currentRun, true);
+      assert.equal(real.record.identityEvidenceV1.explicit, true);
+      assert.equal(real.record.provenance.source, 'bounded_company_profile_probe');
+    }
+  }
+  const navigation = await run('navigation_company');
+  assert.equal(navigation.observation.signalState,
+    maxObserve === 5 && (legacy || navigationBug) ? (legacy ? 'unknown' : 'false') : 'true');
+  const linkedOther = await run('linked_other_company');
+  if (maxObserve === 5) {
+    assert.notEqual(linkedOther.observation.signalState, 'true', 'explicit non-navigation field must retain a real name conflict');
+    assert.equal(linkedOther.observation.conflict, true);
+  } else assert.equal(linkedOther.observation.signalState, 'true');
   const blocked = legacy && maxObserve === 5;
   const normal = await run('address_variation');
   if (blocked) {
@@ -177,4 +219,6 @@ async function run(kind, siteMode = 'ec', signals = {}) {
     }
   }
   console.log(JSON.stringify({ fixture: 'coverage_conflict_probe', maxObserve, legacy, rows }));
+  if (process.env.OPERATOR_FIXTURE_REPORT) fs.writeFileSync(process.env.OPERATOR_FIXTURE_REPORT,
+    JSON.stringify({ fixture: 'coverage_conflict_probe', maxObserve, legacy, rows }, null, 2) + '\n');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -4156,6 +4156,47 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       .map(line => normalizeSubpageJsonLdText(line))
       .filter(Boolean);
 
+    // Keep DOM provenance only for the company-name text fallback. Flattened
+    // navigation text is useful for discovery, but is not a label/value field.
+    // Structured rows above, and address/telephone extraction, keep their
+    // existing contracts. A field's value may still contain a company link.
+    const operatorBody = bodyClone.clone();
+    operatorBody.find('p,div,li,tr,dt,dd,th,td,section,article,h1,h2,h3,h4,h5,h6').prepend('\n');
+    const operatorLines = [];
+    let fragments = [];
+    const flushOperatorLine = () => {
+      if (normalizeSubpageJsonLdText(fragments.map(part => part.text).join(''))) {
+        operatorLines.push(fragments);
+      }
+      fragments = [];
+    };
+    const collectOperatorLineSources = node => {
+      if (node.type === 'text') {
+        const parts = String(node.data || '').split('\n');
+        parts.forEach((text, i) => {
+          if (i) flushOperatorLine();
+          if (text) fragments.push({ text, parent: node.parent });
+        });
+      } else {
+        (node.children || []).forEach(collectOperatorLineSources);
+      }
+    };
+    operatorBody.each((_, node) => collectOperatorLineSources(node));
+    flushOperatorLine();
+    const operatorVisibleLines = operatorLines.map(parts => normalizeSubpageJsonLdText(parts.map(part => part.text).join('')));
+    const operatorLineContext = index => {
+      const parts = (operatorLines[index] || []).filter(part => normalizeSubpageJsonLdText(part.text));
+      const isNavigation = parent => $(parent).parents().addBack().toArray().some(el =>
+        /^(?:nav|header|footer|menu)$/i.test(el.name || '') ||
+        /^(?:navigation|banner|contentinfo|menu|menubar)$/i.test($(el).attr('role') || '') ||
+        /(?:^|[\s_-])(?:nav|navigation|menu)(?:$|[\s_-])/i.test([$(el).attr('class'), $(el).attr('id')].filter(Boolean).join(' ')));
+      return {
+        navigation: parts.some(part => isNavigation(part.parent)),
+        nonLinkText: normalizeSubpageJsonLdText(parts.filter(part => !$(part.parent).closest('a').length).map(part => part.text).join('')),
+        blocks: Array.from(new Set(parts.map(part => $(part.parent).closest('p,div,li,dt,dd,th,td,section,article,h1,h2,h3,h4,h5,h6,body')[0]).filter(Boolean)))
+      };
+    };
+
     const labelValueFromText = (labelRe, kind) => {
       for (const row of rows) {
         const label = canonicalLabel(row.label, kind);
@@ -4165,18 +4206,30 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
           return { value: row.value, label };
         }
       }
-      for (let i = 0; i < visibleLines.length; i++) {
-        const line = visibleLines[i];
+      const lines = kind === 'operator' ? operatorVisibleLines : visibleLines;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
         if (kind === 'address') {
           const inlineAddress = inlineAddressFromHeading(line);
           if (inlineAddress.value) return inlineAddress;
         }
         const label = canonicalLabel(line, kind);
         if (!label || !labelRe.test(line)) continue;
+        const operatorContext = kind === 'operator' ? operatorLineContext(i) : null;
+        if (operatorContext && (operatorContext.navigation || canonicalLabel(operatorContext.nonLinkText, kind) !== label)) continue;
         const afterLabel = normalizeSubpageJsonLdText(line.replace(new RegExp(`^.*?${label}\\s*[：:：]?\\s*`), ''));
-        const value = afterLabel && !genericStopRe.test(afterLabel)
+        const inlineValue = afterLabel && !genericStopRe.test(afterLabel);
+        const value = inlineValue
           ? afterLabel
-          : normalizeSubpageJsonLdText(visibleLines[i + 1] || '');
+          : normalizeSubpageJsonLdText(lines[i + 1] || '');
+        if (operatorContext && !inlineValue) {
+          const nextContext = operatorLineContext(i + 1);
+          // Do not borrow a value across a list item or a different section.
+          // Adjacent label/value blocks and links within the same field remain valid.
+          if (nextContext.navigation || !nextContext.blocks.length || operatorContext.blocks.some(left =>
+            nextContext.blocks.some(right => left !== right &&
+              (left.parent !== right.parent || left.name === 'li' || right.name === 'li')))) continue;
+        }
         if (kind === 'telephone' && !extractJapanesePhone(value)) continue;
         if (value) return { value, label };
       }
