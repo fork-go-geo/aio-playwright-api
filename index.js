@@ -12971,7 +12971,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       discovered.operatorIdentitySelectionPlan.version === 'operator_identity_probe_selection_v1'
       ? discovered.operatorIdentitySelectionPlan
       : buildOperatorIdentityProbeSelectionPlan_(discovered.operatorIdentityAuditCandidates, siteMode, 2);
-    if (!operatorIdentityInfo && observedCompanyProfileIdentity.reason.indexOf('conflict') < 0) {
+    // Coverage field conflicts cannot veto the independent, relation-backed probe.
+    if (!operatorIdentityInfo) {
       const operatorCandidates = operatorSelectionPlan.selected;
       const operatorCandidate = operatorCandidates[0] || null;
       if (operatorCandidate) {
@@ -13340,17 +13341,30 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         operatorIdentityCandidateNoCandidateReason = ['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].includes(String(siteMode || '').toLowerCase())
           ? 'no_high_confidence_candidate'
           : 'site_mode_not_applicable';
+        operatorIdentityProbe.reason = operatorIdentityCandidateNoCandidateReason;
       }
-    } else if (operatorIdentityInfo) {
-      operatorIdentityCandidateNoCandidateReason = 'existing_operator_identity_record';
     } else {
-      operatorIdentityCandidateNoCandidateReason = 'observed_company_profile_conflict';
+      operatorIdentityCandidateNoCandidateReason = 'existing_operator_identity_record';
+    }
+    // Fetching a formal profile and accepting its identity are separate decisions.
+    // Reuse the name-conflict contract; independent coverage addresses/phones
+    // neither supply formal authority nor invalidate an explicit company relation.
+    if (operatorIdentityProbe.attempted === true && isFormalOperatorIdentityRecord_(operatorIdentityInfo) &&
+        operatorIdentityObservations.some(page => operatorIdentityFieldsConflict_(page && page.operatorIdentityInfo, operatorIdentityInfo))) {
+      operatorIdentityInfo.hasOperatorInfo = false;
+      operatorIdentityInfo.conflict = true;
+      operatorIdentityProbe.reason = 'observed_company_profile_conflict';
     }
     if (legalOperatorInfo) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
         ? geoSignalsV1.trustSignals
         : {};
       geoSignalsV1.trustSignals.legalOperatorInfo = legalOperatorInfo;
+    }
+    // Publish only this invocation's probe/result, including the no-candidate case.
+    if (geoSignalsV1.trustSignals) {
+      delete geoSignalsV1.trustSignals.operatorIdentityInfo;
+      delete geoSignalsV1.trustSignals.operatorIdentityProbe;
     }
     if (operatorIdentityInfo) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
@@ -13451,6 +13465,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         secondProbeResult: operatorIdentityProbe && operatorIdentityProbe.secondProbeResult
       }
     );
+    geoSignalsV1.operatorIdentityCandidateAuditV1.observedCompanyProfileReason = observedCompanyProfileIdentity.reason;
     // This bounded provenance record is intentionally separate from the
     // formal identity record above.  GAS can persist it safely even when a
     // probe is partial, while only a complete formal record can affect the
