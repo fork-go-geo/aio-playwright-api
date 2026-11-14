@@ -26599,7 +26599,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       });
       logHeavySiteTopPageAudit('attachCoverageSignalsToGeoSignalsLight_call_start', {
         subpageObservationMode,
-        maxObserve: 2
+        maxObserve: 5
       });
       if (signalsFirstLight) {
         markLightStageCheckpoint_(lightBudget, 'coverage', 'coverage_start');
@@ -26609,7 +26609,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         page,
         context,
         reuseBrowser: true,
-        maxObserve: 2,
+        maxObserve: 5,
         subpageObservationMode,
         siteMode,
         signalsMode,
