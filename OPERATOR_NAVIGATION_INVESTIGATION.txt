@@ -1,0 +1,117 @@
+運営主体の案内リンク誤抽出修正・隔離回帰検証
+2026-11-13 Asia/Tokyo
+
+範囲
+取得側 f85aed248d2de7ce7f3e705fd00a354f5986c63c を基準とし、正式確認修正
+fb34abb11c5979c5cbabfce30368c893f260eb08 を親にした独立cloneで実施。
+通常main、本番、GitHub、GAS、Cloud Run、既存Dockerイメージは変更しない。
+代表ページ上限の本番呼び出しは2のまま。2/5は既存orchestratorのoptsで検証。
+DNS/Dockerの再試行・対象サイトの再取得は行っていない。
+
+直接原因
+利用規約の/about/が既存の会社情報スコープに一致し、全bodyの平文化後に
+案内リンク「運営会社クラシコムのご紹介」をラベル「運営会社」と値
+「クラシコムのご紹介」に分解していた。リンクを単独で除去すると、footerの
+「運営会社」の次行にある「採用情報」が会社名として採用された。
+保存HTMLの406行目、a.about-navigation__linkが最初の採用元。
+これは別会社の正式名称との競合ではない。
+
+修正方式
+extractLegalOperatorInfoFromHtml_内だけを変更。
+既存のCheerio DOMから会社名用テキスト行の由来（親要素）を保持し、既存の
+labelValueFromTextの会社名フォールバックで採用可否を判定する。
+・header/footer/nav/menu、対応するrole、区切り付きnav/navigation/menuの
+  class/id配下のテキストは会社名フォールバックの根拠にしない。
+・ラベル自体がリンク文字列にしか存在しない行を採用しない。
+・別のliや異なるセクションにある次行を値として借用しない。
+・ブロック開始境界を会社名用の行に保持し、直前の案内リンクとの連結を防ぐ。
+・表/dt/ddの既存優先抽出、ラベル・正規化・cleanOperatorName・値の返却、
+  正式確認・競合判定を再利用する。ラベル外の正当な会社名リンクは維持。
+新規resolver、会社名の推測補完、法人格の必須化、サイト固有の除外はない。
+住所・電話、会社情報スコープ、採点、保存、代表候補選択は変更していない。
+
+保存実HTMLの結果
+保存先: /private/tmp/geo-terms-company-probe-20261113/user_terms.html
+SHA-256: 707ff431373c4b3e26cb328883989014755f4282e5980f122544bdf4562f7851
+f85aed2/fb34abb: companyName = クラシコムのご紹介
+今回: companyName = 空、hasCompanyName = false、hasOperatorInfo = false
+対象リンクだけをメモリ上で除去した反証: 修正前は採用情報、修正後は空。
+正式名の本文記載を推測で構造化フィールドへ昇格させない。
+同じHTMLを解析した他の全parser出力はdeepEqual、住所・電話・scopeも一致。
+実HTMLそのものはcommitしない。保存物には無関係な情報を含むため外部公開しない。
+
+正式確認修正fb34abbの再評価
+併用が必要。誤抽出名を取り除いても利用規約由来の住所等と代表ページの
+集約はcompany_profile_field_conflictになり得る。従来の事前ゲートでは
+独立した正式確認が実行されずunknownのままになる。
+fb34abbは正式確認を独立実行し、明示関係・currentRun・取得成功を既存経路で
+評価する。住所表記差だけでは正式名を否定せず、会社名の不一致は拒否する。
+今回その競合判定は変更していない。
+弱い案内リンク由来の候補は抽出段階で除外する。一方、代表ページの表/dlや
+ラベル付き本文に明示された別会社名は、独自のブランド関係証拠がなくても
+保守的に競合として残す。無関係な明示会社フィールドの意味解決は未実装。
+この残存制約を「正式な運営関係のある別会社を識別できた」とは解釈しない。
+
+回帰結果
+取得側: 34実行成功、失敗0。
+内訳: 新規実HTML/抽出検証1、2/5マトリクス6、既存fixture27。
+新規抽出fixture: 正常15形、拒否21形、拒否候補後の正常抽出継続21形。
+法人格なし、本文、改行、表/dl、正当なリンク付き会社名を含む。
+ナビ/ヘッダー/フッター、role/class/id、同一行と次行の誤抽出を検証。
+既存fixtureで正式根拠の別会社名、住所差、明示関係なし、currentRun不一致、
+取得失敗、正式候補なし、旧runレコードの排除を検証。
+corporate/shop_facility/saas/ec/mediaの既存合成fixtureを検証。
+FAQ・サービス・パンくず・coverageの関連fixtureも成功。
+同じ件数の現行/修正間で、代表URL・会社名以外のparser出力・coverage全体の
+比較29ケースが一致。会社名競合の除去だけを成功条件にしていない。
+
+保存利用規約HTMLを組み込んだorchestrator比較
+                  2件      5件        5件時の正式確認呼び出し
+f85aed2 現行      true     unknown    0 (observed_company_profile_conflict)
+fb34abbのみ       true     false      2 (observed_company_profile_conflict)
+fb34abb+今回      true     true       2 (detail_probe_fetched)
+今回の正式名は株式会社クラシコム、provenance=bounded_company_profile_probe、
+explicit=true、currentRun=true。5件でも集約診断のfield_conflictは残り、隠さない。
+重要: 利用規約だけが実HTML。他の代表ページ・正式会社概要は既存合成fixture。
+これは本番ECの新規診断結果でも、過去5サイト全HTMLの完全再実行でもない。
+
+GAS側の確認範囲
+安定版3479ad0240c987f93b17425205fc6911e5082098は無変更・clean。
+読み取り専用の既存ローカルfixture4本が成功:
+test-operator-info-current-run-tristate-contract.js
+test-operator-info-cloudrun-company-profile-fixtures.js
+test-shop-facility-operator-relation-transport-fixtures.js
+test-operator-identity-summary-local.js (内部サマリーfixture11件)
+これらは今回の全取得結果を投入したE2E試験ではない。
+実採点・改善カード・LLMサマリー生成・保存/readback・PDF生成・ポジション分析へ
+今回の変更結果を渡した一貫した検証は未実施。無影響とは断定しない。
+コード変更は取得器の1関数に限定し、採点・表示・保存コードは変更していない。
+
+残るリスク
+1. 未保存の各実サイトHTMLは再現できない。既存5サイトの新規取得比較は未実施。
+2. 実行Nodeはv24.5.0。package.jsonのNode 18～22／既存コンテナ内では未検証。
+3. Browserを要する4本は未実行（compact-footer-group、link-collection-integration、
+   coverage-candidate-dom-ready、breadcrumb-ui-observation）。Dockerの再試行なし。
+4. nav等のclass/idを本文コンテナに使うサイト、複雑な入れ子の次行フィールドは
+   保守的に未採用になり得る。構造化表/dl抽出の契約は変更していない。
+5. 表/dlが実際にはナビとして使われるケースや、別の会社の明示フィールドと
+   ブランド運営関係との意味の違いは、この会社名テキスト修正では解決しない。
+6. 既存のfield extraction auditは一部本文形式でacceptedLabel等がnullになり得る。
+   診断用監査を新しい採用根拠へ作り替える変更は今回含めていない。
+
+次工程
+本番反映前に、対応Node/隔離コンテナで同じfixtureとブラウザ4本を実行する。
+必要な場合だけ、隔離先で5サイトの実HTMLを各1回保存し、同一入力2/5比較を行う。
+その後、隔離GAS検証で採点・カード・サマリー・保存・PDF・ポジション分析の
+差分を確認する。上限5への本番変更、push、デプロイは別途の実施対象とする。
+
+再実行
+NODE_PATH=/Users/go/Desktop/geo-work/main/aio-playwright-api/node_modules node scripts/run-operator-navigation-offline.cjs /private/tmp/geo-terms-company-probe-20261113/user_terms.html /private/tmp/geo-operator-navigation-rerun
+実行場所はこの隔離repo。既存依存ライブラリの読み込みのみ、追加installなし。
+テスト子プロセスはネットワーク呼び出しを即時失敗させる。
+
+証跡
+隔離repo: /private/tmp/geo-operator-fix-20261113-RcGbAT/repo
+取得側一覧: /private/tmp/geo-operator-fix-20261113-RcGbAT/artifacts/suite/summary.json
+GAS一覧: /private/tmp/geo-operator-fix-20261113-RcGbAT/artifacts/gas-contracts/summary.json
+保護対象状態: /private/tmp/geo-operator-fix-20261113-RcGbAT/artifacts/protected-state.json

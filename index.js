@@ -4156,6 +4156,56 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       .map(line => normalizeSubpageJsonLdText(line))
       .filter(Boolean);
 
+    // Keep DOM provenance only for the company-name text fallback. Flattened
+    // navigation text is useful for discovery, but is not a label/value field.
+    // Structured rows above, and address/telephone extraction, keep their
+    // existing contracts. A field's value may still contain a company link.
+    const operatorBody = bodyClone.clone();
+    operatorBody.find('p,div,li,tr,dt,dd,th,td,section,article,h1,h2,h3,h4,h5,h6').prepend('\n');
+    const operatorLines = [];
+    let fragments = [];
+    const flushOperatorLine = () => {
+      if (normalizeSubpageJsonLdText(fragments.map(part => part.text).join(''))) {
+        operatorLines.push(fragments);
+      }
+      fragments = [];
+    };
+    const collectOperatorLineSources = node => {
+      if (node.type === 'text') {
+        const parts = String(node.data || '').split('\n');
+        parts.forEach((text, i) => {
+          if (i) flushOperatorLine();
+          if (text) fragments.push({ text, parent: node.parent });
+        });
+      } else {
+        (node.children || []).forEach(collectOperatorLineSources);
+      }
+    };
+    operatorBody.each((_, node) => collectOperatorLineSources(node));
+    flushOperatorLine();
+    const operatorVisibleLines = operatorLines.map(parts => normalizeSubpageJsonLdText(parts.map(part => part.text).join('')));
+    const operatorLineContext = index => {
+      const parts = (operatorLines[index] || []).filter(part => normalizeSubpageJsonLdText(part.text));
+      const isNavigation = parent => $(parent).parents().addBack().toArray().some(el =>
+        /^(?:nav|header|footer|menu)$/i.test(el.name || '') ||
+        /^(?:navigation|banner|contentinfo|menu|menubar)$/i.test($(el).attr('role') || '') ||
+        /(?:^|[\s_-])(?:nav|navigation|menu)(?:$|[\s_-])/i.test([$(el).attr('class'), $(el).attr('id')].filter(Boolean).join(' ')));
+      return {
+        navigation: parts.some(part => isNavigation(part.parent)),
+        nonLinkText: normalizeSubpageJsonLdText(parts.filter(part => !$(part.parent).closest('a').length).map(part => part.text).join('')),
+        links: Array.from(new Set(parts.map(part => $(part.parent).closest('a')[0]).filter(Boolean))),
+        blocks: Array.from(new Set(parts.map(part => {
+          let block = $(part.parent).closest('p,div,li,dt,dd,th,td,section,article,h1,h2,h3,h4,h5,h6,body')[0];
+          // A single-child div is presentation wrapping, not a new field.
+          // Never unwrap list items or semantic section/table boundaries.
+          while (block && /^(?:div|p|h[1-6])$/.test(block.name) && block.parent && block.parent.name === 'div' &&
+            $(block.parent).children().length === 1 &&
+            !(block.parent.children || []).some(node => node.type === 'text' && normalizeSubpageJsonLdText(node.data))) block = block.parent;
+          return block;
+        }).filter(Boolean)))
+      };
+    };
+
     const labelValueFromText = (labelRe, kind) => {
       for (const row of rows) {
         const label = canonicalLabel(row.label, kind);
@@ -4165,18 +4215,36 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
           return { value: row.value, label };
         }
       }
-      for (let i = 0; i < visibleLines.length; i++) {
-        const line = visibleLines[i];
+      const lines = kind === 'operator' ? operatorVisibleLines : visibleLines;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
         if (kind === 'address') {
           const inlineAddress = inlineAddressFromHeading(line);
           if (inlineAddress.value) return inlineAddress;
         }
         const label = canonicalLabel(line, kind);
         if (!label || !labelRe.test(line)) continue;
+        const operatorContext = kind === 'operator' ? operatorLineContext(i) : null;
         const afterLabel = normalizeSubpageJsonLdText(line.replace(new RegExp(`^.*?${label}\\s*[：:：]?\\s*`), ''));
-        const value = afterLabel && !genericStopRe.test(afterLabel)
+        const inlineValue = afterLabel && !genericStopRe.test(afterLabel);
+        // A linked label is still explicit when its entire value is plain
+        // text in the same block; a whole navigation link never qualifies.
+        const linkedLabel = operatorContext && inlineValue && operatorContext.blocks.length === 1 &&
+          operatorContext.links.length === 1 && normalizeSubpageJsonLdText($(operatorContext.links[0]).text()) === label &&
+          operatorContext.nonLinkText.replace(/^[：:\s]+/, '') === afterLabel;
+        if (operatorContext && (operatorContext.navigation ||
+          (canonicalLabel(operatorContext.nonLinkText, kind) !== label && !linkedLabel))) continue;
+        const value = inlineValue
           ? afterLabel
-          : normalizeSubpageJsonLdText(visibleLines[i + 1] || '');
+          : normalizeSubpageJsonLdText(lines[i + 1] || '');
+        if (operatorContext && !inlineValue) {
+          const nextContext = operatorLineContext(i + 1);
+          // Do not borrow a value across a list item or a different section.
+          // Adjacent label/value blocks and links within the same field remain valid.
+          if (nextContext.navigation || !nextContext.blocks.length || operatorContext.blocks.some(left =>
+            nextContext.blocks.some(right => left !== right &&
+              (left.parent !== right.parent || left.name === 'li' || right.name === 'li')))) continue;
+        }
         if (kind === 'telephone' && !extractJapanesePhone(value)) continue;
         if (value) return { value, label };
       }
@@ -12971,7 +13039,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       discovered.operatorIdentitySelectionPlan.version === 'operator_identity_probe_selection_v1'
       ? discovered.operatorIdentitySelectionPlan
       : buildOperatorIdentityProbeSelectionPlan_(discovered.operatorIdentityAuditCandidates, siteMode, 2);
-    if (!operatorIdentityInfo && observedCompanyProfileIdentity.reason.indexOf('conflict') < 0) {
+    // Coverage field conflicts cannot veto the independent, relation-backed probe.
+    if (!operatorIdentityInfo) {
       const operatorCandidates = operatorSelectionPlan.selected;
       const operatorCandidate = operatorCandidates[0] || null;
       if (operatorCandidate) {
@@ -13340,17 +13409,30 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         operatorIdentityCandidateNoCandidateReason = ['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].includes(String(siteMode || '').toLowerCase())
           ? 'no_high_confidence_candidate'
           : 'site_mode_not_applicable';
+        operatorIdentityProbe.reason = operatorIdentityCandidateNoCandidateReason;
       }
-    } else if (operatorIdentityInfo) {
-      operatorIdentityCandidateNoCandidateReason = 'existing_operator_identity_record';
     } else {
-      operatorIdentityCandidateNoCandidateReason = 'observed_company_profile_conflict';
+      operatorIdentityCandidateNoCandidateReason = 'existing_operator_identity_record';
+    }
+    // Fetching a formal profile and accepting its identity are separate decisions.
+    // Reuse the name-conflict contract; independent coverage addresses/phones
+    // neither supply formal authority nor invalidate an explicit company relation.
+    if (operatorIdentityProbe.attempted === true && isFormalOperatorIdentityRecord_(operatorIdentityInfo) &&
+        operatorIdentityObservations.some(page => operatorIdentityFieldsConflict_(page && page.operatorIdentityInfo, operatorIdentityInfo))) {
+      operatorIdentityInfo.hasOperatorInfo = false;
+      operatorIdentityInfo.conflict = true;
+      operatorIdentityProbe.reason = 'observed_company_profile_conflict';
     }
     if (legalOperatorInfo) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
         ? geoSignalsV1.trustSignals
         : {};
       geoSignalsV1.trustSignals.legalOperatorInfo = legalOperatorInfo;
+    }
+    // Publish only this invocation's probe/result, including the no-candidate case.
+    if (geoSignalsV1.trustSignals) {
+      delete geoSignalsV1.trustSignals.operatorIdentityInfo;
+      delete geoSignalsV1.trustSignals.operatorIdentityProbe;
     }
     if (operatorIdentityInfo) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
@@ -13451,6 +13533,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         secondProbeResult: operatorIdentityProbe && operatorIdentityProbe.secondProbeResult
       }
     );
+    geoSignalsV1.operatorIdentityCandidateAuditV1.observedCompanyProfileReason = observedCompanyProfileIdentity.reason;
     // This bounded provenance record is intentionally separate from the
     // formal identity record above.  GAS can persist it safely even when a
     // probe is partial, while only a complete formal record can affect the
