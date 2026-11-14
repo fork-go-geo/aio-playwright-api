@@ -1,0 +1,35 @@
+{
+  "note": "Curated HTML excerpts from frozen public pages; source hashes refer to original full HTML. No company-name/DOM invention.",
+  "pages": [
+    {
+      "name": "sitepolicy",
+      "url": "https://megalos.co.jp/contents/information/sitepolicy.html",
+      "finalUrl": "https://megalos.co.jp/contents/information/sitepolicy.html",
+      "status": 200,
+      "bytes": 60171,
+      "sha256": "27f07d956f5aaadb1cf69231f7ebf60da21d36ef9b11431cfdadebeb874dfc80",
+      "capturedAt": "2026-11-14T03:53:21.771197+00:00",
+      "fixtureSha256": "995e4961214e4452eb41b84d2b679511ba28d1f5fb497d2bed968d5a117f692a"
+    },
+    {
+      "name": "corporate",
+      "url": "https://megalos.co.jp/corporate/",
+      "finalUrl": "https://megalos.co.jp/corporate/",
+      "status": 200,
+      "bytes": 37321,
+      "sha256": "2e88605f865b61e1b4cc73bdaf8d6ebabe63bf6ca69c9d4781fd1d3f2646ea5a",
+      "capturedAt": "2026-11-14T03:53:21.902583+00:00",
+      "fixtureSha256": "e9a6b7b5ea1dda60594b61ce3835cd38156ded2e4e4571a82cf3036fccd72b6c"
+    },
+    {
+      "name": "company",
+      "url": "https://megalos.co.jp/corporate/company/",
+      "finalUrl": "https://megalos.co.jp/corporate/company",
+      "status": 200,
+      "bytes": 32605,
+      "sha256": "4ae5e77392e4883b2db711b2a764d31cb77ccd7ab460574c37379436696ba76b",
+      "capturedAt": "2026-11-14T03:53:22.173586+00:00",
+      "fixtureSha256": "3338e3fb5b7f294d4e82f3215f9942ef0ad10ffe4168a572f0e9c2e5812a5c71"
+    }
+  ]
+}

@@ -3426,6 +3426,9 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
 // labelled-field extractor before it can create any formal identity record.
 function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
   const strict = evaluateHighConfidenceCompanyProfileCandidate_(candidate);
+  if (candidate && candidate.operatorPolicyContextV1) {
+    return Object.assign({}, strict, { probeEligible: true, probeTier: 'root_site_policy_relation', probeSourceType: 'company_profile' });
+  }
   if (strict.highConfidenceEligible === true) {
     return Object.assign({}, strict, {
       probeEligible: true,
@@ -5224,6 +5227,18 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     productPriceSignal,
     productDescriptionSignal
   );
+  let operatorPolicyObservationV1 = null;
+  if (siteMode === 'shop_facility' && opts.operatorPolicyContextV1) {
+    const policyBody = $('body').first().clone();
+    policyBody.find('script,style,noscript,nav,header,footer,[role="navigation"],[hidden],[aria-hidden="true"]').remove();
+    const statements = [];
+    policyBody.find('p').each((_, el) => {
+      const text = normalizeSubpageJsonLdText($(el).text());
+      const match = text.match(/^(?:この|当)(?:WEB|ウェブ)?サイトは[、,\s]*([^。]{1,200})が運営しています[。.]/i);
+      if (match && !statements.includes(match[1]) && statements.length < 2) statements.push(match[1]);
+    });
+    operatorPolicyObservationV1 = Object.assign({}, opts.operatorPolicyContextV1, { statements });
+  }
   const legalOperatorInfo = legalPageType === 'legal'
     ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
     : null;
@@ -5397,6 +5412,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     sampledText,
     legalOperatorInfo,
     operatorIdentityInfo,
+    ...(operatorPolicyObservationV1 ? { operatorPolicyObservationV1 } : {}),
     externalCompanyProfileDetailLinks: companyProfileDetailLinks,
     companyProfileDetailLinks,
     companyProfileHubLinks,
@@ -11744,7 +11760,7 @@ function buildObservedCompanyProfileRelationEvidenceV1_(candidate, page, identit
 // all three current-run hops must be observed and same-origin.  This keeps the
 // direct-relation contract intact while allowing a formal detail page to be
 // used for the already-bounded hub/detail traversal.
-function buildObservedCompanyProfileHubDetailRelationEvidenceV1_(hubCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode) {
+function buildObservedCompanyProfileHubDetailRelationEvidenceV1_(hubCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode, opts = {}) {
   const externalRelation = buildExplicitOperatorIdentityRelationEvidenceV1_(hubCandidate);
   if (externalRelation && externalRelation.kind === 'explicit_external_operator_relation') {
     try {
@@ -11756,6 +11772,44 @@ function buildObservedCompanyProfileHubDetailRelationEvidenceV1_(hubCandidate, h
       }
     } catch (_) {}
     return null;
+  }
+  if (String(siteMode || '').toLowerCase() === 'shop_facility' && hubCandidate && hubCandidate.operatorPolicyContextV1) {
+    // The statement is about this website, not every store on its origin.
+    // Bind the root entry and all three fetched hops to the same request.
+    try {
+      const landingPage = opts.operatorPolicyPage;
+      const entry = new URL(String(opts.entryKey || ''));
+      const run = String(opts.sourceRunId || '');
+      const pages = [landingPage, hubPage, detailPage];
+      const context = hubCandidate.operatorPolicyContextV1;
+      if (entry.pathname !== '/' || entry.search || entry.hash || !run || context.sourceRunId !== run || context.entryKey !== entry.href ||
+          pages.some(page => !page || page.ok !== true || !page.operatorPolicyObservationV1 ||
+            page.operatorPolicyObservationV1.sourceRunId !== run || page.operatorPolicyObservationV1.entryKey !== entry.href)) return null;
+      const landing = new URL(landingPage.finalUrl || landingPage.url);
+      const hub = new URL(hubPage.finalUrl || hubPage.url);
+      const detail = new URL(detailPage.finalUrl || detailPage.url);
+      const observed = new URL(detailIdentity.sourceUrl);
+      if ([entry, landing, hub, detail, observed].some(url => url.protocol !== 'https:' || url.origin !== entry.origin || url.username || url.password) ||
+          hubCandidate.operatorRelationSourceOrigin !== entry.origin ||
+          discoverSubpageCandidateKey(hubCandidate.url) !== discoverSubpageCandidateKey(landing.href) ||
+          !(landingPage.companyProfileHubLinks || []).some(link => link.source === 'explicit_company_profile_hub_link' && discoverSubpageCandidateKey(link.url) === discoverSubpageCandidateKey(hub.href)) ||
+          !(hubPage.companyProfileDetailLinks || []).some(link => link.source === 'explicit_company_profile_link' && discoverSubpageCandidateKey(link.url) === discoverSubpageCandidateKey(detail.href)) ||
+          detailLink.source !== 'explicit_company_profile_link' ||
+          discoverSubpageCandidateKey(detailLink.url) !== discoverSubpageCandidateKey(detail.href) ||
+          discoverSubpageCandidateKey(detail.href) !== discoverSubpageCandidateKey(observed.href) ||
+          detailIdentity.observed !== true || detailIdentity.conflict === true || detailIdentity.scope !== 'company_profile_page') return null;
+      const statements = landingPage.operatorPolicyObservationV1.statements || [];
+      const name = normalizeSubpageJsonLdText(detailIdentity.companyName || detailIdentity.operatorName);
+      // Match the already-extracted formal name in the same statement. No
+      // name inference, legal-form requirement, or cross-paragraph borrowing.
+      if (!name || statements.length !== 1 || normalizeSubpageJsonLdText(statements[0])
+          .replace(/[（(]以下[、,\s]*(?:当社|弊社)といいます[）)]$/, '').trim() !== name) return null;
+      return { version: 'operator_identity_relation_evidence_v1', kind: 'explicit_same_origin_company_profile_relation',
+        explicit: true, currentRun: true, relationLabel: 'サイト運営主体の明示本文',
+        relationSource: 'explicit_root_site_policy_company_profile_relation', relationSourceOrigin: entry.origin,
+        candidateSourceUrl: detail.href, parentSourceUrl: hub.href, landingSourceUrl: landing.href,
+        entryKey: entry.href, sourceRunId: run };
+    } catch (_) { return null; }
   }
   if (String(siteMode || '').toLowerCase() !== 'corporate') return null;
   if (!hubCandidate || !hubPage || hubPage.ok !== true || !detailLink || !detailPage || detailPage.ok !== true) return null;
@@ -12049,7 +12103,7 @@ function isOperatorIdentityPriorityLaneCandidate_(candidate) {
       isLegalOperatorCandidateText_(label) || isLegalOperatorCandidatePath_(url));
 }
 
-function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandidates = 2) {
+function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandidates = 2, opts = {}) {
   // A SaaS service may publish its legal operator on the same company/profile
   // page as a corporate site. Strictly corroborated candidates retain priority,
   // except for a bounded, directly-labelled same-origin operator relation.
@@ -12059,7 +12113,29 @@ function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandi
   // candidate contract as corporate/service sites.  Their representative
   // coverage plan is different, but it is not an identity authority and must
   // not be the only way to reach a formal operating-company record.
-  const input = Array.isArray(candidates) ? candidates : [];
+  let input = Array.isArray(candidates) ? candidates : [];
+  // A site-wide policy can nominate a bounded relation probe only for a root
+  // entry with a request identity. It is a fetch hint, never formal evidence.
+  try {
+    const entry = new URL(String(opts.entryKey || ''));
+    const run = String(opts.sourceRunId || '');
+    if (mode === 'shop_facility' && entry.protocol === 'https:' && entry.pathname === '/' &&
+        !entry.search && !entry.hash && !entry.username && !entry.password &&
+        (!opts.requestedEntryUrl || normalizeDiscoverTopUrl(opts.requestedEntryUrl).topUrl === entry.href) &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(run)) {
+      input = input.map((candidate, index) => {
+        if (index >= OPERATOR_IDENTITY_PRESELECTION_INPUT_MAX_V1_ || !candidate ||
+            !/^(?:サイトポリシー|site\s*policy)$/i.test(normalizeSubpageJsonLdText(candidate.label)) ||
+            !(candidate.sources || [candidate.source]).some(source => source === 'nav' || source === 'footer')) return candidate;
+        try {
+          const target = new URL(candidate.url);
+          if (target.protocol !== 'https:' || target.origin !== entry.origin ||
+              candidate.operatorRelationSourceOrigin !== entry.origin || target.username || target.password) return candidate;
+          return Object.assign({}, candidate, { operatorPolicyContextV1: { entryKey: entry.href, sourceRunId: run } });
+        } catch (_) { return candidate; }
+      });
+    }
+  } catch (_) {}
   const plan = { version: 'operator_identity_probe_selection_v1', strategy: 'bounded_metadata_priority_before_eligibility_v1', inputCandidateCount: input.length, preselectionInputCount: 0, priorityLaneScanCount: 0, priorityLaneRetainedCount: 0, normalizedCandidateCount: 0, eligibilityEvaluationCount: 0, eligibleCandidateCount: 0, selected: [] };
   if (!['corporate', 'generic', 'saas', 'shop_facility', 'ec', 'media'].includes(mode)) return plan;
   const profilePathSpecificity = candidate => {
@@ -12087,14 +12163,14 @@ function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandi
   const priorityScan = input.slice(0, OPERATOR_IDENTITY_PRIORITY_LANE_SCAN_MAX_V1_);
   plan.priorityLaneScanCount = priorityScan.length;
   const priorityLane = priorityScan.map((candidate, originalIndex) => ({ candidate, originalIndex,
-    preselectionRank: operatorIdentityCandidatePreselectionRank_(candidate, originalIndex) }))
-    .filter(item => isOperatorIdentityPriorityLaneCandidate_(item.candidate))
+    preselectionRank: candidate && candidate.operatorPolicyContextV1 ? [2] : operatorIdentityCandidatePreselectionRank_(candidate, originalIndex) }))
+    .filter(item => (item.candidate && item.candidate.operatorPolicyContextV1) || isOperatorIdentityPriorityLaneCandidate_(item.candidate))
     .sort((left, right) => compareOperatorIdentityPreselectionRank_(left.preselectionRank, right.preselectionRank))
     .slice(0, OPERATOR_IDENTITY_PRIORITY_LANE_RETAIN_MAX_V1_);
   plan.priorityLaneRetainedCount = priorityLane.length;
   const normalizedByUrl = new Map();
   priorityLane.concat(boundedInput.map((candidate, originalIndex) => ({ candidate, originalIndex,
-    preselectionRank: operatorIdentityCandidatePreselectionRank_(candidate, originalIndex) }))).forEach(item => {
+    preselectionRank: candidate && candidate.operatorPolicyContextV1 ? [2] : operatorIdentityCandidatePreselectionRank_(candidate, originalIndex) }))).forEach(item => {
     const url = String(item.candidate && (item.candidate.finalUrl || item.candidate.url || item.candidate.href || '') || '');
     const key = discoverSubpageCandidateKey(url);
     if (!url || !key) return;
@@ -12137,6 +12213,18 @@ function buildOperatorIdentityProbeSelectionPlan_(candidates, siteMode, maxCandi
     operatorIdentityProbeSourceType: item.evaluation.probeSourceType,
     operatorIdentityAllowExplicitExternalCompanyRedirect: item.evaluation.allowExplicitExternalCompanyRedirect === true
   }));
+  // Explicit operator/legal candidates retain priority. A policy replaces an
+  // unqualified company landing, rather than adding a fourth probe.
+  const policy = evaluated.find(item => item.candidate.operatorPolicyContextV1);
+  if (policy && !evaluated.some(item => item.candidate.officialSameOriginOperatorProfile === true ||
+      item.candidate.officialExternalOperatorProfile === true || item.evaluation.probeSourceType === 'legal')) {
+    const selectedPolicy = Object.assign({}, policy.candidate, {
+      operatorIdentityProbeTier: policy.evaluation.probeTier, operatorIdentityProbeSourceType: 'company_profile',
+      operatorIdentityAllowExplicitExternalCompanyRedirect: false
+    });
+    plan.selected = [selectedPolicy].concat(plan.selected.filter(item =>
+      discoverSubpageCandidateKey(item.url) !== discoverSubpageCandidateKey(selectedPolicy.url))).slice(0, Math.max(1, Math.min(2, Number(maxCandidates) || 2)));
+  }
   // Internal-only wiring for the bounded audit projection. These raw URLs are
   // never returned; buildOperatorIdentityCandidateAuditV1_ replaces them with
   // response-local HMAC keys before transport.
@@ -13035,7 +13123,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     let operatorIdentityHubProbeAuditContext = null;
     let operatorIdentityDetailProbeAuditContext = null;
     let operatorIdentityCandidateNoCandidateReason = null;
-    const operatorSelectionPlan = discovered.operatorIdentitySelectionPlan &&
+    const operatorSelectionPlan = siteMode === 'shop_facility' && opts.sourceRunId &&
+      Array.isArray(discovered.operatorIdentityAuditCandidates)
+      ? buildOperatorIdentityProbeSelectionPlan_(discovered.operatorIdentityAuditCandidates, siteMode, 2, {
+        sourceRunId: opts.sourceRunId, entryKey: normalized.topUrl, requestedEntryUrl: opts.operatorPolicyEntryUrl
+      })
+      : discovered.operatorIdentitySelectionPlan &&
       discovered.operatorIdentitySelectionPlan.version === 'operator_identity_probe_selection_v1'
       ? discovered.operatorIdentitySelectionPlan
       : buildOperatorIdentityProbeSelectionPlan_(discovered.operatorIdentityAuditCandidates, siteMode, 2);
@@ -13091,7 +13184,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           allowExplicitExternalCompanyRedirect: operatorCandidate.operatorIdentityAllowExplicitExternalCompanyRedirect === true,
           allowExplicitOperatorHttpsDowngradeRecovery,
           operatorIdentityNoSaveRedirectDebug: opts.operatorIdentityNoSaveRedirectDebug === true,
-          collectOperatorSecondPageCompanyProfileLink: operatorProbeSourceType === 'company_profile'
+          collectOperatorSecondPageCompanyProfileLink: operatorProbeSourceType === 'company_profile',
+          operatorPolicyContextV1: operatorCandidate.operatorPolicyContextV1
         });
         let operatorPage = operatorProbeResult && Array.isArray(operatorProbeResult.pages) ? operatorProbeResult.pages[0] : null;
         operatorIdentityProbe.totalOperatorProbeCount = 1;
@@ -13273,7 +13367,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
             minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
             operatorIdentitySourceType: 'company_profile',
             highConfidenceCompanyProfile: true,
-            collectOperatorSecondPageCompanyProfileLink: collectLinks === true
+            collectOperatorSecondPageCompanyProfileLink: collectLinks === true,
+            operatorPolicyContextV1: operatorCandidate.operatorPolicyContextV1
           });
           return result && Array.isArray(result.pages) ? result.pages[0] : null;
         };
@@ -13364,7 +13459,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
                 } else {
                   const detailIdentity = detailPage.operatorIdentityInfo;
                   const detailRelationEvidence = buildObservedCompanyProfileHubDetailRelationEvidenceV1_(
-                    operatorCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode
+                    operatorCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode,
+                    { operatorPolicyPage: operatorPage, entryKey: normalized.topUrl, sourceRunId: opts.sourceRunId }
                   );
                   const detailResult = adoptCompanyProfileIdentity(detailPage, detailLink.url, hubResult.identity, detailRelationEvidence);
                   operatorIdentityDetailProbeAuditContext = buildOperatorIdentityProbeAuditContextV1_(
@@ -26618,6 +26714,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         operatorIdentityNoSaveRedirectDebug,
         sourceRunId: runId,
         entryKey: finalUrl || urlToFetch,
+        operatorPolicyEntryUrl: urlToFetch,
         lightBudget: signalsFirstLight ? lightBudget : null
         ,executionAuth
       });
