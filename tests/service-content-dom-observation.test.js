@@ -68,6 +68,29 @@ const cases = [];
     await check('same-entry fragments and query do not fetch or double count', `${body}<a href="#feature01">詳細</a><a href="?campaign=1#feature01">機能</a>`, (o, visits) => {
       assert.equal(visits.length, 1); assert.equal(o.observedPageCount, 1); assert.equal(o.explicitCandidateCount, 0); complete(o);
     }, {}, { hasServiceNav: true });
+    // Fixed public markup from the entry trace captured on 2026-11-16.
+    // The cookie vendor is out of scope even though its URL contains products.
+    const cookieVendor = '<div class="ot-pc-footer-logo"><a href="https://www.onetrust.com/products/cookie-consent/" aria-label="Powered by OneTrust 新しいタブで開く"><img alt="Powered by Onetrust"></a></div>';
+    const selfFeatures = '<div class="facial-features-linkbox">' + [
+      ['feature01','顔が大きい'], ['feature02','フェイスラインがもたつく'], ['feature01','エラが張っている'],
+      ['feature02','二重あご'], ['feature03','横顔に自信を持てない'], ['feature03','唇が薄い']
+    ].map(([id,label]) => `<a href="#${id}" class="facial-features-link">${label}</a>`).join('') + '</div>';
+    await check('captured self anchors plus cookie vendor are already observed', body + selfFeatures + cookieVendor, (o, visits) => {
+      complete(o); assert.equal(o.observedPageCount, 1); assert.equal(o.explicitCandidateCount, 0); assert.equal(visits.length, 1);
+    });
+    await check('self anchor plus any external service URL uses the same scope', body + '<a href="#feature01">機能</a><a href="https://outside.example.test/products/widget">製品</a>', (o, visits) => {
+      complete(o); assert.equal(o.observedPageCount, 1); assert.equal(visits.length, 1);
+    });
+    await check('external-only service hint is not silently resolved', body + cookieVendor, (o, visits) => {
+      assert.equal(o.completeness, 'partial'); assert.equal(o.failureKind, 'service_link_candidate_unresolved'); assert.equal(visits.length, 1);
+    });
+    await check('excluded external URL cannot promote navigation-only content', '<nav>' + selfFeatures + cookieVendor + '</nav>', o => {
+      assert.equal(o.completeness, 'partial'); assert.equal(o.serviceTextLength, null);
+    });
+    await check('real internal service candidate survives external vendor removal', body + selfFeatures + cookieVendor + '<a href="/services/detail">サービス</a>', (o, visits) => {
+      complete(o); assert.equal(o.observedPageCount, 2); assert.equal(o.explicitCandidateCount, 1); assert.equal(visits.length, 2);
+      assert.equal(visits.filter(url => url === origin + '/services/detail').length, 1);
+    }, { [origin + '/services/detail']: { contentType: 'text/html; charset=utf-8', body: `<main><p>${text}</p></main>` } });
     await check('self links do not consume the three candidate slots', `${body}<a href="#feature01">機能</a>${[1,2,3,4].map(n=>`<a href="/services/${n}">サービス${n}</a>`).join('')}`, (o, visits) => {
       complete(o); assert.equal(o.explicitCandidateCount, 3); assert.equal(o.observedPageCount, 4);
       assert.equal(visits.filter(url => /\/services\//.test(url)).length, 3);
