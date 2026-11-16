@@ -3426,6 +3426,16 @@ function isHighConfidenceCompanyProfileCandidate_(candidate) {
 // labelled-field extractor before it can create any formal identity record.
 function evaluateBoundedOperatorIdentityProbeCandidate_(candidate) {
   const strict = evaluateHighConfidenceCompanyProfileCandidate_(candidate);
+  if (candidate && candidate.unconfirmedFooterProfileCandidate === true) {
+    let eligible = false;
+    try {
+      const target = new URL(candidate.url), entry = new URL(candidate.operatorProfileEntryUrl);
+      eligible = candidate.source === 'footer' && entry.origin === candidate.operatorRelationSourceOrigin &&
+        target.protocol === 'https:' && entry.protocol === 'https:' && target.origin !== entry.origin && target.pathname === '/' &&
+        !target.username && !target.password && !target.search && !target.hash && !isBlockedSubpageJsonLdHost(target.hostname);
+    } catch (_) {}
+    return Object.assign({},strict,{highConfidenceEligible:false,probeEligible:eligible,probeTier:'footer_brand_profile_discovery',probeSourceType:'company_profile'});
+  }
   if (candidate && candidate.operatorPolicyContextV1) {
     return Object.assign({}, strict, { probeEligible: true, probeTier: 'root_site_policy_relation', probeSourceType: 'company_profile' });
   }
@@ -4297,6 +4307,34 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
 
     const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名|社名|名称|商号/i, 'operator');
     const labelledAddress = labelValueFromText(/本社所在地|本社事務所|本社|所在地|住所/i, 'address');
+    // A company-profile heading may label a single name/postal-address block
+    // instead of individual table cells. Keep both fields in that same block;
+    // navigation, multiple entities and bare address prose remain ineligible.
+    if (sourceType === 'company_profile' && !operator.value && !labelledAddress.value) {
+      const blocks = [];
+      $('h2,h3').each((_, heading) => {
+        if (!/^(?:会社概要|企業概要|Company Profile)$/i.test(normalizeSubpageJsonLdText($(heading).text()))) return;
+        let scope = $(heading).parent();
+        for (let depth=0; depth<4 && scope.length; depth++,scope=scope.parent()) {
+          if (scope.is('body,main,header,footer,nav') || scope.closest('header,footer,nav,[role="navigation"],[role="contentinfo"],[hidden],[aria-hidden="true"]').length) break;
+          if (scope.find('h1,h2,h3').length !== 1) break;
+          const candidates=[];
+          scope.find('p').each((__, paragraph) => {
+            if ($(paragraph).find('a,button').length) return;
+            const lines=structuredCellText(paragraph).split('||').map(normalizeSubpageJsonLdText).filter(Boolean);
+            if (lines.length<2 || !/(?:株式会社|有限会社|合同会社|合資会社|合名会社)/.test(lines[0]) || lines[0].length>80) return;
+            const address=lines.slice(1).join(' ');
+            if (!/^〒?\s*\d{3}[-‐‑‒–—]\d{4}\s*(?:北海道|東京都|(?:京都|大阪)府|..県)/.test(address)) return;
+            candidates.push({value:cleanOperatorName(lines[0]),address:extractJapaneseAddress(address),label:normalizeSubpageJsonLdText($(heading).text())});
+          });
+          if (candidates.length) { if (candidates.length===1) blocks.push(candidates[0]); break; }
+        }
+      });
+      if (blocks.length===1) {
+        operator.value=blocks[0].value; operator.label=blocks[0].label;
+        labelledAddress.value=blocks[0].address; labelledAddress.label=blocks[0].label;
+      }
+    }
     // A company profile may disclose offices in a nested dt/dd list inside
     // its explicitly labelled 事業所 row. Keep each address in its own dd;
     // this establishes an office location, never an inferred headquarters.
@@ -7056,6 +7094,25 @@ function collectOfficialExternalOperatorProfileCandidates_(links, origin) {
   // rather than global navigation.  The same explicit-label/group-heading
   // gate applies, so this is not a general external-link crawl.
   (Array.isArray(links && links.allLinks) ? links.allLinks : []).forEach(link => add(link, 'explicit_body_operator_relation'));
+  // A unique footer brand logo is only a bounded profile-discovery hint.
+  // It never establishes an operating-company relation or a positive identity.
+  if (!out.length) {
+    const logos = (links && links.footerLinks || []).filter(link => {
+      try {
+        const target = new URL(link.href), entry = new URL(link.sourceEntryUrl);
+        return link.footerBrandLogo === true && normalizeSubpageJsonLdText(link.text) && entry.origin === sourceOrigin &&
+          entry.protocol === 'https:' && target.protocol === 'https:' && target.origin !== entry.origin &&
+          target.pathname === '/' && !target.search && !target.hash && !target.username && !target.password &&
+          !isBlockedSubpageJsonLdHost(target.hostname);
+      } catch (_) { return false; }
+    });
+    const unique = Array.from(new Map(logos.map(link => [link.href, link])).values());
+    if (unique.length === 1) {
+      const link = unique[0];
+      out.push({url:link.href,label:normalizeSubpageJsonLdText(link.text).slice(0,120),source:'footer',sources:['footer'],score:0,
+        unconfirmedFooterProfileCandidate:true,operatorProfileEntryUrl:link.sourceEntryUrl,operatorRelationSourceOrigin:sourceOrigin});
+    }
+  }
   return out;
 }
 
@@ -7725,6 +7782,8 @@ async function collectDiscoverLinksFromPage(page) {
       ariaLabel: clean(a.getAttribute && a.getAttribute('aria-label') || ''),
       title: clean(a.getAttribute && a.getAttribute('title') || ''),
       groupHeading: groupHeadingFor(a),
+      footerBrandLogo: !!a.closest('footer,[role="contentinfo"]') && !!a.querySelector('img[alt]') && /logo/i.test([a.className, a.parentElement && a.parentElement.className, a.querySelector('img') && a.querySelector('img').className].join(' ')) && a.getClientRects().length > 0,
+      sourceEntryUrl: location.href,
       // A footer may contain its own <nav>. Preserve both landmark facts so
       // one anchor observed through overlapping selectors cannot impersonate
       // independent navigation and footer corroboration.
@@ -11745,6 +11804,7 @@ function isCorroboratedCorporateSameOriginCompanyProfileRelationV1_(candidate, o
 }
 
 function buildObservedCompanyProfileRelationEvidenceV1_(candidate, page, identity, siteMode) {
+  if (candidate && candidate.unconfirmedFooterProfileCandidate === true) return null;
   return buildExplicitOperatorIdentityRelationEvidenceV1_(candidate, {
     siteMode,
     currentRunFetched: !!(page && page.ok === true),
@@ -11761,6 +11821,7 @@ function buildObservedCompanyProfileRelationEvidenceV1_(candidate, page, identit
 // direct-relation contract intact while allowing a formal detail page to be
 // used for the already-bounded hub/detail traversal.
 function buildObservedCompanyProfileHubDetailRelationEvidenceV1_(hubCandidate, hubPage, detailLink, detailPage, detailIdentity, siteMode, opts = {}) {
+  if (hubCandidate && hubCandidate.unconfirmedFooterProfileCandidate === true) return null;
   const externalRelation = buildExplicitOperatorIdentityRelationEvidenceV1_(hubCandidate);
   if (externalRelation && externalRelation.kind === 'explicit_external_operator_relation') {
     try {
@@ -12655,7 +12716,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length,
       subpageObservationMode: scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : (htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : '')
     });
-    if (!selectedCandidates.length) {
+    if (!selectedCandidates.length && !(discovered.operatorIdentitySelectionPlan && discovered.operatorIdentitySelectionPlan.selected.length)) {
       attachContactDestination_(geoSignalsV1, await resolveContactDestinationLight_(normalized.origin, [], hasContactCandidate, {
         siteMode,
         context: opts && opts.context
@@ -13509,6 +13570,24 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       }
     } else {
       operatorIdentityCandidateNoCandidateReason = 'existing_operator_identity_record';
+    }
+    // Keep a completed, non-positive profile observation tied to the exact
+    // entry/run and the directly linked corporate origin. Never promote it.
+    if (selectedOperatorIdentityCandidate && selectedOperatorIdentityCandidate.unconfirmedFooterProfileCandidate === true &&
+        operatorIdentityInfo && operatorIdentityInfo.observed === true && operatorIdentityInfo.hasOperatorInfo === false &&
+        operatorIdentityInfo.hasCompanyName === true && operatorIdentityInfo.hasAddress === true && operatorIdentityInfo.conflict !== true &&
+        operatorIdentityProbe.observationComplete === true && operatorIdentityProbe.landingProbeResult === 'fetched' &&
+        operatorIdentityProbe.detailProbeResult === 'fetched' && operatorIdentityProbe.totalOperatorProbeCount <= 3 &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(opts.sourceRunId || ''))) {
+      try {
+        const candidate = selectedOperatorIdentityCandidate;
+        if (normalizeDiscoverTopUrl(candidate.operatorProfileEntryUrl).topUrl === normalized.topUrl &&
+            new URL(operatorIdentityInfo.sourceUrl).origin === new URL(candidate.url).origin) {
+          operatorIdentityInfo.provenance = {source:'bounded_footer_brand_profile_probe',scope:'company_profile_page',
+            candidateSourceUrl:operatorIdentityInfo.sourceUrl,landingSourceUrl:candidate.url,sourceEntryUrl:normalized.topUrl,
+            sourceRunId:opts.sourceRunId,relation:'unconfirmed'};
+        }
+      } catch (_) {}
     }
     // Fetching a formal profile and accepting its identity are separate decisions.
     // Reuse the name-conflict contract; independent coverage addresses/phones
@@ -16822,22 +16901,35 @@ function buildBreadcrumbObservationV2_(entry, subpages, discoveryComplete, opts 
   const independentSubpageScope = opts && opts.independentSubpageScope === true;
   const entryComplete = isCoverageObservationV2CompletePage_(entry);
   const completed = pages.filter(isCoverageObservationV2CompletePage_);
-  const complete = independentSubpageScope
+  // A non-root diagnosis entry is already a hierarchical page. Reuse its
+  // completed DOM observation only when discovery found no child candidate;
+  // never mask a failed child fetch or borrow a different entry's observation.
+  let hierarchicalEntry = false;
+  try {
+    const target = new URL(String(opts.entryUrl || ''));
+    hierarchicalEntry = !independentSubpageScope && entryComplete && discoveryComplete === true && pages.length === 0 &&
+      target.protocol === 'https:' && target.pathname !== '/' && !target.username && !target.password &&
+      normalizeCoverageObservationV2Url_(target.origin, entry.url) === normalizeCoverageObservationV2Url_(target.origin, target.href) &&
+      typeof entry.breadcrumbUi === 'boolean';
+  } catch (_) {}
+  const complete = hierarchicalEntry || (independentSubpageScope
     ? (discoveryComplete === true && completed.length > 0 && completed.length === pages.length)
-    : (entryComplete && discoveryComplete === true && completed.length > 0 && completed.length === pages.length);
-  const subpageHasUi = complete ? pages.some(row => row.breadcrumbUi === true) : null;
+    : (entryComplete && discoveryComplete === true && completed.length > 0 && completed.length === pages.length));
+  const completeScope = hierarchicalEntry ? 'hierarchical_entry' : (independentSubpageScope ? 'independent_hierarchical_subpage' : 'entry_and_hierarchical_subpage');
+  const subpageHasUi = complete && !hierarchicalEntry ? pages.some(row => row.breadcrumbUi === true) : null;
   return Object.assign(coverageObservationV2Common_({ checked: !!(entry && entry.checked),
     completeness: complete ? 'complete' : ((entry && entry.checked) ? 'partial' : 'unavailable'), limited: !complete,
-    scope: complete ? (independentSubpageScope ? 'independent_hierarchical_subpage' : 'entry_and_hierarchical_subpage') : (entryComplete ? 'entry_only' : 'unknown') }), {
+    scope: complete ? completeScope : (entryComplete ? 'entry_only' : 'unknown') }), {
     hasAnyUi: complete ? (independentSubpageScope ? subpageHasUi === true : (entry.breadcrumbUi === true || subpageHasUi === true)) : null,
     topHasUi: independentSubpageScope ? null : (entryComplete ? !!entry.breadcrumbUi : null),
-    subpageHasUi, observedScope: complete ? (independentSubpageScope ? 'independent_hierarchical_subpage' : 'entry_and_hierarchical_subpage') : (entryComplete ? 'entry_only' : 'unknown'),
+    subpageHasUi, observedScope: complete ? completeScope : (entryComplete ? 'entry_only' : 'unknown'),
     // This formal count is meaningful only with the formal hierarchical scope:
     // a partly failed candidate batch must not look like a completed subpage
     // observation merely because one candidate happened to render.
     observedSubpageCount: complete ? completed.length : 0,
     completedCandidateCount: completed.length,
     candidateCount: pages.length,
+    entryUrl: hierarchicalEntry ? normalizeCoverageObservationV2Url_(new URL(opts.entryUrl).origin, entry.url) : null,
     legacyUsed: false
   });
 }
@@ -17107,7 +17199,7 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
     serviceContentObservationV2: buildServiceContentObservationV2_(entry, serviceRows, candidateComplete),
     breadcrumbObservationV2: buildBreadcrumbObservationV2_(entry, breadcrumbRows,
       usingReusableBreadcrumbRows ? true : candidateComplete,
-      { independentSubpageScope: usingReusableBreadcrumbRows }),
+      { independentSubpageScope: usingReusableBreadcrumbRows, entryUrl: breadcrumbBaseUrl }),
     htmlSitemapCandidateDiscoveryV1: buildHtmlSitemapCandidateDiscoveryV1_(entry, sitemapUrls)
   };
   if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') return observations;

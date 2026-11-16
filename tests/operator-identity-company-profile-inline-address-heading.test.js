@@ -38,3 +38,21 @@ console.log(JSON.stringify({
   fixture: 'operator_identity_company_profile_inline_address_heading_v1',
   cases: { inlineHeading: true, addressAbsent: true, unlabeledAddressRejected: true, formalRecord: true }
 }));
+
+// Explicit profile headings can own one inseparable legal-name/postal block.
+const profileBlock='<section><h2>会社概要</h2><div><p>架空合同会社 部門名<br>〒100-0001<br>東京都千代田区架空1-2-3</p></div></section>';
+const block=parseProfile('<main>'+profileBlock+'</main>');
+assert.equal(block.companyName,'架空合同会社 部門名');
+assert.equal(block.address,'〒100-0001 東京都千代田区架空1-2-3');
+assert.equal(block.hasOperatorInfo,true);
+for(const html of [
+ profileBlock.replace('会社概要','店舗一覧'),
+ profileBlock.replace('架空合同会社 部門名','店舗名'),
+ profileBlock.replace('〒100-0001<br>',''),
+ '<footer>'+profileBlock+'</footer>',
+ '<nav>'+profileBlock+'</nav>',
+ '<div hidden>'+profileBlock+'</div>',
+ profileBlock+profileBlock.replace('架空合同会社','別合同会社'),
+ profileBlock.replace('</div>','<p>別合同会社<br>〒100-0001<br>東京都千代田区架空4-5</p></div>'),
+ profileBlock.replace('架空合同会社 部門名','<a href="/company">架空合同会社 部門名</a>')
+]) assert.equal(parseProfile(html).hasOperatorInfo,false,html);

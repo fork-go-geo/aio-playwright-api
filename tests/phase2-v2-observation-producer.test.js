@@ -42,6 +42,24 @@ const entryOnlyBreadcrumb = hooks.buildBreadcrumbObservationV2_(complete(), [], 
 check('breadcrumb-entry-only', entryOnlyBreadcrumb.hasAnyUi, null);
 check('breadcrumb-entry-only-scope', entryOnlyBreadcrumb.observedScope, 'entry_only');
 check('breadcrumb-entry-only-formal-count', entryOnlyBreadcrumb.observedSubpageCount, 0);
+// A fully rendered non-root diagnosis entry is itself a hierarchical page.
+const leafUrl = 'https://fixture.invalid/brand/';
+const leaf = complete({ url:leafUrl });
+const leafResult = hooks.buildBreadcrumbObservationV2_(leaf, [], true, { entryUrl:leafUrl });
+check('breadcrumb-leaf-entry-complete', leafResult.completeness, 'complete');
+check('breadcrumb-leaf-entry-absence', leafResult.hasAnyUi, false);
+check('breadcrumb-leaf-entry-scope', leafResult.observedScope, 'hierarchical_entry');
+check('breadcrumb-leaf-entry-no-invented-child', leafResult.observedSubpageCount, 0);
+check('breadcrumb-leaf-entry-present', hooks.buildBreadcrumbObservationV2_(complete({url:leafUrl,breadcrumbUi:true}), [], true, {entryUrl:leafUrl}).hasAnyUi, true);
+for (const [name, entry, pages, discovery, target] of [
+ ['root',complete({url:'https://fixture.invalid/'}),[],true,'https://fixture.invalid/'],
+ ['other-entry',leaf,[],true,'https://fixture.invalid/other/'],
+ ['discovery-failed',leaf,[],false,leafUrl],
+ ['frame-failed',complete({url:leafUrl,frameComplete:false}),[],true,leafUrl],
+ ['candidate-failed',leaf,[partial('timeout')],true,leafUrl],
+ ['missing-boolean',complete({url:leafUrl,breadcrumbUi:null}),[],true,leafUrl]
+]) check('breadcrumb-leaf-reject-'+name,hooks.buildBreadcrumbObservationV2_(entry,pages,discovery,{entryUrl:target}).hasAnyUi,null);
+
 check('breadcrumb-frame-incomplete', hooks.buildBreadcrumbObservationV2_(complete(), [partial('frame_incomplete')], true).subpageHasUi, null);
 check('breadcrumb-render-incomplete', hooks.buildBreadcrumbObservationV2_(partial('render_incomplete'), [complete()], true).hasAnyUi, null);
 const mixedBreadcrumb = hooks.buildBreadcrumbObservationV2_(complete(), [complete(), partial('timeout')], true);

@@ -104,6 +104,15 @@ async function collect(page, html) {
       `<a href="${origin}/company/">詳細はこちら</a>`));
     assert.strictEqual(unlabeled.operatorRelationLinks.length, 0);
 
+    // Capture the exact entry from the DOM, not a caller-supplied origin.
+    await page.route('https://brand.fixture.invalid/service',route=>route.fulfill({contentType:'text/html',body:'<main>Fixture</main><footer><p class="brand-logo"><a href="https://operator.fixture.invalid/"><img alt="Fixture Brand" width="120" height="40"></a></p></footer>'}));
+    await page.goto('https://brand.fixture.invalid/service');
+    const logoLinks=await hooks.collectDiscoverLinksFromPage(page);
+    const logoCandidates=hooks.collectOfficialExternalOperatorProfileCandidates_(logoLinks,origin);
+    assert.equal(logoCandidates.length,1);assert.equal(logoCandidates[0].unconfirmedFooterProfileCandidate,true);
+    assert.equal(logoCandidates[0].operatorProfileEntryUrl,'https://brand.fixture.invalid/service');
+    assert.equal(logoCandidates[0].officialExternalOperatorProfile,undefined);
+
     console.log(JSON.stringify({
       pass: true,
       fixture: 'operator_identity_link_collection_integration_v1',
