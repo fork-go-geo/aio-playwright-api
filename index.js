@@ -16795,7 +16795,8 @@ function buildFaqObservationV2_(entry, candidates, discoveryComplete) {
 }
 
 function buildServiceContentObservationV2_(entry, candidates, discoveryComplete) {
-  const rows = [entry].concat(Array.isArray(candidates) ? candidates : []).filter(Boolean);
+  const rows = [entry].concat(Array.isArray(candidates) ? candidates : []).filter(Boolean)
+    .map(row => Object.assign({}, row, row.servicePrimaryContent || {}));
   const lengthsComplete = rows.every(row => Number.isFinite(row.mainTextLength) && Number.isFinite(row.serviceTextLength));
   // If a rendered service link was observed but could not be represented by a
   // candidate, the bounded observation cannot establish a complete scope.
@@ -16962,6 +16963,40 @@ async function readCoverageObservationV2Page_(page) {
       const serviceNodes = Array.from(main.querySelectorAll('section, article, [class], [id], [aria-label]')).filter(el => /(?:service|product|solution|feature|pricing|サービス|製品|商品|機能|料金)/i.test(`${el.id || ''} ${el.className || ''} ${el.getAttribute('aria-label') || ''}`));
       const distinctServiceNodes = serviceNodes.filter(el=>!serviceNodes.some(other=>other!==el&&other.contains(el)));
       const serviceText = clean(distinctServiceNodes.map(el => el.innerText || '').join(' '));
+      let servicePrimaryContent = null;
+      if (!mainElement) {
+        // Reuse the rendered primary-message observer's content regions and
+        // chrome-stripped body-child path. Do not promote its boolean/length
+        // summary: measure this document's actual service content here.
+        const excluded = 'header,nav,footer,aside,script,style,noscript,template,[role="navigation"],[role="banner"],[role="contentinfo"],[hidden],[aria-hidden="true"]';
+        const visible = el => !el.closest(excluded) && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+        let roots = Array.from(document.querySelectorAll('article,[role="article"],section,[class*="content" i],[class*="article" i],[class*="post" i],[class*="entry" i]')).filter(visible);
+        if (!roots.length) roots = Array.from(document.body ? document.body.children : []).filter(visible);
+        roots = roots.filter(el => !roots.some(other => other !== el && other.contains(el)));
+        const content = roots.map(el => {
+          const clone = el.cloneNode(true);
+          const originals = Array.from(el.querySelectorAll('*'));
+          Array.from(clone.querySelectorAll('*')).forEach((node, index) => {
+            if (node.matches(excluded) || !visible(originals[index])) node.remove();
+          });
+          return clone;
+        }).filter(el => {
+          const prose = el.cloneNode(true);
+          prose.querySelectorAll('a,button').forEach(node => node.remove());
+          return !el.matches('a,button') && clean(prose.textContent).length > 0;
+        });
+        const serviceSelector = /(?:service|product|solution|feature|pricing|サービス|製品|商品|機能|料金)/i;
+        const regions = content.flatMap(el => [el, ...el.querySelectorAll('section,article,[class],[id],[aria-label]')])
+          .filter(el => serviceSelector.test(`${el.id || ''} ${el.className || ''} ${el.getAttribute('aria-label') || ''}`));
+        const outerRegions = regions.filter(el => !regions.some(other => other !== el && other.contains(el)));
+        servicePrimaryContent = {
+          mainContentObserved: content.length > 0,
+          mainContentSource: content.length ? 'rendered_primary_content' : null,
+          mainTextLength: clean(content.map(el => el.textContent).join(' ')).length,
+          serviceRegionCertain: content.length > 0,
+          serviceTextLength: content.length ? clean(outerRegions.map(el => el.textContent).join(' ')).length : null
+        };
+      }
       return { url: location.href, mainContentSource: semanticMain ? 'semantic_main' : (mainElement ? 'unique_named_main_container' : null), readyState: document.readyState, hasFrame: !!document.querySelector('frame, frameset, iframe'), hasFrameset: !!document.querySelector('frameset'), mainContentObserved: !!mainElement, mainTextLength: mainText.length,
         // A zero-length text region is still a finite observation when the
         // rendered service region exists. Null is reserved for an unobserved
@@ -16969,7 +17004,7 @@ async function readCoverageObservationV2Page_(page) {
         serviceTextLength: mainElement ? serviceText.length : null, serviceRegionCertain: !!mainElement,
         faqDetector, breadcrumbUi: breadcrumb, links: all.slice(0, 120), faqLinks, faqLinkObserved:faqLinks.length>0,
         serviceLinks, serviceLinkObserved:serviceLinks.length>0,
-        sitemapLinks, sitemapLinkDiscoveryComplete:true };
+        sitemapLinks, sitemapLinkDiscoveryComplete:true, servicePrimaryContent };
     });
     // An embedded widget must not make a complete rendered main document
     // unusable. Only a frameset or sparse shell requires a child-frame scope.
@@ -17014,9 +17049,15 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   const entry = await readCoverageObservationV2Page_(page);
   entry.faqLinkObserved = entry.faqLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasFaqLink === true || geoSignalsV1.coverage.hasFaqNav === true));
   entry.serviceLinkObserved = entry.serviceLinkObserved === true || !!(geoSignalsV1 && geoSignalsV1.coverage && (geoSignalsV1.coverage.hasServicePageLink === true || geoSignalsV1.coverage.hasServiceNav === true));
+  const serviceLinks = entry.serviceLinks || entry.links || [];
+  const serviceEntryUrl = normalizeCoverageObservationV2Url_(origin, entry.url || pageUrl);
+  const distinctServiceLinks = serviceLinks.filter(link => normalizeCoverageObservationV2Url_(origin, link.href) !== serviceEntryUrl);
+  // A service anchor within this entry has already been observed, not lost.
+  // Remove it before the candidate cap without hiding unresolved link hints.
+  if (serviceLinks.length && !distinctServiceLinks.length) entry.serviceLinkObserved = false;
   const discoveryComplete = isCoverageObservationV2CompletePage_(entry) && !!origin;
   const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.faqLinks || entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_) : [];
-  const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.serviceLinks || entry.links, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
+  const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, distinctServiceLinks, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
   const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(breadcrumbBaseUrl, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
   const htmlSitemapDiscoveryComplete = isHtmlSitemapCandidateDiscoveryCompleteV1_(entry) && !!origin;
   const sitemapUrls = htmlSitemapDiscoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
@@ -17040,7 +17081,17 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   }
   const rowsFor = urls => canOpen ? urls.map(url => candidateFacts.get(url)) : [];
   const faqRows = rowsFor(faqUrls);
-  const serviceRows = rowsFor(serviceUrls);
+  const serviceSeen = new Set([serviceEntryUrl]);
+  const serviceRows = rowsFor(serviceUrls).filter(row => {
+    const url = row && row.url ? normalizeCoverageObservationV2Url_(origin, row.url) : null;
+    const content = row && (row.servicePrimaryContent || row);
+    if (!url || !isCoverageObservationV2CompletePage_(row) || content.mainContentObserved !== true || content.serviceRegionCertain !== true) return true;
+    if (serviceSeen.has(url)) return false;
+    serviceSeen.add(url);
+    return true;
+  });
+  // Completed redirects back to the entry do not add a second content page.
+  if (serviceUrls.length && !serviceRows.length) entry.serviceLinkObserved = false;
   const directBreadcrumbRows = rowsFor(breadcrumbUrls);
   const reusableBreadcrumbRows = !breadcrumbUrls.length
     ? collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin)
