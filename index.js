@@ -16938,19 +16938,29 @@ function collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin) {
   const pages = geoSignalsV1 && geoSignalsV1.subpageSignals && Array.isArray(geoSignalsV1.subpageSignals.pages)
     ? geoSignalsV1.subpageSignals.pages : [];
   let expectedOrigin = '';
-  try { expectedOrigin = new URL(String(origin || '')).origin; } catch (_) {}
+  let entryPath = '';
+  try {
+    const entry = new URL(String(origin || ''));
+    expectedOrigin = entry.origin;
+    entryPath = entry.pathname.replace(/\/+$/, '');
+  } catch (_) {}
   const seen = new Set();
   return pages.reduce((rows, page) => {
     const url = String(page && (page.finalUrl || page.url) || '');
     let parsed = null;
     try { parsed = new URL(url); } catch (_) { return rows; }
-    if (!expectedOrigin || parsed.origin !== expectedOrigin || seen.has(parsed.href)) return rows;
+    const normalizedUrl = normalizeCoverageObservationV2Url_(expectedOrigin, url);
+    const candidatePath = parsed.pathname.replace(/\/+$/, '');
+    if (!expectedOrigin || !normalizedUrl || parsed.origin !== expectedOrigin ||
+        candidatePath === entryPath || !candidatePath.startsWith(entryPath + '/') ||
+        typeof page.hasBreadcrumbUi !== 'boolean' || seen.has(candidatePath)) return rows;
     // subpageSignals only contains page.ok === true observations from the
     // bounded coverage fetch.  Its parser has already evaluated this URL, so
     // it is an independent subpage scope, not an assertion about the framed
     // entry document or any of its unobserved child frames.
-    seen.add(parsed.href);
+    seen.add(candidatePath);
     rows.push({
+      url: normalizedUrl,
       checked: true,
       attempted: true,
       renderComplete: true,
@@ -17153,7 +17163,14 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   const discoveryComplete = isCoverageObservationV2CompletePage_(entry) && !!origin;
   const faqUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.faqLinks || entry.links, 'faq', COVERAGE_OBSERVATION_V2_MAX_FAQ_CANDIDATES_) : [];
   const serviceUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(origin, distinctServiceLinks, 'service', COVERAGE_OBSERVATION_V2_MAX_SERVICE_CANDIDATES_) : [];
-  const breadcrumbUrls = discoveryComplete ? selectCoverageObservationV2Candidates_(breadcrumbBaseUrl, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
+  const reusableBreadcrumbRows = collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, breadcrumbBaseUrl);
+  // 同一呼出で確認済みの肯定根拠を先に使い、重複取得による取りこぼしを避ける。
+  // 静的HTMLのfalseだけではDOM観測を省略せず、従来の不完全判定を維持する。
+  const positiveBreadcrumbRows = reusableBreadcrumbRows.filter(row => row.breadcrumbUi === true);
+  const positiveBreadcrumbUrls = positiveBreadcrumbRows.length ? selectCoverageObservationV2Candidates_(breadcrumbBaseUrl,
+    positiveBreadcrumbRows.map(row => ({ href:row.url })), 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
+  const preferredBreadcrumbRows = positiveBreadcrumbRows.filter(row => positiveBreadcrumbUrls.includes(row.url));
+  const breadcrumbUrls = discoveryComplete && !preferredBreadcrumbRows.length ? selectCoverageObservationV2Candidates_(breadcrumbBaseUrl, entry.links, 'breadcrumb', COVERAGE_OBSERVATION_V2_MAX_BREADCRUMB_CANDIDATES_) : [];
   const htmlSitemapDiscoveryComplete = isHtmlSitemapCandidateDiscoveryCompleteV1_(entry) && !!origin;
   const sitemapUrls = htmlSitemapDiscoveryComplete ? selectCoverageObservationV2Candidates_(origin, entry.sitemapLinks || entry.links, 'sitemap', COVERAGE_OBSERVATION_V2_MAX_SITEMAP_CANDIDATES_) : [];
   const canOpen = context && typeof context.newPage === 'function';
@@ -17188,11 +17205,9 @@ async function collectCoverageObservationsV2_(geoSignalsV1, page, pageUrl, conte
   // Completed redirects back to the entry do not add a second content page.
   if (serviceUrls.length && !serviceRows.length) entry.serviceLinkObserved = false;
   const directBreadcrumbRows = rowsFor(breadcrumbUrls);
-  const reusableBreadcrumbRows = !breadcrumbUrls.length
-    ? collectReusableBreadcrumbObservationV2Rows_(geoSignalsV1, origin)
-    : [];
-  const usingReusableBreadcrumbRows = reusableBreadcrumbRows.length > 0;
-  const breadcrumbRows = usingReusableBreadcrumbRows ? reusableBreadcrumbRows : directBreadcrumbRows;
+  const reusedBreadcrumbRows = preferredBreadcrumbRows.length ? preferredBreadcrumbRows : (!breadcrumbUrls.length ? reusableBreadcrumbRows : []);
+  const usingReusableBreadcrumbRows = reusedBreadcrumbRows.length > 0;
+  const breadcrumbRows = usingReusableBreadcrumbRows ? reusedBreadcrumbRows : directBreadcrumbRows;
   const candidateComplete = discoveryComplete && canOpen;
   const observations = {
     faqObservationV2: buildFaqObservationV2_(entry, faqRows, candidateComplete),
