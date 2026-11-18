@@ -18,6 +18,19 @@ assert.strictEqual(field(complete, 'companyName').acceptedSourceType, 'table');
 assert.strictEqual(field(complete, 'telephone').accepted, true);
 assert.strictEqual(field(complete, 'telephone').acceptedLabel, 'TEL');
 
+// 明示的な会社名称ラベルは既存の会社名と同じ構造化フィールド。
+for (const label of ['会社名称', '会社 名称', '会社　名称']) {
+  for (const body of [`<table><tr><th>${label}</th><td>検証組織</td></tr></table>`, `<dl><dt>${label}</dt><dd>検証組織</dd></dl>`]) {
+    const info = extract(body + '<p>所在地：東京都検証区1-1</p>');
+    assert.strictEqual(info.companyName, '検証組織', label);
+    assert.strictEqual(field(info, 'companyName').accepted, true, label + ': audit');
+  }
+}
+for (const label of ['会社名称のご紹介', '会社名称変更のお知らせ']) {
+  assert.strictEqual(extract(`<table><tr><th>${label}</th><td>検証組織</td></tr></table>`).companyName, '', label);
+}
+assert.strictEqual(extract('<nav><a href="/company">会社名称</a><a href="/jobs">募集案内</a></nav>').companyName, '');
+
 const houjin = extract('<table><tr><th>法人名</th><td>匿名一般社団法人</td></tr><tr><th>所在地</th><td>東京都匿名区1-1</td></tr><tr><th>電話番号</th><td>03-0000-0000</td></tr></table>');
 assert.strictEqual(houjin.hasCompanyName, false);
 assert.strictEqual(field(houjin, 'companyName').summary.evidenceSeen, true);
@@ -74,4 +87,4 @@ assert.strictEqual(missingParity.hasAddress, true);
 assert.strictEqual(missingParity.hasTelephone, true);
 assert.strictEqual(missingParity.hasOperatorInfo, false);
 
-console.log(JSON.stringify({ pass: true, cases: 11, bounded: Object.values(complete.operatorIdentityFieldExtractionAuditV1.fields).every(item => item.candidates.length <= 5) }));
+console.log(JSON.stringify({ pass: true, cases: 20, bounded: Object.values(complete.operatorIdentityFieldExtractionAuditV1.fields).every(item => item.candidates.length <= 5) }));

@@ -4069,7 +4069,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       if (/販売業者/.test(compact)) return '販売業者';
       if (/運営会社/.test(compact)) return '運営会社';
       if (/^名称$/i.test(compact)) return '名称';
-      if (/^(?:会社商号|商号)$/i.test(compact)) return compact;
+      if (/^(?:会社名称|会社商号|商号)$/i.test(compact)) return compact;
       if (/本社所在地/.test(compact)) return '本社所在地';
       if (/^本社事務所$/i.test(compact)) return '本社事務所';
       // "本社" is a valid address field only as a complete table/dl label
@@ -4679,7 +4679,7 @@ function buildOperatorIdentityFieldExtractionAuditV1_(html, meta = {}, identity)
   };
   const labelMatches = (field, label) => {
     const raw = normalize(label), compact = normalizeLabel(label);
-    if (field === 'companyName') return /事業者名/.test(compact) || /販売業者/.test(compact) || /運営会社/.test(compact) || /^(?:名称|会社商号|商号)$/i.test(compact) || /^(?:会社名|社名)$/.test(raw);
+    if (field === 'companyName') return /事業者名/.test(compact) || /販売業者/.test(compact) || /運営会社/.test(compact) || /^(?:名称|会社名称|会社商号|商号)$/i.test(compact) || /^(?:会社名|社名)$/.test(raw);
     if (field === 'address') return /本社所在地/.test(compact) || /^本社事務所$/.test(compact) || /^本社(?:\s*[（(](?:所在地|事務所)[）)])?$/i.test(raw) || /所在地/.test(compact) || /住所/.test(compact);
     return /^電話番号(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^電話$/i.test(compact) || /^tel(?:\s*[（(](?:代表|お問い合わせ|連絡先)[）)])?$/i.test(raw) || /^連絡先$/i.test(raw) || /お客様相談室/.test(compact);
   };
