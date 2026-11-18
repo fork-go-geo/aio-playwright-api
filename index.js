@@ -5423,6 +5423,13 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
     h1Count: $('h1').length,
     h1Texts,
     jsonldTypes: uniqueTypes,
+    jsonldScanAttempted: true,
+    // Only an empty, healthy HTML scan authorizes a new absence claim.
+    // Existing type traversal can truncate nested JSON-LD and is not completion proof.
+    jsonldScanComplete: $('script[type*="ld+json" i]').length === 0 && bodyTextLength > 0 &&
+      classifyBrowserEntryDocumentHealthV1_({ observed: { h1: { values: h1Texts }, primaryMessageObservationSeedV2: { text: normalizeSubpageJsonLdText($('body').text()) } } }, { title, bodyTextLength }, { browserStatus: status }) === 'normal',
+    jsonldParseErrors: parseErrors,
+    jsonldObservationScope: 'fetched_html_ldjson',
     jsonldTypeCounts,
     breadcrumbListCount: Number(jsonldTypeCounts.BreadcrumbList || 0),
     listItemCount: Number(jsonldTypeCounts.ListItem || 0),
@@ -8781,6 +8788,10 @@ function compactSubpageJsonLdObservation_(page) {
     h1Count: Number(page && page.h1Count || 0),
     h1Texts: Array.isArray(page && page.h1Texts) ? page.h1Texts.slice(0, 5) : [],
     jsonldTypes: Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [],
+    jsonldScanAttempted: page && typeof page.jsonldScanAttempted === 'boolean' ? page.jsonldScanAttempted : null,
+    jsonldScanComplete: page && page.ok === true && typeof page.jsonldScanComplete === 'boolean' ? page.jsonldScanComplete : null,
+    jsonldParseErrors: page && Number.isInteger(page.jsonldParseErrors) ? page.jsonldParseErrors : null,
+    jsonldObservationScope: page && page.jsonldObservationScope || null,
     jsonldTypeCounts: rawCounts,
     breadcrumbListCount,
     listItemCount,
@@ -9837,6 +9848,10 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         jsonLdTypes,
         jsonLdCount: Number(page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount || jsonLdTypes.length || 0),
         hasJsonLd: page.hasJsonLd === true || jsonLdTypes.length > 0,
+        jsonldScanAttempted: typeof page.jsonldScanAttempted === 'boolean' ? page.jsonldScanAttempted : null,
+        jsonldScanComplete: typeof page.jsonldScanComplete === 'boolean' ? page.jsonldScanComplete : null,
+        jsonldParseErrors: Number.isInteger(page.jsonldParseErrors) ? page.jsonldParseErrors : null,
+        jsonldObservationScope: page.jsonldObservationScope || null,
         productJsonLdObserved: Array.isArray(page.jsonldTypes) ? true : null,
         hasProductJsonLd: page.hasProductJsonLd === true ? true : null,
         hasProductPrice: typeof page.hasProductPrice === 'boolean' ? page.hasProductPrice : null,
@@ -18667,8 +18682,19 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       }) || null;
       const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
       const footerObserved = footerAnchors.length > 0 || semanticFooterCount > 0 || !!explicitFooterRoot;
+      const footerStructureRoots = queryAllDeep('footer,[role="contentinfo"]');
+      if (!footerStructureRoots.length && explicitFooterRoot) footerStructureRoots.push(explicitFooterRoot);
+      const footerStructureNodes = (selector) => Array.from(new Set(footerStructureRoots.flatMap(root => Array.from(root.querySelectorAll(selector)))));
+      const footerStructureComplete = footerStructureRoots.length > 0 && !footerStructureRoots.some(root => root.shadowRoot || Array.from(root.querySelectorAll('*')).some(node => node.shadowRoot));
+      const footerHeadingCount = footerStructureNodes('h2,h3,h4,h5,h6').length;
+      const footerListCount = footerStructureNodes('ul,ol,dl').length;
+      const footerGroupedLinkBlocks = footerStructureNodes('section,div,nav').filter(block => block.querySelector('h2,h3,h4,h5,h6') && block.querySelector('ul,ol,dl')).length || (footerHeadingCount > 0 && footerListCount > 0 ? 1 : 0);
       const footerSignals = {
         observed: footerObserved,
+        structureObserved: footerStructureComplete,
+        headingCount: footerStructureComplete ? footerHeadingCount : null,
+        listCount: footerStructureComplete ? footerListCount : null,
+        groupedLinkBlocks: footerStructureComplete ? footerGroupedLinkBlocks : null,
         linkCount: footerObserved ? footerAnchors.length : null,
         hasPrivacyLink: footerObserved ? privacyPolicyRe.test(footerHay) : null,
         hasCompanyLink: footerObserved ? /company|about|corporate|会社|企業|運営|概要/.test(footerHay) : null,
@@ -24335,6 +24361,13 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         }) || null;
         const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
         const footerObserved = footerAnchors.length > 0 || queryAllDeep('footer,[role="contentinfo"]').length > 0 || !!explicitFooterRoot;
+        const footerStructureRoots = queryAllDeep('footer,[role="contentinfo"]');
+        if (!footerStructureRoots.length && explicitFooterRoot) footerStructureRoots.push(explicitFooterRoot);
+        const footerStructureNodes = (selector) => Array.from(new Set(footerStructureRoots.flatMap(root => Array.from(root.querySelectorAll(selector)))));
+        const footerStructureComplete = footerStructureRoots.length > 0 && !footerStructureRoots.some(root => root.shadowRoot || Array.from(root.querySelectorAll('*')).some(node => node.shadowRoot));
+        const footerHeadingCount = footerStructureNodes('h2,h3,h4,h5,h6').length;
+        const footerListCount = footerStructureNodes('ul,ol,dl').length;
+        const footerGroupedLinkBlocks = footerStructureNodes('section,div,nav').filter(block => block.querySelector('h2,h3,h4,h5,h6') && block.querySelector('ul,ol,dl')).length || (footerHeadingCount > 0 && footerListCount > 0 ? 1 : 0);
         const formSignals = (() => {
           const forms = Array.from(document.querySelectorAll('form'));
           const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(location.pathname || '');
@@ -24443,6 +24476,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           formSignals,
           footerSignals: {
             observed: footerObserved,
+            structureObserved: footerStructureComplete,
+            headingCount: footerStructureComplete ? footerHeadingCount : null,
+            listCount: footerStructureComplete ? footerListCount : null,
+            groupedLinkBlocks: footerStructureComplete ? footerGroupedLinkBlocks : null,
             linkCount: footerObserved ? footerAnchors.length : null,
             hasPrivacyLink: footerObserved ? /privacy|プライバシー|個人情報/.test(footerHay) : null,
             hasCompanyLink: footerObserved ? /company|about|corporate|会社|企業|運営|概要/.test(footerHay) : null,
