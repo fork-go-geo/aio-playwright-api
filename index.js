@@ -4757,11 +4757,8 @@ function buildOperatorIdentityFieldExtractionAuditV1_(html, meta = {}, identity)
   return output;
 }
 
-function extractContactSignalsFromHtml_(html, sourceUrl) {
-  const empty = {
-    hasPhone: false,
-    telephone: null
-  };
+function extractContactSignalsFromHtml_(html, sourceUrl, status = 200) {
+  const empty = { hasPhone: false, telephone: null, observationComplete: false };
   try {
     const $ = cheerio.load(String(html || ''));
     const normalizePhone = v => normalizeSubpageJsonLdText(v)
@@ -4793,9 +4790,15 @@ function extractContactSignalsFromHtml_(html, sourceUrl) {
         if (telephone) break;
       }
     }
+    const body = $('body').clone();
+    body.find('script,style,noscript,svg').remove();
+    const text = normalizeSubpageJsonLdText(body.text());
+    const potentialPhone = /(?:tel|phone|電話|0\d{1,4}-\d{1,4}-\d{3,4}|0\d{9,10}|[+＋]\d{7,})/i.test(normalizePhone(text)) || body.find('a[href^="tel:" i]').length > 0;
+    const health = classifyBrowserEntryDocumentHealthV1_({ observed: { h1: { values: [$('h1').text()] }, primaryMessageObservationSeedV2: { text } } }, { title: $('title').text(), bodyTextLength: text.length }, { browserStatus: status });
     return {
       hasPhone: !!telephone,
-      telephone: telephone || null
+      telephone: telephone || null,
+      observationComplete: isSubpageHtmlLightObservationSufficient_({ ok: status >= 200 && status < 300, title: $('title').text(), h1Count: $('h1').length, bodyTextLength: text.length, internalLinkCount: body.find('a[href]').length }) && body.find('iframe,frame,frameset,template[shadowrootmode]').length === 0 && health === 'normal' && (!!telephone || !potentialPhone)
     };
   } catch (_) {
     return empty;
@@ -5295,6 +5298,8 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode, opts
       })
     : null;
   if (operatorIdentityInfo && typeof operatorIdentityInfo === 'object') {
+    const phoneScan = extractContactSignalsFromHtml_(html, finalUrl || url, status);
+    operatorIdentityInfo.telephoneObservationV1 = { scope: 'company_profile_html', sourceUrl: finalUrl || url, complete: phoneScan.observationComplete, hasPhone: phoneScan.hasPhone };
     operatorIdentityInfo.scope = 'company_profile_page';
     operatorIdentityInfo.scopeKey = operatorIdentityScopeKey_(finalUrl || url) || null;
   }
@@ -8866,6 +8871,7 @@ function compactSubpageJsonLdObservation_(page) {
       hasCompanyName: page.operatorIdentityInfo.hasCompanyName === true,
       hasAddress: page.operatorIdentityInfo.hasAddress === true,
       hasTelephone: page.operatorIdentityInfo.hasTelephone === true,
+      telephoneObservationV1: page.operatorIdentityInfo.telephoneObservationV1 && page.operatorIdentityInfo.telephoneObservationV1.scope === 'company_profile_html' ? { scope: 'company_profile_html', sourceUrl: String(page.operatorIdentityInfo.telephoneObservationV1.sourceUrl || ''), complete: page.operatorIdentityInfo.telephoneObservationV1.complete === true, hasPhone: typeof page.operatorIdentityInfo.telephoneObservationV1.hasPhone === 'boolean' ? page.operatorIdentityInfo.telephoneObservationV1.hasPhone : null } : null,
       hasOperatorInfo: page.operatorIdentityInfo.hasOperatorInfo === true,
       extractionMethod: String(page.operatorIdentityInfo.extractionMethod || 'html_text').slice(0, 80),
       evidenceLabels: Array.isArray(page.operatorIdentityInfo.evidenceLabels) ? page.operatorIdentityInfo.evidenceLabels.slice(0, 10) : [],
@@ -9703,15 +9709,30 @@ function normalizeContactDestination_(value) {
   };
 }
 
-function evaluateContactDestinationPages_(origin, pages, source, checkedUrls) {
+function evaluateContactDestinationPages_(origin, pages, source, checkedUrls, opts = {}) {
   const checkedAt = new Date().toISOString();
   const contactIntentRe = /contact|contact\s*us|inquir(?:y|ies)|お問い合わせ|お問合せ|問い合わせ|問合せ|連絡先|ご相談|資料請求/i;
   const softErrorRe = /404|not[\s-]?found|page[\s-]?not[\s-]?found|ページが見つかりません|お探しのページ|error/i;
   const compact = value => normalizeSubpageJsonLdText(value).slice(0, 240);
   const checked = Array.isArray(checkedUrls) ? checkedUrls.filter(Boolean).slice(0, 8) : [];
   const items = Array.isArray(pages) ? pages : [];
+  // Diagnostic transport only: reuse the value-free error/URL projections.
+  const probeAuditV1 = {
+    version: 'contact_destination_probe_audit_v1',
+    sourceRunId: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(opts.sourceRunId || '')) ? opts.sourceRunId : null,
+    entryUrl: safeOperatorIdentityDebugUrlProjectionV1_(opts.entryKey),
+    attempts: items.slice(0, 8).map(page => ({
+      url: safeOperatorIdentityDebugUrlProjectionV1_(page && page.url),
+      finalUrl: safeOperatorIdentityDebugUrlProjectionV1_(page && (page.finalUrl || page.url)),
+      status: page && typeof page.status === 'number' && page.status >= 100 && page.status <= 599 ? page.status : null,
+      ok: !!(page && page.ok === true),
+      errorStage: page && ['precheck', 'fetch', 'timeout', 'budget', 'parse'].includes(page.errorStage) ? page.errorStage : null,
+      reason: normalizeOperatorIdentityProbeErrorCodeV1_(page)
+    }))
+  };
   let observationLimited = false;
   let successfulChecks = 0;
+  const completedUrls = new Set();
   for (const page of items) {
     if (!page) continue;
     const finalUrl = String(page.finalUrl || page.url || '');
@@ -9725,14 +9746,21 @@ function evaluateContactDestinationPages_(origin, pages, source, checkedUrls) {
     const status = Number(page.status || 0);
     const success = page.ok === true && status >= 200 && status < 300;
     if (!success || !sameOrigin) {
+      if (sameOrigin && checked.includes(page.url) && !completedUrls.has(page.url) && page.errorStage === 'fetch' &&
+          [404, 410].includes(status) && normalizeOperatorIdentityProbeErrorCodeV1_(page) === 'http_4xx') {
+        completedUrls.add(page.url);
+        continue;
+      }
       observationLimited = true;
       continue;
     }
+    if (checked.includes(page.url)) completedUrls.add(page.url);
     successfulChecks += 1;
     const title = compact(page.title);
     const h1 = compact(Array.isArray(page.h1Texts) ? page.h1Texts[0] : page.h1);
     const text = compact(page.sampledText);
-    if (softErrorRe.test([title, h1, text].join(' '))) continue;
+    const documentHealth = classifyBrowserEntryDocumentHealthV1_({ observed: { h1: { values: [h1] }, primaryMessageObservationSeedV2: { text } } }, { title, bodyTextLength: Number(page.bodyTextLength || text.length) }, { browserStatus: status });
+    if (softErrorRe.test([title, h1, text].join(' ')) || documentHealth !== 'normal') { observationLimited = true; continue; }
     const urlIntent = contactIntentRe.test(pathname);
     const contentIntent = contactIntentRe.test([title, h1, text].join(' '));
     const formSignals = page.formSignals && typeof page.formSignals === 'object' ? page.formSignals : null;
@@ -9740,6 +9768,7 @@ function evaluateContactDestinationPages_(origin, pages, source, checkedUrls) {
     const pageTypeContact = String(page.pageType || '').toLowerCase() === 'contact';
     const evidence = {
       checkedUrls: checked,
+      probeAuditV1,
       urlIntent,
       contentIntent,
       pageType: page.pageType || null,
@@ -9762,20 +9791,20 @@ function evaluateContactDestinationPages_(origin, pages, source, checkedUrls) {
     }
     if (formSignals && formSignals.formObservationLimited === true) observationLimited = true;
   }
-  const evidence = { checkedUrls: checked, checkedCount: checked.length, successfulChecks, observationLimited };
+  const evidence = { checkedUrls: checked, checkedCount: checked.length, successfulChecks, completedChecks: completedUrls.size, observationLimited, probeAuditV1 };
   if (observationLimited) return normalizeContactDestination_({ hasContactDestination: null, source: 'observation_limited', evidence, checkedAt, reason: 'contact_destination_observation_limited' });
-  if (checked.length && successfulChecks === checked.length) return normalizeContactDestination_({ hasContactDestination: false, source: 'not_observed', evidence, checkedAt, reason: 'contact_destination_not_observed_after_completed_checks' });
+  if (checked.length && items.length === checked.length && new Set(items.map(page => page && page.url)).size === checked.length && new Set(checked).size === checked.length && completedUrls.size === checked.length) return normalizeContactDestination_({ hasContactDestination: false, source: 'not_observed', evidence, checkedAt, reason: 'contact_destination_not_observed_after_completed_checks' });
   return normalizeContactDestination_({ hasContactDestination: null, source: 'observation_limited', evidence, checkedAt, reason: 'contact_destination_not_observed_with_incomplete_checks' });
 }
 
 async function resolveContactDestinationLight_(origin, existingPages, hasContactCandidate, opts = {}) {
   const existingUrls = (Array.isArray(existingPages) ? existingPages : []).map(page => page && (page.finalUrl || page.url)).filter(Boolean);
-  let result = evaluateContactDestinationPages_(origin, existingPages, hasContactCandidate ? 'candidate_probe' : 'observed_contact_page', existingUrls);
+  let result = evaluateContactDestinationPages_(origin, existingPages, hasContactCandidate ? 'candidate_probe' : 'observed_contact_page', existingUrls, opts);
   if (result.hasContactDestination === true || hasContactCandidate) return result;
   const standardUrls = ['/contact/', '/contact_us/', '/contact-us/', '/inquiry/', '/otoiawase/'].map(path => origin + path);
   const htmlObserved = await fetchSubpageHtmlLightUrls_(standardUrls, { siteMode: opts.siteMode });
   let pages = Array.isArray(htmlObserved && htmlObserved.pages) ? htmlObserved.pages : [];
-  result = evaluateContactDestinationPages_(origin, pages, 'standard_path_probe', standardUrls);
+  result = evaluateContactDestinationPages_(origin, pages, 'standard_path_probe', standardUrls, opts);
   if (result.hasContactDestination === true) return result;
   const playwrightCandidate = pages.find(page => page && page.ok === true && (() => {
     try { return /\/(?:contact|contact_us|contact-us|inquiry|otoiawase)\/$/i.test(new URL(page.finalUrl || page.url).pathname); } catch (_) { return false; }
@@ -9783,7 +9812,7 @@ async function resolveContactDestinationLight_(origin, existingPages, hasContact
   if (playwrightCandidate && (result.hasContactDestination === null || !isSubpageHtmlLightObservationSufficient_(playwrightCandidate))) {
     const scoped = await fetchSubpagePlaywrightScopedLight(playwrightCandidate.finalUrl || playwrightCandidate.url, { siteMode: opts.siteMode, timeout: 8000, context: opts.context });
     pages = pages.map(page => String(page && page.url || '') === String(playwrightCandidate.url || '') ? scoped : page);
-    result = evaluateContactDestinationPages_(origin, pages, 'standard_path_probe', standardUrls);
+    result = evaluateContactDestinationPages_(origin, pages, 'standard_path_probe', standardUrls, opts);
   }
   return result;
 }
@@ -11956,7 +11985,8 @@ function normalizeOperatorIdentityInfo_(info, sourceType, opts = {}) {
     evidenceLabels: Array.isArray(info.evidenceLabels) ? info.evidenceLabels.slice(0, 10) : [],
     authority: String(info.authority || 'cloud_run_geoSignalsV1_trustSignals_operator_identity_v1'),
     provenance: info.provenance && typeof info.provenance === 'object' ? info.provenance : null,
-    identityEvidenceV1: relationEvidence
+    identityEvidenceV1: relationEvidence,
+    telephoneObservationV1: info.telephoneObservationV1 && info.telephoneObservationV1.scope === 'company_profile_html' ? { scope: 'company_profile_html', sourceUrl: String(info.telephoneObservationV1.sourceUrl || ''), complete: info.telephoneObservationV1.complete === true, hasPhone: typeof info.telephoneObservationV1.hasPhone === 'boolean' ? info.telephoneObservationV1.hasPhone : null } : null
   };
 }
 
@@ -12323,11 +12353,33 @@ function canAttemptOperatorIdentityFallbackV1_(landingPage, fallbackCandidate) {
   return normalizeOperatorIdentityProbeErrorCodeV1_(landingPage) !== 'budget_exhausted';
 }
 
-function pickBestContactSignals_(pages) {
+function pickBestContactSignals_(pages, scope = {}) {
   const candidates = (Array.isArray(pages) ? pages : [])
     .map(page => page && page.contactSignals)
     .filter(info => info && info.hasPhone === true && normalizeSubpageJsonLdText(info.telephone));
-  if (!candidates.length) return null;
+  if (!candidates.length) {
+    const entry = scope.entry, profile = scope.profile, nav = scope.navigation, destination = scope.destination;
+    const audit = destination && destination.evidence && destination.evidence.probeAuditV1;
+    const phone = profile && profile.record && profile.record.telephoneObservationV1;
+    const profileUrl = safeOperatorIdentityDebugUrlProjectionV1_(profile && profile.record && profile.record.sourceUrl);
+    const key = discoverSubpageCandidateKey(scope.entryKey || '');
+    const run = String(scope.sourceRunId || '');
+    const auditEntry = audit && audit.entryUrl;
+    const auditKey = auditEntry && discoverSubpageCandidateKey(`${auditEntry.scheme}://${auditEntry.host}${auditEntry.port ? ':' + auditEntry.port : ''}${auditEntry.path}`);
+    const attempts = audit && audit.attempts;
+    if (!run || !key || !entry || entry.sourceRunId !== run || discoverSubpageCandidateKey(entry.url) !== key ||
+        entry.complete !== true || entry.hasPhone !== false || scope.positivePhone !== false || scope.structuredPhoneAbsent !== true ||
+        !profile || profile.sourceRunId !== run || discoverSubpageCandidateKey(profile.entryKey) !== key ||
+        !profile.record || profile.record.observationComplete !== true || profile.record.conflict !== false || profile.record.hasTelephone !== false ||
+        !profile.record.identityEvidenceV1 || profile.record.identityEvidenceV1.currentRun !== true || profile.record.identityEvidenceV1.explicit !== true ||
+        [profile.record,profile.record.provenance,profile.record.identityEvidenceV1].filter(Boolean).some(record => ['runId','sourceRunId'].some(field => record[field] != null && String(record[field]) !== run) || (record.entryKey != null && discoverSubpageCandidateKey(record.entryKey) !== key)) ||
+        !phone || !profileUrl || !auditEntry || profileUrl.host !== auditEntry.host || profileUrl.scheme !== auditEntry.scheme || profileUrl.port !== auditEntry.port || phone.complete !== true || phone.hasPhone !== false || discoverSubpageCandidateKey(phone.sourceUrl) !== discoverSubpageCandidateKey(profile.record.sourceUrl) ||
+        !nav || nav.inputObserved !== true || nav.observationLimited !== false || !nav.kinds || !nav.kinds.contact || nav.kinds.contact.classificationComplete !== true || nav.kinds.contact.matchedCount !== 0 ||
+        !destination || destination.hasContactDestination !== false || !audit || audit.sourceRunId !== run || auditKey !== key ||
+        !Array.isArray(attempts) || attempts.length !== 5 || !['/contact/','/contact_us/','/contact-us/','/inquiry/','/otoiawase/'].every(path => attempts.filter(x => x.url && x.url.path === path).length === 1) ||
+        !attempts.every(x => x.url && x.finalUrl && x.url.host === auditEntry.host && x.finalUrl.host === auditEntry.host && x.url.scheme === auditEntry.scheme && x.finalUrl.scheme === auditEntry.scheme && x.url.port === auditEntry.port && x.finalUrl.port === auditEntry.port && x.url.path === x.finalUrl.path && x.errorStage === 'fetch' && [404,410].includes(x.status) && x.reason === 'http_4xx')) return null;
+    return { hasPhone: false, telephone: null, observationComplete: true, sourceRunId: run, entryKey: key, scope: 'entry_company_profile_navigation_standard_contacts', source: 'bounded_company_phone_observation_v1' };
+  }
   const best = candidates[0];
   return {
     hasPhone: true,
@@ -12734,6 +12786,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     if (!selectedCandidates.length && !(discovered.operatorIdentitySelectionPlan && discovered.operatorIdentitySelectionPlan.selected.length)) {
       attachContactDestination_(geoSignalsV1, await resolveContactDestinationLight_(normalized.origin, [], hasContactCandidate, {
         siteMode,
+        sourceRunId: opts.sourceRunId, entryKey: opts.entryKey || normalized.topUrl,
         context: opts && opts.context
       }));
       // Candidate selection completed, but no bounded representative page was
@@ -13115,6 +13168,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     );
     attachContactDestination_(geoSignalsV1, await resolveContactDestinationLight_(normalized.origin, observations, hasContactCandidate, {
       siteMode,
+      sourceRunId: opts.sourceRunId, entryKey: opts.entryKey || normalized.topUrl,
       context: opts && opts.context
     }));
     const coverageBudgetStages = lightBudget && Array.isArray(lightBudget.skipped)
@@ -13750,12 +13804,42 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       lightBudget,
       executionAuth: opts.executionAuth
     });
-    const contactSignals = pickBestContactSignals_(observations);
+    const positiveContactSignals = pickBestContactSignals_(observations);
+    let entryPhoneObservation = null;
+    const domObservation = geoSignalsV1.renderedDomObservationV1 || {};
+    if (!positiveContactSignals && operatorIdentityInfo && operatorIdentityInfo.hasTelephone === false &&
+        geoSignalsV1.contactDestination && geoSignalsV1.contactDestination.hasContactDestination === false &&
+        !(geoSignalsV1.trustSignals && (geoSignalsV1.trustSignals.telephone || geoSignalsV1.trustSignals.hasPhone === true)) &&
+        (!lightBudget || getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESERVE_MS) >= 1200) &&
+        opts.page && domObservation.navigationCompleted === true && domObservation.domContentObserved === true && domObservation.observationLimited === false && !domObservation.fallbackKind) {
+      try {
+        const entryDom = await opts.page.evaluate(() => ({ url: location.href, html: document.documentElement.outerHTML,
+          complete: document.readyState === 'complete' && !Array.from(document.querySelectorAll('iframe,frame,frameset')).some(node => !node.closest('noscript')) &&
+            !Array.from(document.querySelectorAll('*')).some(node => node.shadowRoot || node.tagName.includes('-')) }));
+        const scanned = extractContactSignalsFromHtml_(entryDom.html, entryDom.url);
+        entryPhoneObservation = { sourceRunId: opts.sourceRunId, url: entryDom.url, hasPhone: scanned.hasPhone, complete: entryDom.complete && scanned.observationComplete && (!lightBudget || getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESERVE_MS) > 0) };
+      } catch (_) {}
+    }
+    const structuredPhone = geoSignalsV1.structuredData || {};
+    const orgPhone = structuredPhone.structuredDataQualityV1 && structuredPhone.structuredDataQualityV1.organization;
+    const trustPhone = geoSignalsV1.trustSignals || {};
+    const contactSignals = positiveContactSignals || pickBestContactSignals_(observations, {
+      sourceRunId: opts.sourceRunId, entryKey: opts.entryKey || normalized.topUrl, entry: entryPhoneObservation,
+      profile: { sourceRunId: opts.sourceRunId, entryKey: opts.entryKey || normalized.topUrl, record: operatorIdentityInfo },
+      navigation: geoSignalsV1.navigationPathObservationsV1, destination: geoSignalsV1.contactDestination,
+      positivePhone: !!(trustPhone.telephone || trustPhone.hasPhone === true || trustPhone.hasTelephone === true || (legalOperatorInfo && legalOperatorInfo.telephone) || (structuredPhone.organizationProfile && structuredPhone.organizationProfile.telephone)),
+      structuredPhoneAbsent: !!(orgPhone && orgPhone.observationComplete === true && orgPhone.telephoneObservedCount === 0 && structuredPhone.observationLimited === false)
+    });
     if (contactSignals) {
       geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
         ? geoSignalsV1.trustSignals
         : {};
-      geoSignalsV1.trustSignals.hasPhone = true;
+      geoSignalsV1.trustSignals.hasPhone = contactSignals.hasPhone;
+      if (contactSignals.hasPhone === false) {
+        geoSignalsV1.trustSignals.hasTelephone = false;
+        geoSignalsV1.trustSignals.telephoneObserved = true;
+        geoSignalsV1.trustSignals.telephoneSource = contactSignals.source;
+      }
       geoSignalsV1.trustSignals.telephone = contactSignals.telephone;
       geoSignalsV1.trustSignals.contactSignals = contactSignals;
     }
@@ -30537,6 +30621,9 @@ module.exports.__lightBudgetTestHooks = {
   addDiscoverSubpageCandidate,
   discoverSubpageCandidatesLightData_,
   compactSubpageJsonLdObservation_,
+  evaluateContactDestinationPages_,
+  extractContactSignalsFromHtml_,
+  pickBestContactSignals_,
   normalizeArticleVisibleDate_,
   pickArticleVisibleDate_,
   selectMediaFreshnessArticleCandidates_,
